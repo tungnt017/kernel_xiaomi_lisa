@@ -216,55 +216,84 @@ extern int ksu_handle_sys_write(unsigned int fd,
     data = read(path)
 
     if "extern int ksu_handle_sys_read" not in data:
-        if "SYSCALL_DEFINE3(read," in data:
+        if "ssize_t ksys_read(" in data:
+            insert_before(path, "ssize_t ksys_read(", proto, required=False)
+        elif "SYSCALL_DEFINE3(read," in data:
             insert_before(path, "SYSCALL_DEFINE3(read,", proto, required=False)
         else:
-            print("[WARN] read syscall marker not found")
-            return
+            print("[WARN] cannot find read marker for prototype")
 
     data = read(path)
 
-    # Patch sys_read
+    # Patch ksys_read()
     if "ksu_handle_sys_read(fd" not in data:
-        print("[INFO] patching sys_read")
+        print("[INFO] patching ksys_read")
 
-        replace_once(
-            path,
-            """    struct fd f = fdget_pos(fd);""",
-            """    struct fd f;
-
-#ifdef CONFIG_KSU
-    if (unlikely(ksu_vfs_read_hook))
-        ksu_handle_sys_read(fd, &buf, &count);
-#endif
-
-    f = fdget_pos(fd);""",
-            required=False,
+        read_pattern = re.compile(
+            r"(?P<header>ssize_t\s+ksys_read\s*\(\s*unsigned\s+int\s+fd\s*,\s*"
+            r"char\s+__user\s+\*buf\s*,\s*size_t\s+count\s*\)\s*\{\s*)"
+            r"(?P<indent>[ \t]*)struct\s+fd\s+f\s*=\s*fdget_pos\s*\(\s*fd\s*\)\s*;\s*\n"
+            r"(?P=indent)ssize_t\s+ret\s*=\s*-EBADF\s*;",
+            re.S,
         )
+
+        def read_repl(m):
+            indent = m.group("indent")
+            return (
+                m.group("header")
+                + f"{indent}struct fd f;\n"
+                + f"{indent}ssize_t ret = -EBADF;\n\n"
+                + "#ifdef CONFIG_KSU\n"
+                + f"{indent}if (unlikely(ksu_vfs_read_hook))\n"
+                + f"{indent}\tksu_handle_sys_read(fd, &buf, &count);\n"
+                + "#endif\n\n"
+                + f"{indent}f = fdget_pos(fd);"
+            )
+
+        data, count = read_pattern.subn(read_repl, data, count=1)
+
+        if count:
+            print("[OK] patched ksys_read")
+        else:
+            print("[WARN] ksys_read pattern not found")
     else:
-        print("[SKIP] sys_read already patched")
+        print("[SKIP] ksys_read already patched")
 
-    data = read(path)
-
-    # Patch sys_write
+    # Patch ksys_write()
     if "ksu_handle_sys_write(fd" not in data:
-        print("[INFO] patching sys_write")
+        print("[INFO] patching ksys_write")
 
-        replace_once(
-            path,
-            """    struct fd f = fdget_pos(fd);""",
-            """    struct fd f;
-
-#ifdef CONFIG_KSU
-    if (unlikely(ksu_vfs_write_hook))
-        ksu_handle_sys_write(fd, &buf, &count);
-#endif
-
-    f = fdget_pos(fd);""",
-            required=False,
+        write_pattern = re.compile(
+            r"(?P<header>ssize_t\s+ksys_write\s*\(\s*unsigned\s+int\s+fd\s*,\s*"
+            r"const\s+char\s+__user\s+\*buf\s*,\s*size_t\s+count\s*\)\s*\{\s*)"
+            r"(?P<indent>[ \t]*)struct\s+fd\s+f\s*=\s*fdget_pos\s*\(\s*fd\s*\)\s*;\s*\n"
+            r"(?P=indent)ssize_t\s+ret\s*=\s*-EBADF\s*;",
+            re.S,
         )
+
+        def write_repl(m):
+            indent = m.group("indent")
+            return (
+                m.group("header")
+                + f"{indent}struct fd f;\n"
+                + f"{indent}ssize_t ret = -EBADF;\n\n"
+                + "#ifdef CONFIG_KSU\n"
+                + f"{indent}if (unlikely(ksu_vfs_write_hook))\n"
+                + f"{indent}\tksu_handle_sys_write(fd, &buf, &count);\n"
+                + "#endif\n\n"
+                + f"{indent}f = fdget_pos(fd);"
+            )
+
+        data, count = write_pattern.subn(write_repl, data, count=1)
+
+        if count:
+            print("[OK] patched ksys_write")
+        else:
+            print("[WARN] ksys_write pattern not found")
     else:
-        print("[SKIP] sys_write already patched")
+        print("[SKIP] ksys_write already patched")
+
+    write(path, data)
 
 
 def patch_stat():
