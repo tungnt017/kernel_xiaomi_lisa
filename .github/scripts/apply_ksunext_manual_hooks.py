@@ -74,6 +74,7 @@ def patch_defconfig(defconfig):
         ROOT / "arch" / "arm64" / "configs" / "vendor" / defconfig,
     ]
     path = next((c for c in candidates if c.exists()), None)
+
     if path is None:
         print("[ERROR] defconfig not found.")
         print("Available defconfigs:")
@@ -85,26 +86,46 @@ def patch_defconfig(defconfig):
     for line in read(path).splitlines():
         if line.startswith("CONFIG_KSU="):
             continue
+        if line.startswith("CONFIG_KSU_MANUAL_HOOK="):
+            continue
         if line.startswith("CONFIG_KSU_KPROBE_HOOKS="):
             continue
+        if line.startswith("CONFIG_KSU_KPROBES_HOOK="):
+            continue
+        if line.startswith("CONFIG_KSU_KPROBES_HOOKS="):
+            continue
+        if line.startswith("CONFIG_KSU_WITH_KPROBES="):
+            continue
+
         if line.startswith("# CONFIG_KSU is not set"):
+            continue
+        if line.startswith("# CONFIG_KSU_MANUAL_HOOK is not set"):
             continue
         if line.startswith("# CONFIG_KSU_KPROBE_HOOKS is not set"):
             continue
+        if line.startswith("# CONFIG_KSU_KPROBES_HOOK is not set"):
+            continue
+        if line.startswith("# CONFIG_KSU_KPROBES_HOOKS is not set"):
+            continue
+        if line.startswith("# CONFIG_KSU_WITH_KPROBES is not set"):
+            continue
+
         lines.append(line)
 
     lines += [
         "",
         "# KernelSU Next",
         "CONFIG_KSU=y",
+        "CONFIG_KSU_MANUAL_HOOK=y",
         "# CONFIG_KSU_KPROBE_HOOKS is not set",
-		"# CONFIG_KSU_KPROBES_HOOK is not set",
-		"# CONFIG_KSU_KPROBES_HOOKS is not set",
-		"# CONFIG_KSU_WITH_KPROBES is not set",
+        "# CONFIG_KSU_KPROBES_HOOK is not set",
+        "# CONFIG_KSU_KPROBES_HOOKS is not set",
+        "# CONFIG_KSU_WITH_KPROBES is not set",
         "",
     ]
+
     write(path, "\n".join(lines))
-    print(f"[OK] enabled CONFIG_KSU in {path}")
+    print(f"[OK] enabled CONFIG_KSU manual hook in {path}")
 
 
 def patch_exec():
