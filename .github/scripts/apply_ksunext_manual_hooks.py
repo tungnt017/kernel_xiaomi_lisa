@@ -146,41 +146,87 @@ extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
                              int *flags);
 #endif"""
 
-    insert_before(path, "long do_sys_openat2(", proto)
+    data = read(path)
 
-    # insert đúng SAU khi biến đã tồn tại
-    replace_once(
-        path,
-        "struct open_flags op;",
-        """struct open_flags op;
+    # Insert prototype, nhưng KHÔNG bắt buộc phải có do_sys_openat2
+    if "extern int ksu_handle_openat" not in data:
+        if "long do_sys_openat2(" in data:
+            insert_before(path, "long do_sys_openat2(", proto)
+        elif "long do_sys_open(" in data:
+            insert_before(path, "long do_sys_open(", proto)
+        elif "SYSCALL_DEFINE3(openat" in data:
+            insert_before(path, "SYSCALL_DEFINE3(openat", proto)
+        else:
+            print("[WARN] cannot find open function marker for prototype")
+
+    data = read(path)
+
+    if "ksu_handle_openat(&dfd" in data:
+        print("[SKIP] open.c already patched")
+        return
+
+    # Case kernel có do_sys_openat2
+    if "long do_sys_openat2(" in data:
+        print("[INFO] patching open.c using do_sys_openat2")
+
+        replace_once(
+            path,
+            """    struct open_flags op;
+    int fd = build_open_flags(how, &op);
+    struct filename *tmp;""",
+            """    struct open_flags op;
+    int fd;
+    struct filename *tmp;
 
 #ifdef CONFIG_KSU
     ksu_handle_openat(&dfd, &filename, &how->flags);
-#endif""",
-        required=False,
-    )
+#endif
+    fd = build_open_flags(how, &op);""",
+            required=False,
+        )
+        return
 
-    # fallback cho kernel không có openat2
-    replace_once(
-        path,
-        "SYSCALL_DEFINE3(openat,",
-        """SYSCALL_DEFINE3(openat,
+    # Case lisa thường dùng do_sys_open
+    if "long do_sys_open(" in data:
+        print("[INFO] patching open.c using do_sys_open")
+
+        # Variant 1: dùng biến err
+        replace_once(
+            path,
+            """    struct open_flags op;
+    int err = build_open_flags(flags, mode, &op);
+    struct filename *tmp;""",
+            """    struct open_flags op;
+    int err;
+    struct filename *tmp;
+
 #ifdef CONFIG_KSU
     ksu_handle_openat(&dfd, &filename, &flags);
-#endif""",
-        required=False,
-    )
+#endif
+    err = build_open_flags(flags, mode, &op);""",
+            required=False,
+        )
 
-    # fallback cho kernel không có openat2
-    replace_once(
-        path,
-        "SYSCALL_DEFINE3(openat,",
-        """SYSCALL_DEFINE3(openat,
+        # Variant 2: dùng biến fd
+        replace_once(
+            path,
+            """    struct open_flags op;
+    int fd = build_open_flags(flags, mode, &op);
+    struct filename *tmp;""",
+            """    struct open_flags op;
+    int fd;
+    struct filename *tmp;
+
 #ifdef CONFIG_KSU
     ksu_handle_openat(&dfd, &filename, &flags);
-#endif""",
-        required=False,
-    )
+#endif
+    fd = build_open_flags(flags, mode, &op);""",
+            required=False,
+        )
+
+        return
+
+    print("[WARN] open hook not applied: no supported open function found")
 
 
 def patch_read_write():
