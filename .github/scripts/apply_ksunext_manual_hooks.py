@@ -142,102 +142,126 @@ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 
 def patch_open():
     path = "fs/open.c"
-    data = read(path)
 
     proto = """#ifdef CONFIG_KSU
-extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
-                             int *flags);
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+                                int *mode, int *flags);
 #endif"""
 
-    func_pattern = re.compile(
-        r"(?:static\s+)?(?:long|int)\s+do_sys_open\s*\(\s*"
-        r"int\s+dfd\s*,\s*"
-        r"const\s+char\s+__user\s+\*filename\s*,\s*"
-        r"int\s+flags\s*,\s*"
-        r"umode_t\s+mode\s*\)\s*\{",
-        re.S,
-    )
+    data = read(path)
 
-    span = find_function_span(data, func_pattern)
-    if not span:
-        print("[WARN] do_sys_open() not found in fs/open.c, open hook not applied")
-        return
-
-    start, brace_start, end = span
-    if "extern int ksu_handle_openat" not in data:
-        data = data[:start] + proto + "\n\n" + data[start:]
-        write(path, data)
-        print("[OK] inserted openat prototype")
-        data = read(path)
-        span = find_function_span(data, func_pattern)
-        if not span:
-            print("[WARN] do_sys_open() disappeared after prototype insert")
+    if "extern int ksu_handle_faccessat" not in data:
+        if "long do_faccessat(" in data:
+            insert_before(path, "long do_faccessat(", proto, required=False)
+        elif "SYSCALL_DEFINE3(faccessat" in data:
+            insert_before(path, "SYSCALL_DEFINE3(faccessat", proto, required=False)
+        else:
+            print("[WARN] faccessat marker not found in fs/open.c")
             return
-        start, brace_start, end = span
 
-    body = data[start:end]
-    if "ksu_handle_openat(&dfd, &filename, &flags);" in body:
-        print("[SKIP] open.c already patched")
+    data = read(path)
+
+    if "ksu_handle_faccessat(&dfd, &filename, &mode" in data:
+        print("[SKIP] open.c faccessat already patched")
         return
 
-    block_pattern = re.compile(
-        r"(?P<indent>[ \t]*)struct\s+open_flags\s+op;\s*\n"
-        r"(?P=indent)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\s*\(\s*flags\s*,\s*mode\s*,\s*&op\s*\)\s*;\s*\n"
-        r"(?P=indent)(?P<tmp>struct\s+filename\s+\*tmp[^;]*;)",
-        re.S,
-    )
-    bm = block_pattern.search(body)
-    if not bm:
-        print("[WARN] do_sys_open declaration block not found, open hook not applied")
+    # Hook do_faccessat(int dfd, const char __user *filename, int mode)
+    if "long do_faccessat(" in data:
+        print("[INFO] patching open.c using do_faccessat")
+
+        func_pattern = re.compile(
+            r"(long\s+do_faccessat\s*\(\s*int\s+dfd\s*,\s*"
+            r"const\s+char\s+__user\s+\*filename\s*,\s*"
+            r"int\s+mode\s*\)\s*\{)",
+            re.S,
+        )
+
+        def repl(m):
+            return m.group(1) + """
+
+#ifdef CONFIG_KSU
+    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#endif"""
+
+        new_data, count = func_pattern.subn(repl, data, count=1)
+
+        if count:
+            write(path, new_data)
+            print("[OK] patched open.c faccessat")
+        else:
+            print("[WARN] do_faccessat function body not matched")
+
         return
 
-    indent = bm.group("indent")
-    var = bm.group("var")
-    tmp_decl = bm.group("tmp")
-    replacement = (
-        f"{indent}struct open_flags op;\n"
-        f"{indent}int {var};\n"
-        f"{indent}{tmp_decl}\n\n"
-        f"#ifdef CONFIG_KSU\n"
-        f"{indent}ksu_handle_openat(&dfd, &filename, &flags);\n"
-        f"#endif\n"
-        f"{indent}{var} = build_open_flags(flags, mode, &op);"
-    )
-    body_new = block_pattern.sub(replacement, body, count=1)
-    write(path, data[:start] + body_new + data[end:])
-    print("[OK] patched open.c inside do_sys_open")
+    print("[WARN] open.c faccessat hook not applied")
+
 
 
 def patch_read_write():
     path = "fs/read_write.c"
+
     proto = """#ifdef CONFIG_KSU
-extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
-                               size_t *count_ptr, loff_t **pos);
-extern int ksu_handle_vfs_write(struct file **file_ptr,
+extern bool ksu_vfs_read_hook;
+extern bool ksu_vfs_write_hook;
+extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,
+                               size_t *count_ptr);
+extern int ksu_handle_sys_write(unsigned int fd,
                                 const char __user **buf_ptr,
-                                size_t *count_ptr, loff_t **pos);
+                                size_t *count_ptr);
 #endif"""
-    insert_before(path, "ssize_t vfs_read(", proto, required=False)
 
-    replace_once(
-        path,
-        """\tif (!(file->f_mode & FMODE_READ))""",
-        """#ifdef CONFIG_KSU
-	ksu_handle_vfs_read(&file, &buf, &count, &pos);
-#endif
-	if (!(file->f_mode & FMODE_READ))""",
-        required=False,
-    )
+    data = read(path)
 
-    replace_once(
-        path,
-        """\tif (!(file->f_mode & FMODE_WRITE))""",
-        """#ifdef CONFIG_KSU
-	ksu_handle_vfs_write(&file, &buf, &count, &pos);
+    if "extern int ksu_handle_sys_read" not in data:
+        if "SYSCALL_DEFINE3(read," in data:
+            insert_before(path, "SYSCALL_DEFINE3(read,", proto, required=False)
+        else:
+            print("[WARN] read syscall marker not found")
+            return
+
+    data = read(path)
+
+    # Patch sys_read
+    if "ksu_handle_sys_read(fd" not in data:
+        print("[INFO] patching sys_read")
+
+        replace_once(
+            path,
+            """    struct fd f = fdget_pos(fd);""",
+            """    struct fd f;
+
+#ifdef CONFIG_KSU
+    if (unlikely(ksu_vfs_read_hook))
+        ksu_handle_sys_read(fd, &buf, &count);
 #endif
-	if (!(file->f_mode & FMODE_WRITE))""",
-        required=False,
-    )
+
+    f = fdget_pos(fd);""",
+            required=False,
+        )
+    else:
+        print("[SKIP] sys_read already patched")
+
+    data = read(path)
+
+    # Patch sys_write
+    if "ksu_handle_sys_write(fd" not in data:
+        print("[INFO] patching sys_write")
+
+        replace_once(
+            path,
+            """    struct fd f = fdget_pos(fd);""",
+            """    struct fd f;
+
+#ifdef CONFIG_KSU
+    if (unlikely(ksu_vfs_write_hook))
+        ksu_handle_sys_write(fd, &buf, &count);
+#endif
+
+    f = fdget_pos(fd);""",
+            required=False,
+        )
+    else:
+        print("[SKIP] sys_write already patched")
 
 
 def patch_stat():
