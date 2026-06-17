@@ -171,6 +171,17 @@ extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
         required=False,
     )
 
+    # fallback cho kernel không có openat2
+    replace_once(
+        path,
+        "SYSCALL_DEFINE3(openat,",
+        """SYSCALL_DEFINE3(openat,
+#ifdef CONFIG_KSU
+    ksu_handle_openat(&dfd, &filename, &flags);
+#endif""",
+        required=False,
+    )
+
 
 def patch_read_write():
     path = "fs/read_write.c"
@@ -235,7 +246,6 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
 
     write(path, new_data)
     print("[OK] patched stat.c (safe mode)")
-``
 
 
 def patch_reboot():
