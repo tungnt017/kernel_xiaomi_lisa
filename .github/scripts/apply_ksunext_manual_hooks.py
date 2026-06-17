@@ -142,29 +142,29 @@ def patch_open():
     path = "fs/open.c"
 
     proto = """#ifdef CONFIG_KSU
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-                int *mode, int *flags);
 extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
-                 int *flags);
+                             int *flags);
 #endif"""
 
-    insert_before(path, "long do_faccessat(", proto)
+    insert_before(path, "long do_sys_openat2(", proto)
 
+    # insert đúng SAU khi biến đã tồn tại
     replace_once(
         path,
-        """\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */""",
-        """#ifdef CONFIG_KSU
-    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-#endif
-    if (mode & ~S_IRWXO)    /* where's F_OK, X_OK, W_OK, R_OK? */""",
+        "struct open_flags op;",
+        """struct open_flags op;
+
+#ifdef CONFIG_KSU
+    ksu_handle_openat(&dfd, &filename, &how->flags);
+#endif""",
         required=False,
     )
 
+    # fallback cho kernel không có openat2
     replace_once(
         path,
-        """\tstruct open_flags op;""",
-        """\tstruct open_flags op;
-
+        "SYSCALL_DEFINE3(openat,",
+        """SYSCALL_DEFINE3(openat,
 #ifdef CONFIG_KSU
     ksu_handle_openat(&dfd, &filename, &flags);
 #endif""",
@@ -211,30 +211,31 @@ def patch_stat():
 
     proto = """#ifdef CONFIG_KSU
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-               int *flags);
+                           int *flags);
 #endif"""
 
-    insert_before(path, "int vfs_statx(", proto)
+    insert_before(path, "SYSCALL_DEFINE4(statx,", proto)
 
-    replace_once(
-        path,
-        """\treturn vfs_statx(dfd, filename, flags, &stat, request_mask);""",
-        """#ifdef CONFIG_KSU
+    # hook ngay sau dấu {
+    data = read(path)
+
+    if "ksu_handle_stat" in data:
+        print("[SKIP] stat already patched")
+        return
+
+    new_data = data.replace(
+        "{",
+        """{
+#ifdef CONFIG_KSU
     ksu_handle_stat(&dfd, &filename, &flags);
 #endif
-    return vfs_statx(dfd, filename, flags, &stat, request_mask);""",
-        required=False,
+""",
+        1
     )
 
-    replace_once(
-        path,
-        """\terror = vfs_statx(dfd, filename, flags, &stat, request_mask);""",
-        """#ifdef CONFIG_KSU
-    ksu_handle_stat(&dfd, &filename, &flags);
-#endif
-    error = vfs_statx(dfd, filename, flags, &stat, request_mask);""",
-        required=False,
-    )
+    write(path, new_data)
+    print("[OK] patched stat.c (safe mode)")
+``
 
 
 def patch_reboot():
