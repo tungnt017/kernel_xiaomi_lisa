@@ -256,12 +256,8 @@ def patch_read_write():
 
     proto = """#ifdef CONFIG_KSU
 extern bool ksu_vfs_read_hook;
-extern bool ksu_vfs_write_hook;
 extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,
                                size_t *count_ptr);
-extern int ksu_handle_sys_write(unsigned int fd,
-                                const char __user **buf_ptr,
-                                size_t *count_ptr);
 #endif"""
 
     data = read(path)
@@ -276,7 +272,9 @@ extern int ksu_handle_sys_write(unsigned int fd,
 
     data = read(path)
 
-    # Patch ksys_read()
+    # Patch ksys_read only.
+    # Do NOT patch ksys_write because KernelSU-Next v3.2.0-legacy may not export
+    # ksu_vfs_write_hook / ksu_handle_sys_write.
     if "ksu_handle_sys_read(fd" not in data:
         print("[INFO] patching ksys_read")
 
@@ -309,40 +307,6 @@ extern int ksu_handle_sys_write(unsigned int fd,
             print("[WARN] ksys_read pattern not found")
     else:
         print("[SKIP] ksys_read already patched")
-
-    # Patch ksys_write()
-    if "ksu_handle_sys_write(fd" not in data:
-        print("[INFO] patching ksys_write")
-
-        write_pattern = re.compile(
-            r"(?P<header>ssize_t\s+ksys_write\s*\(\s*unsigned\s+int\s+fd\s*,\s*"
-            r"const\s+char\s+__user\s+\*buf\s*,\s*size_t\s+count\s*\)\s*\{\s*)"
-            r"(?P<indent>[ \t]*)struct\s+fd\s+f\s*=\s*fdget_pos\s*\(\s*fd\s*\)\s*;\s*\n"
-            r"(?P=indent)ssize_t\s+ret\s*=\s*-EBADF\s*;",
-            re.S,
-        )
-
-        def write_repl(m):
-            indent = m.group("indent")
-            return (
-                m.group("header")
-                + f"{indent}struct fd f;\n"
-                + f"{indent}ssize_t ret = -EBADF;\n\n"
-                + "#ifdef CONFIG_KSU\n"
-                + f"{indent}if (unlikely(ksu_vfs_write_hook))\n"
-                + f"{indent}\tksu_handle_sys_write(fd, &buf, &count);\n"
-                + "#endif\n\n"
-                + f"{indent}f = fdget_pos(fd);"
-            )
-
-        data, count = write_pattern.subn(write_repl, data, count=1)
-
-        if count:
-            print("[OK] patched ksys_write")
-        else:
-            print("[WARN] ksys_write pattern not found")
-    else:
-        print("[SKIP] ksys_write already patched")
 
     write(path, data)
 
