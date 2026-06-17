@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 import sys
+import re
 from pathlib import Path
 
 ROOT = Path(".").resolve()
 
+def replace_regex_once(path, pattern, repl, required=True, flags=0):
+    p = Path(path)
+    data = read(p)
+
+    if isinstance(repl, str) and repl.strip() in data:
+        print(f"[SKIP] regex block already exists: {path}")
+        return
+
+    new_data, count = re.subn(pattern, repl, data, count=1, flags=flags)
+
+    if count == 0:
+        msg = f"[MISS] regex context not found in {path}: {pattern}"
+        if required:
+            raise RuntimeError(msg)
+        print(msg)
+        return
+
+    write(p, new_data)
+    print(f"[OK] regex patched: {path}")
 
 def read(path):
     return Path(path).read_text(errors="ignore")
@@ -148,7 +168,6 @@ extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
 
     data = read(path)
 
-    # Insert prototype, nhưng KHÔNG bắt buộc phải có do_sys_openat2
     if "extern int ksu_handle_openat" not in data:
         if "long do_sys_openat2(" in data:
             insert_before(path, "long do_sys_openat2(", proto)
@@ -165,65 +184,38 @@ extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
         print("[SKIP] open.c already patched")
         return
 
-    # Case kernel có do_sys_openat2
+    # Case 1: kernel có do_sys_openat2()
     if "long do_sys_openat2(" in data:
         print("[INFO] patching open.c using do_sys_openat2")
 
-        replace_once(
+        replace_regex_once(
             path,
-            """    struct open_flags op;
-    int fd = build_open_flags(how, &op);
-    struct filename *tmp;""",
-            """    struct open_flags op;
-    int fd;
-    struct filename *tmp;
+            r"(?P<indent>\s*)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\(\s*how\s*,\s*&op\s*\);",
+            r"""\g<indent>int \g<var>;
 
 #ifdef CONFIG_KSU
-    ksu_handle_openat(&dfd, &filename, &how->flags);
+\g<indent>ksu_handle_openat(&dfd, &filename, &how->flags);
 #endif
-    fd = build_open_flags(how, &op);""",
+\g<indent>\g<var> = build_open_flags(how, &op);""",
             required=False,
         )
         return
 
-    # Case lisa thường dùng do_sys_open
+    # Case 2: lisa dùng do_sys_open()
     if "long do_sys_open(" in data:
         print("[INFO] patching open.c using do_sys_open")
 
-        # Variant 1: dùng biến err
-        replace_once(
+        replace_regex_once(
             path,
-            """    struct open_flags op;
-    int err = build_open_flags(flags, mode, &op);
-    struct filename *tmp;""",
-            """    struct open_flags op;
-    int err;
-    struct filename *tmp;
+            r"(?P<indent>\s*)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\(\s*flags\s*,\s*mode\s*,\s*&op\s*\);",
+            r"""\g<indent>int \g<var>;
 
 #ifdef CONFIG_KSU
-    ksu_handle_openat(&dfd, &filename, &flags);
+\g<indent>ksu_handle_openat(&dfd, &filename, &flags);
 #endif
-    err = build_open_flags(flags, mode, &op);""",
+\g<indent>\g<var> = build_open_flags(flags, mode, &op);""",
             required=False,
         )
-
-        # Variant 2: dùng biến fd
-        replace_once(
-            path,
-            """    struct open_flags op;
-    int fd = build_open_flags(flags, mode, &op);
-    struct filename *tmp;""",
-            """    struct open_flags op;
-    int fd;
-    struct filename *tmp;
-
-#ifdef CONFIG_KSU
-    ksu_handle_openat(&dfd, &filename, &flags);
-#endif
-    fd = build_open_flags(flags, mode, &op);""",
-            required=False,
-        )
-
         return
 
     print("[WARN] open hook not applied: no supported open function found")
@@ -271,27 +263,69 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
                            int *flags);
 #endif"""
 
-    insert_before(path, "SYSCALL_DEFINE4(statx,", proto)
-
-    # hook ngay sau dấu {
     data = read(path)
 
-    if "ksu_handle_stat" in data:
-        print("[SKIP] stat already patched")
+    if "extern int ksu_handle_stat" not in data:
+        if "int vfs_statx(" in data:
+            insert_before(path, "int vfs_statx(", proto)
+        elif "int vfs_fstatat(" in data:
+            insert_before(path, "int vfs_fstatat(", proto)
+        else:
+            print("[WARN] cannot find stat function marker for prototype")
+
+    data = read(path)
+
+    if "ksu_handle_stat(&dfd, &filename, &flags);" in data:
+        print("[SKIP] stat.c already patched")
         return
 
-    new_data = data.replace(
-        "{",
-        """{
+    # Preferred: hook vfs_statx()
+    if "int vfs_statx(" in data:
+        print("[INFO] patching stat.c using vfs_statx")
+
+        pattern = (
+            r"(int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
+            r"const\s+char\s+__user\s+\*filename\s*,\s*"
+            r"int\s+flags\s*,.*?\)\s*\{)"
+        )
+
+        replace_regex_once(
+            path,
+            pattern,
+            r"""\1
+
 #ifdef CONFIG_KSU
     ksu_handle_stat(&dfd, &filename, &flags);
-#endif
-""",
-        1
-    )
+#endif""",
+            required=True,
+            flags=re.S,
+        )
+        return
 
-    write(path, new_data)
-    print("[OK] patched stat.c (safe mode)")
+    # Fallback: hook vfs_fstatat()
+    if "int vfs_fstatat(" in data:
+        print("[INFO] patching stat.c using vfs_fstatat fallback")
+
+        pattern = (
+            r"(int\s+vfs_fstatat\s*\(\s*int\s+dfd\s*,\s*"
+            r"const\s+char\s+__user\s+\*filename\s*,.*?"
+            r"int\s+flags\s*\)\s*\{)"
+        )
+
+        replace_regex_once(
+            path,
+            pattern,
+            r"""\1
+
+#ifdef CONFIG_KSU
+    ksu_handle_stat(&dfd, &filename, &flags);
+#endif""",
+            required=False,
+            flags=re.S,
+        )
+        return
+
+    print("[WARN] stat hook not applied: no supported stat function found")
 
 
 def patch_reboot():
