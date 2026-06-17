@@ -166,58 +166,88 @@ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
 
 def patch_open():
     path = "fs/open.c"
+    data = read(path)
 
     proto = """#ifdef CONFIG_KSU
 extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
                                 int *mode, int *flags);
 #endif"""
 
-    data = read(path)
+    # Locate do_faccessat()
+    func_pattern = re.compile(
+        r"(?:static\s+)?(?:long|int)\s+do_faccessat\s*\(\s*"
+        r"int\s+dfd\s*,\s*"
+        r"const\s+char\s+__user\s+\*filename\s*,\s*"
+        r"int\s+mode\s*\)\s*\{",
+        re.S,
+    )
 
+    span = find_function_span(data, func_pattern)
+
+    if not span:
+        print("[WARN] do_faccessat() not found in fs/open.c, faccessat hook not applied")
+        return
+
+    start, brace_start, end = span
+
+    # Insert prototype before do_faccessat()
     if "extern int ksu_handle_faccessat" not in data:
-        if "long do_faccessat(" in data:
-            insert_before(path, "long do_faccessat(", proto, required=False)
-        elif "SYSCALL_DEFINE3(faccessat" in data:
-            insert_before(path, "SYSCALL_DEFINE3(faccessat", proto, required=False)
-        else:
-            print("[WARN] faccessat marker not found in fs/open.c")
+        data = data[:start] + proto + "\n\n" + data[start:]
+        write(path, data)
+        print("[OK] inserted faccessat prototype")
+
+        data = read(path)
+        span = find_function_span(data, func_pattern)
+
+        if not span:
+            print("[WARN] do_faccessat() disappeared after prototype insert")
             return
 
-    data = read(path)
+        start, brace_start, end = span
 
-    if "ksu_handle_faccessat(&dfd, &filename, &mode" in data:
+    body = data[brace_start + 1:end - 1]
+
+    if "ksu_handle_faccessat(&dfd, &filename, &mode" in body:
         print("[SKIP] open.c faccessat already patched")
         return
 
-    # Hook do_faccessat(int dfd, const char __user *filename, int mode)
-    if "long do_faccessat(" in data:
-        print("[INFO] patching open.c using do_faccessat")
+    lines = body.splitlines(True)
+    insert_index = 0
 
-        func_pattern = re.compile(
-            r"(long\s+do_faccessat\s*\(\s*int\s+dfd\s*,\s*"
-            r"const\s+char\s+__user\s+\*filename\s*,\s*"
-            r"int\s+mode\s*\)\s*\{)",
-            re.S,
-        )
+    declaration_regex = re.compile(
+        r"^\s*(?:const\s+)?(?:"
+        r"struct|unsigned|signed|int|long|short|char|bool|umode_t|"
+        r"uid_t|gid_t|kuid_t|kgid_t|loff_t|size_t|ssize_t|u8|u16|u32|u64|"
+        r"s8|s16|s32|s64|enum"
+        r")\b.*;\s*(?:/\*.*\*/)?\s*$"
+    )
 
-        def repl(m):
-            return m.group(1) + """
+    blank_or_comment_regex = re.compile(
+        r"^\s*$|^\s*/\*.*\*/\s*$|^\s*//.*$"
+    )
 
-#ifdef CONFIG_KSU
-    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-#endif"""
+    for idx, line in enumerate(lines):
+        if blank_or_comment_regex.match(line):
+            insert_index = idx + 1
+            continue
 
-        new_data, count = func_pattern.subn(repl, data, count=1)
+        if declaration_regex.match(line):
+            insert_index = idx + 1
+            continue
 
-        if count:
-            write(path, new_data)
-            print("[OK] patched open.c faccessat")
-        else:
-            print("[WARN] do_faccessat function body not matched")
+        break
 
-        return
+    hook = (
+        "\n#ifdef CONFIG_KSU\n"
+        "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+        "#endif\n"
+    )
 
-    print("[WARN] open.c faccessat hook not applied")
+    lines.insert(insert_index, hook)
+    new_body = "".join(lines)
+
+    write(path, data[:brace_start + 1] + new_body + data[end - 1:])
+    print("[OK] patched open.c faccessat after declarations")
 
 
 
