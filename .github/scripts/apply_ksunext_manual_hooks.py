@@ -168,57 +168,94 @@ extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
 
     data = read(path)
 
+    # Tìm đúng function do_sys_open(), không patch global bừa
+    func_pattern = re.compile(
+        r"(?P<header>(?:static\s+)?(?:long|int)\s+do_sys_open\s*\(\s*"
+        r"int\s+dfd\s*,\s*"
+        r"const\s+char\s+__user\s+\*filename\s*,\s*"
+        r"int\s+flags\s*,\s*"
+        r"umode_t\s+mode\s*\)\s*\{)",
+        re.S,
+    )
+
+    m = func_pattern.search(data)
+
+    if not m:
+        print("[WARN] do_sys_open() not found in fs/open.c, open hook not applied")
+        return
+
+    # Insert prototype trước do_sys_open()
     if "extern int ksu_handle_openat" not in data:
-        if "long do_sys_openat2(" in data:
-            insert_before(path, "long do_sys_openat2(", proto)
-        elif "long do_sys_open(" in data:
-            insert_before(path, "long do_sys_open(", proto)
-        elif "SYSCALL_DEFINE3(openat" in data:
-            insert_before(path, "SYSCALL_DEFINE3(openat", proto)
-        else:
-            print("[WARN] cannot find open function marker for prototype")
+        data = data[:m.start()] + proto + "\n\n" + data[m.start():]
+        write(path, data)
+        print("[OK] inserted openat prototype")
+        data = read(path)
+        m = func_pattern.search(data)
 
-    data = read(path)
-
-    if "ksu_handle_openat(&dfd" in data:
+    if "ksu_handle_openat(&dfd, &filename, &flags);" in data:
         print("[SKIP] open.c already patched")
         return
 
-    # Case 1: kernel có do_sys_openat2()
-    if "long do_sys_openat2(" in data:
-        print("[INFO] patching open.c using do_sys_openat2")
-
-        replace_regex_once(
-            path,
-            r"(?P<indent>\s*)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\(\s*how\s*,\s*&op\s*\);",
-            r"""\g<indent>int \g<var>;
-
-#ifdef CONFIG_KSU
-\g<indent>ksu_handle_openat(&dfd, &filename, &how->flags);
-#endif
-\g<indent>\g<var> = build_open_flags(how, &op);""",
-            required=False,
-        )
+    # Xác định body của do_sys_open()
+    start = m.start()
+    brace_start = data.find("{", m.start())
+    if brace_start == -1:
+        print("[WARN] cannot find do_sys_open body start")
         return
 
-    # Case 2: lisa dùng do_sys_open()
-    if "long do_sys_open(" in data:
-        print("[INFO] patching open.c using do_sys_open")
+    depth = 0
+    end = None
 
-        replace_regex_once(
-            path,
-            r"(?P<indent>\s*)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\(\s*flags\s*,\s*mode\s*,\s*&op\s*\);",
-            r"""\g<indent>int \g<var>;
+    for i in range(brace_start, len(data)):
+        if data[i] == "{":
+            depth += 1
+        elif data[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
 
-#ifdef CONFIG_KSU
-\g<indent>ksu_handle_openat(&dfd, &filename, &flags);
-#endif
-\g<indent>\g<var> = build_open_flags(flags, mode, &op);""",
-            required=False,
-        )
+    if end is None:
+        print("[WARN] cannot find do_sys_open body end")
         return
 
-    print("[WARN] open hook not applied: no supported open function found")
+    before = data[:start]
+    body = data[start:end]
+    after = data[end:]
+
+    # Patch đúng block khai báo trong do_sys_open()
+    # Quan trọng: hook đặt SAU toàn bộ declarations để tránh lỗi declaration-after-statement.
+    block_pattern = re.compile(
+        r"(?P<indent>[ \t]*)struct\s+open_flags\s+op;\s*\n"
+        r"(?P=indent)int\s+(?P<var>err|fd)\s*=\s*build_open_flags\s*\(\s*flags\s*,\s*mode\s*,\s*&op\s*\)\s*;\s*\n"
+        r"(?P=indent)(?P<tmp>struct\s+filename\s+\*tmp[^;]*;)",
+        re.S,
+    )
+
+    bm = block_pattern.search(body)
+
+    if not bm:
+        print("[WARN] do_sys_open declaration block not found, open hook not applied")
+        return
+
+    indent = bm.group("indent")
+    var = bm.group("var")
+    tmp_decl = bm.group("tmp")
+
+    replacement = (
+        f"{indent}struct open_flags op;\n"
+        f"{indent}int {var};\n"
+        f"{indent}{tmp_decl}\n\n"
+        f"#ifdef CONFIG_KSU\n"
+        f"{indent}ksu_handle_openat(&dfd, &filename, &flags);\n"
+        f"#endif\n"
+        f"{indent}{var} = build_open_flags(flags, mode, &op);"
+    )
+
+    body_new = block_pattern.sub(replacement, body, count=1)
+
+    write(path, before + body_new + after)
+    print("[OK] patched open.c inside do_sys_open")
 
 
 def patch_read_write():
