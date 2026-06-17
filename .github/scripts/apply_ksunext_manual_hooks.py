@@ -98,6 +98,9 @@ def patch_defconfig(defconfig):
         "# KernelSU Next",
         "CONFIG_KSU=y",
         "# CONFIG_KSU_KPROBE_HOOKS is not set",
+		"# CONFIG_KSU_KPROBES_HOOK is not set",
+		"# CONFIG_KSU_KPROBES_HOOKS is not set",
+		"# CONFIG_KSU_WITH_KPROBES is not set",
         "",
     ]
     write(path, "\n".join(lines))
