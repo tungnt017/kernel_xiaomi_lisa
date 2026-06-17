@@ -11,9 +11,13 @@ on:
         description: "Build jobs"
         required: true
         default: "auto"
+      release_tag:
+        description: "Release tag name"
+        required: true
+        default: "ksunext-lisa-manual"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -87,27 +91,54 @@ jobs:
             CC=clang LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu-
 
-      - name: Collect artifacts
-        run: |
-          set -e
-          mkdir -p artifacts
-
-          find "${OUT_DIR}/arch/arm64/boot" -maxdepth 2 -type f \( \
-            -name "Image" -o \
-            -name "Image.gz" -o \
-            -name "Image.gz-dtb" -o \
-            -name "*.dtb" -o \
-            -name "*.dtbo" \
-          \) -exec cp -v {} artifacts/ \; || true
-
-          find "${OUT_DIR}" -type f -name "*.ko" -exec cp -v {} artifacts/ \; || true
-
-          echo "Collected artifacts:"
-          find artifacts -type f -maxdepth 1 -print
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lisa-kernel-ksunext-manual
-          path: artifacts/*
-          if-no-files-found: error
+          - name: Collect artifacts
+                  run: |
+                    set -e
+          
+                    mkdir -p artifacts/modules
+          
+                    if [ -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
+                      cp -v "${OUT_DIR}/arch/arm64/boot/Image" artifacts/Image
+                      gzip -c "${OUT_DIR}/arch/arm64/boot/Image" > artifacts/Image.gz
+                    else
+                      echo "ERROR: Image not found"
+                      find "${OUT_DIR}/arch/arm64/boot" -type f -maxdepth 3 -print || true
+                      exit 1
+                    fi
+          
+                    find "${OUT_DIR}" -type f -name "*.ko" -exec cp -v {} artifacts/modules/ \; || true
+          
+                    echo "Artifacts:"
+                    find artifacts -type f -print
+          
+                - name: Upload kernel artifacts
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: lisa-kernel-ksunext-manual
+                    path: artifacts/*
+                    if-no-files-found: error
+          
+                - name: Upload Image and Image.gz to GitHub Release
+                  env:
+                    GH_TOKEN: ${{ github.token }}
+                    RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+                  run: |
+                    set -e
+          
+                    RELEASE_NAME="Lisa Kernel KernelSU Next Manual - ${RELEASE_TAG}"
+          
+                    echo "Using release tag: ${RELEASE_TAG}"
+          
+                    if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+                      echo "Release exists, uploading assets..."
+                    else
+                      echo "Creating release..."
+                      gh release create "${RELEASE_TAG}" \
+                        --title "${RELEASE_NAME}" \
+                        --notes "KernelSU Next manual hook kernel build for Xiaomi lisa."
+                    fi
+          
+                    gh release upload "${RELEASE_TAG}" \
+                      artifacts/Image \
+                      artifacts/Image.gz \
+                      --clobber
