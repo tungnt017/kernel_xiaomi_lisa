@@ -316,53 +316,89 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
         print("[SKIP] stat.c already patched")
         return
 
-    # Preferred: hook vfs_statx()
-    if "int vfs_statx(" in data:
-        print("[INFO] patching stat.c using vfs_statx")
-
-        pattern = (
-            r"(int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
-            r"const\s+char\s+__user\s+\*filename\s*,\s*"
-            r"int\s+flags\s*,.*?\)\s*\{)"
-        )
-
-        replace_regex_once(
-            path,
-            pattern,
-            r"""\1
-
-#ifdef CONFIG_KSU
-    ksu_handle_stat(&dfd, &filename, &flags);
-#endif""",
-            required=True,
-            flags=re.S,
-        )
+    if "int vfs_statx(" not in data:
+        print("[WARN] vfs_statx not found, stat hook not applied")
         return
 
-    # Fallback: hook vfs_fstatat()
-    if "int vfs_fstatat(" in data:
-        print("[INFO] patching stat.c using vfs_fstatat fallback")
+    print("[INFO] patching stat.c using vfs_statx declaration-safe mode")
 
-        pattern = (
-            r"(int\s+vfs_fstatat\s*\(\s*int\s+dfd\s*,\s*"
-            r"const\s+char\s+__user\s+\*filename\s*,.*?"
-            r"int\s+flags\s*\)\s*\{)"
-        )
+    func_pattern = re.compile(
+        r"(?P<header>int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
+        r"const\s+char\s+__user\s+\*filename\s*,\s*"
+        r"int\s+flags\s*,.*?\)\s*\{)",
+        re.S,
+    )
 
-        replace_regex_once(
-            path,
-            pattern,
-            r"""\1
+    m = func_pattern.search(data)
 
-#ifdef CONFIG_KSU
-    ksu_handle_stat(&dfd, &filename, &flags);
-#endif""",
-            required=False,
-            flags=re.S,
-        )
+    if not m:
+        print("[WARN] cannot locate vfs_statx function body")
         return
 
-    print("[WARN] stat hook not applied: no supported stat function found")
+    brace_start = data.find("{", m.start())
+    if brace_start == -1:
+        print("[WARN] cannot find vfs_statx opening brace")
+        return
+
+    depth = 0
+    end = None
+
+    for i in range(brace_start, len(data)):
+        if data[i] == "{":
+            depth += 1
+        elif data[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end is None:
+        print("[WARN] cannot find vfs_statx function end")
+        return
+
+    before = data[:brace_start + 1]
+    body = data[brace_start + 1:end - 1]
+    after = data[end - 1:]
+
+    lines = body.splitlines(True)
+
+    insert_index = 0
+
+    declaration_regex = re.compile(
+        r"^\s*(const\s+)?("
+        r"struct|unsigned|signed|int|long|short|char|bool|umode_t|"
+        r"uid_t|gid_t|loff_t|size_t|ssize_t|u8|u16|u32|u64|s8|s16|s32|s64|"
+        r"enum"
+        r")\b.*;\s*(/\*.*\*/)?\s*$"
+    )
+
+    blank_or_comment_regex = re.compile(
+        r"^\s*$|^\s*/\*.*\*/\s*$|^\s*//.*$"
+    )
+
+    for idx, line in enumerate(lines):
+        if blank_or_comment_regex.match(line):
+            insert_index = idx + 1
+            continue
+
+        if declaration_regex.match(line):
+            insert_index = idx + 1
+            continue
+
+        break
+
+    hook = (
+        "\n#ifdef CONFIG_KSU\n"
+        "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+        "#endif\n"
+    )
+
+    lines.insert(insert_index, hook)
+
+    new_body = "".join(lines)
+
+    write(path, before + new_body + after)
+    print("[OK] patched stat.c after declarations")
 
 
 def patch_reboot():
