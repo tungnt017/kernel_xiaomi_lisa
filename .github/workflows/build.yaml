@@ -12,9 +12,9 @@ on:
         required: true
         default: "auto"
       release_tag:
-        description: "GitHub Release tag name"
-        required: true
-        default: "ksunext-lisa-manual"
+        description: "GitHub Release tag name, empty = auto run number"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -106,11 +106,12 @@ jobs:
 
           bash build.sh
 
-      - name: Collect artifacts
+      - name: Collect Image, Image.gz, modules and flashable zip
         run: |
           set -e
 
           mkdir -p artifacts/modules
+          mkdir -p artifacts/zips
 
           echo "Searching kernel images..."
           find . -type f \( \
@@ -134,9 +135,30 @@ jobs:
           gzip -c "${IMAGE_PATH}" > artifacts/Image.gz
 
           echo "Collecting kernel modules..."
-          find . -type f -name "*.ko" -exec cp -v {} artifacts/modules/ \; || true
+          find . -type f -name "*.ko" \
+            ! -path "./artifacts/*" \
+            -exec cp -v {} artifacts/modules/ \; || true
 
-          echo "Artifacts:"
+          echo "Searching flashable zip files..."
+
+          mapfile -t ZIP_FILES < <(
+            find . -type f -name "*.zip" \
+              ! -path "./.git/*" \
+              ! -path "./artifacts/*" \
+              ! -path "./KernelSU-Next/*" \
+              | sort
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "WARNING: No zip found. build.sh may not have packed AnyKernel3."
+          else
+            for zipfile in "${ZIP_FILES[@]}"; do
+              echo "Found zip: ${zipfile}"
+              cp -v "${zipfile}" artifacts/zips/
+            done
+          fi
+
+          echo "Final artifacts:"
           find artifacts -type f -print
 
       - name: Upload kernel artifacts
@@ -146,12 +168,18 @@ jobs:
           path: artifacts/**
           if-no-files-found: error
 
-      - name: Upload Image and Image.gz to GitHub Release
+      - name: Upload Image, Image.gz and zip to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -e
+
+          if [ -z "${INPUT_RELEASE_TAG}" ]; then
+            RELEASE_TAG="ksunext-lisa-${{ github.run_number }}"
+          else
+            RELEASE_TAG="${INPUT_RELEASE_TAG}"
+          fi
 
           RELEASE_NAME="Lisa Kernel KernelSU Next Manual - ${RELEASE_TAG}"
 
@@ -166,7 +194,19 @@ jobs:
               --notes "KernelSU Next manual hook kernel build for Xiaomi lisa."
           fi
 
-          gh release upload "${RELEASE_TAG}" \
-            artifacts/Image \
-            artifacts/Image.gz \
-            --clobber
+          ASSETS=()
+          ASSETS+=("artifacts/Image")
+          ASSETS+=("artifacts/Image.gz")
+
+          if compgen -G "artifacts/zips/*.zip" > /dev/null; then
+            while IFS= read -r zipfile; do
+              ASSETS+=("${zipfile}")
+            done < <(find artifacts/zips -type f -name "*.zip" | sort)
+          else
+            echo "WARNING: No zip found in artifacts/zips. Only uploading Image and Image.gz."
+          fi
+
+          echo "Uploading release assets:"
+          printf '%s\n' "${ASSETS[@]}"
+
+          gh release upload "${RELEASE_TAG}" "${ASSETS[@]}" --clobber
