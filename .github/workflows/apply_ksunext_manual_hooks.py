@@ -142,34 +142,57 @@ def patch_open():
     path = "fs/open.c"
 
     proto = """#ifdef CONFIG_KSU
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-                int *mode, int *flags);
 extern int ksu_handle_openat(int *dfd, const char __user **filename_user,
-                 int *flags);
+                             int *flags);
 #endif"""
 
-    insert_before(path, "long do_faccessat(", proto)
+    # luôn insert proto (nếu chưa có)
+    try:
+        insert_before(path, "SYSCALL_DEFINE", proto)
+    except:
+        print("[WARN] cannot insert proto normally, skip")
 
-    replace_once(
-        path,
-        """\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */""",
-        """#ifdef CONFIG_KSU
-    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-#endif
-    if (mode & ~S_IRWXO)    /* where's F_OK, X_OK, W_OK, R_OK? */""",
-        required=False,
-    )
+    data = read(path)
 
-    replace_once(
-        path,
-        """\tstruct open_flags op;""",
-        """\tstruct open_flags op;
+    if "ksu_handle_openat" in data:
+        print("[SKIP] open already patched")
+        return
 
+    # ✅ CASE 1: kernel dùng openat2
+    if "do_sys_openat2(" in data:
+        print("[INFO] using openat2 hook")
+
+        replace_once(
+            path,
+            "struct open_flags op;",
+            """struct open_flags op;
+
+#ifdef CONFIG_KSU
+    ksu_handle_openat(&dfd, &filename, &how->flags);
+#endif""",
+            required=False,
+        )
+        return
+
+    # ✅ CASE 2: kernel dùng openat (lisa)
+    if "SYSCALL_DEFINE3(openat" in data:
+        print("[INFO] using openat hook")
+
+        new_data = data.replace(
+            "SYSCALL_DEFINE3(openat",
+            """SYSCALL_DEFINE3(openat
 #ifdef CONFIG_KSU
     ksu_handle_openat(&dfd, &filename, &flags);
 #endif""",
-        required=False,
-    )
+            1
+        )
+
+        write(path, new_data)
+        print("[OK] patched open.c (openat mode)")
+        return
+
+    # ❌ không tìm thấy gì
+    print("[WARN] open hook not applied (no matching function)")
 
 
 def patch_read_write():
