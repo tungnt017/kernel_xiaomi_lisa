@@ -1,0 +1,172 @@
+name: Build Lisa Kernel With KernelSU Next Manual Hooks
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lisa_defconfig"
+      jobs:
+        description: "Build jobs"
+        required: true
+        default: "auto"
+      release_tag:
+        description: "GitHub Release tag name"
+        required: true
+        default: "ksunext-lisa-manual"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      OUT_DIR: out
+      DEFCONFIG: ${{ github.event.inputs.defconfig }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          sudo apt update
+          sudo apt install -y \
+            git curl wget zip unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libyaml-dev \
+            python3 python-is-python3 \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            cpio rsync file gzip
+
+      - name: Add KernelSU Next source
+        run: |
+          set -e
+
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+      - name: Apply KernelSU Next manual hooks
+        run: |
+          set -e
+
+          python3 .github/scripts/apply_ksunext_manual_hooks.py "${DEFCONFIG}"
+
+      - name: Show KernelSU config
+        run: |
+          set -e
+
+          DEFCONFIG_PATH=""
+
+          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+          else
+            echo "ERROR: defconfig not found: ${DEFCONFIG}"
+            find arch/arm64/configs -name "*defconfig" | sort
+            exit 1
+          fi
+
+          echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
+          grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+
+      - name: Build kernel using build.sh
+        run: |
+          set -e
+
+          chmod +x build.sh
+
+          if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
+            export JOBS="$(nproc --all)"
+          else
+            export JOBS="${{ github.event.inputs.jobs }}"
+          fi
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export OUT_DIR="${OUT_DIR}"
+          export DEFCONFIG="${DEFCONFIG}"
+
+          echo "ARCH=${ARCH}"
+          echo "SUBARCH=${SUBARCH}"
+          echo "OUT_DIR=${OUT_DIR}"
+          echo "DEFCONFIG=${DEFCONFIG}"
+          echo "JOBS=${JOBS}"
+
+          bash build.sh
+
+      - name: Collect artifacts
+        run: |
+          set -e
+
+          mkdir -p artifacts/modules
+
+          echo "Searching kernel images..."
+          find . -type f \( \
+            -path "*/arch/arm64/boot/Image" -o \
+            -path "*/arch/arm64/boot/Image.gz" -o \
+            -path "*/arch/arm64/boot/Image.gz-dtb" \
+          \) -print || true
+
+          IMAGE_PATH="$(find . -type f -path "*/arch/arm64/boot/Image" | head -n 1 || true)"
+
+          if [ -z "${IMAGE_PATH}" ]; then
+            echo "ERROR: Image not found"
+            echo "Available Image files:"
+            find . -type f -name "Image*" | sort || true
+            exit 1
+          fi
+
+          echo "Using IMAGE_PATH=${IMAGE_PATH}"
+
+          cp -v "${IMAGE_PATH}" artifacts/Image
+          gzip -c "${IMAGE_PATH}" > artifacts/Image.gz
+
+          echo "Collecting kernel modules..."
+          find . -type f -name "*.ko" -exec cp -v {} artifacts/modules/ \; || true
+
+          echo "Artifacts:"
+          find artifacts -type f -print
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-kernel-ksunext-manual
+          path: artifacts/**
+          if-no-files-found: error
+
+      - name: Upload Image and Image.gz to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -e
+
+          RELEASE_NAME="Lisa Kernel KernelSU Next Manual - ${RELEASE_TAG}"
+
+          echo "Using release tag: ${RELEASE_TAG}"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release exists, uploading assets..."
+          else
+            echo "Creating release..."
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes "KernelSU Next manual hook kernel build for Xiaomi lisa."
+          fi
+
+          gh release upload "${RELEASE_TAG}" \
+            artifacts/Image \
+            artifacts/Image.gz \
+            --clobber
