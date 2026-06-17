@@ -1,0 +1,391 @@
+name: "📦 Repack compiled Image/Image.gz → stock boot.img & stock AnyKernel3 ZIP"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_zip_url:
+        description: "🔗 Direct URL to Artifacts ZIP containing Image or Image.gz"
+        required: true
+        type: string
+      stock_boot_img_url:
+        description: "🔗 Direct URL to stock boot.img"
+        required: true
+        type: string
+      stock_ak3_zip_url:
+        description: "🔗 Direct URL to stock AnyKernel3 ZIP"
+        required: true
+        type: string
+      output_prefix:
+        description: "📦 Output file name prefix"
+        required: false
+        default: "lisa-SukiSU"
+        type: string
+
+jobs:
+  repack:
+    name: "📦 Image/Image.gz → boot.img + AK3 ZIP"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Step 1: Download Artifacts ZIP"
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/artifacts
+          cd work
+
+          echo "📥 Downloading Artifacts ZIP..."
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.kernel_zip_url }}" -o artifacts.zip
+
+          echo "📋 Downloaded artifact:"
+          ls -lh artifacts.zip
+
+          echo "📦 Extracting Artifacts ZIP..."
+          unzip -o artifacts.zip -d ./artifacts/
+
+          echo "📋 Extracted files:"
+          find ./artifacts/ -type f | sort
+
+      - name: "🔍 Step 2: Find compiled kernel Image/Image.gz"
+        run: |
+          set -euo pipefail
+          cd work
+
+          KERNEL_IMAGE=""
+
+          echo "🔍 Searching for Image.gz or Image..."
+
+          for pattern in "Image.gz" "Image"; do
+            while IFS= read -r f; do
+              KERNEL_IMAGE="$f"
+              break 2
+            done < <(find ./artifacts/ -type f -name "$pattern" 2>/dev/null | sort)
+          done
+
+          if [ -z "$KERNEL_IMAGE" ]; then
+            echo "❌ No Image.gz or Image found in Artifacts ZIP"
+            echo "📋 Available files:"
+            find ./artifacts/ -type f | sort
+            exit 1
+          fi
+
+          KERNEL_BASENAME="$(basename "$KERNEL_IMAGE")"
+
+          echo "✅ Found compiled kernel:"
+          echo "   Path: $KERNEL_IMAGE"
+          echo "   Name: $KERNEL_BASENAME"
+
+          ls -lh "$KERNEL_IMAGE"
+          file "$KERNEL_IMAGE" || true
+
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> "$GITHUB_ENV"
+          echo "KERNEL_BASENAME=$KERNEL_BASENAME" >> "$GITHUB_ENV"
+
+      - name: "✅ Step 3: Verify compiled kernel Image/Image.gz"
+        run: |
+          set -euo pipefail
+          cd work
+
+          export VERIFY_SRC="${{ env.KERNEL_IMAGE }}"
+          export VERIFY_NAME="${{ env.KERNEL_BASENAME }}"
+
+          python3 - <<'PYEOF'
+          import os
+          import sys
+          import zlib
+          import hashlib
+
+          p = os.environ["VERIFY_SRC"]
+          name = os.environ["VERIFY_NAME"]
+
+          with open(p, "rb") as f:
+              data = f.read()
+
+          def fail(m):
+              print("❌ " + m)
+              sys.exit(1)
+
+          def ok(m):
+              print("✅ " + m)
+
+          def warn(m):
+              print("⚠️ " + m)
+
+          def is_arm64(buf):
+              return len(buf) >= 0x40 and buf[0x38:0x3c] == b"ARMd"
+
+          if not data:
+              fail("Kernel image is empty")
+
+          print(f"📦 {name}: {len(data)} bytes")
+          print(f"🔐 SHA256: {hashlib.sha256(data).hexdigest()}")
+
+          if name == "Image.gz" or data[:2] == b"\x1f\x8b":
+              if data[:2] != b"\x1f\x8b":
+                  fail("gzip magic 1f8b missing")
+
+              try:
+                  d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                  raw = d.decompress(data) + d.flush()
+              except Exception as e:
+                  fail(f"gzip decompress failed: {e}")
+
+              if len(raw) < 1024 * 1024:
+                  fail(f"Decompressed image too small: {len(raw)} bytes")
+
+              if not is_arm64(raw):
+                  fail("No ARM64 magic after gzip decompress")
+
+              ok(f"Image.gz valid, decompressed {len(raw)} bytes, ARM64 magic OK")
+
+              if d.unused_data:
+                  warn(f"Trailing data detected: {len(d.unused_data)} bytes")
+
+          elif name == "Image":
+              if len(data) < 1024 * 1024:
+                  fail(f"Raw Image too small: {len(data)} bytes")
+
+              if not is_arm64(data):
+                  fail("No ARM64 magic in raw Image")
+
+              ok("Raw Image ARM64 magic OK")
+
+          else:
+              fail(f"Unsupported kernel filename: {name}. Only Image and Image.gz are allowed.")
+
+          ok("Kernel image verification PASSED")
+          PYEOF
+
+      - name: "📥 Step 4: Download stock boot.img & stock AnyKernel3 ZIP"
+        run: |
+          set -euo pipefail
+          cd work
+
+          echo "📥 Downloading stock boot.img..."
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.stock_boot_img_url }}" -o stock_boot.img
+
+          echo "📥 Downloading stock AnyKernel3 ZIP..."
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.stock_ak3_zip_url }}" -o stock-ak3.zip
+
+          echo "📋 Downloaded stock files:"
+          ls -lh stock_boot.img stock-ak3.zip
+
+      - name: "🔍 Step 5: Verify stock files"
+        run: |
+          set -euo pipefail
+          cd work
+
+          [ -s stock_boot.img ] || { echo "❌ stock_boot.img empty/missing"; exit 1; }
+          [ -s stock-ak3.zip ] || { echo "❌ stock-ak3.zip empty/missing"; exit 1; }
+
+          unzip -t stock-ak3.zip
+
+          echo "✅ Stock files verified"
+
+      - name: "🛠️ Step 6: Install magiskboot"
+        run: |
+          set -euo pipefail
+          cd work
+
+          echo "📥 Fetching latest Magisk release..."
+
+          MAGISK_URL="$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+\.apk' \
+            | head -1)"
+
+          [ -n "$MAGISK_URL" ] || { echo "❌ Cannot find Magisk APK URL"; exit 1; }
+
+          echo "📥 Downloading Magisk APK..."
+          curl -fL --retry 3 --retry-delay 2 "$MAGISK_URL" -o Magisk.apk
+
+          echo "📦 Extracting magiskboot..."
+          unzip -o Magisk.apk 'lib/x86_64/libmagiskboot.so' -d _mb/
+
+          cp _mb/lib/x86_64/libmagiskboot.so ./magiskboot
+          chmod +x ./magiskboot
+
+          echo "✅ magiskboot ready"
+          ./magiskboot --help || true
+
+      - name: "📂 Step 7: Unpack stock boot.img"
+        run: |
+          set -euo pipefail
+
+          cd work
+          rm -rf bootwork
+          mkdir bootwork
+
+          cp stock_boot.img bootwork/boot.img
+          cp magiskboot bootwork/
+
+          cd bootwork
+
+          echo "📂 Unpacking stock boot.img..."
+          ./magiskboot unpack boot.img
+
+          echo "📋 Unpacked boot files:"
+          ls -lah
+
+          [ -f kernel ] || { echo "❌ magiskboot did not extract kernel"; exit 1; }
+
+          echo "✅ Stock boot.img unpacked"
+
+      - name: "🧩 Step 8: Replace kernel in boot.img"
+        run: |
+          set -euo pipefail
+          cd work/bootwork
+
+          STOCK_KERNEL_SIZE="$(stat -c%s kernel)"
+          echo "📋 Stock boot kernel size: $STOCK_KERNEL_SIZE bytes"
+
+          rm -f kernel
+          cp "../${{ env.KERNEL_IMAGE }}" ./kernel
+          chmod 0644 kernel
+
+          NEW_KERNEL_SIZE="$(stat -c%s kernel)"
+          echo "📋 New kernel size: $NEW_KERNEL_SIZE bytes"
+
+          echo "✅ Kernel replaced in boot.img"
+
+      - name: "📦 Step 9: Repack boot.img"
+        run: |
+          set -euo pipefail
+          cd work/bootwork
+
+          echo "📦 Repacking boot.img..."
+          ./magiskboot repack boot.img
+
+          if [ -f new-boot.img ]; then
+            mv new-boot.img ../boot-repacked.img
+          elif [ -f image-new.img ]; then
+            mv image-new.img ../boot-repacked.img
+          else
+            echo "❌ Repacked boot image not found"
+            ls -lah
+            exit 1
+          fi
+
+          echo "✅ boot-repacked.img created:"
+          ls -lh ../boot-repacked.img
+
+      - name: "📂 Step 10: Extract stock AnyKernel3 ZIP & detect kernel target"
+        run: |
+          set -euo pipefail
+
+          cd work
+          rm -rf ak3work
+          mkdir ak3work
+
+          echo "📦 Extracting stock AnyKernel3 ZIP..."
+          unzip -o stock-ak3.zip -d ak3work/
+
+          echo "📋 Stock AK3 contents:"
+          find ak3work -maxdepth 3 -type f | sort
+
+          [ -f ak3work/anykernel.sh ] || { echo "❌ anykernel.sh missing"; exit 1; }
+
+          cd ak3work
+
+          STOCK_KERNEL_TARGET=""
+
+          for k in Image.gz Image Image.gz-dtb Image.lz4 Image.lz4-dtb zImage zImage-dtb; do
+            if [ -f "$k" ]; then
+              STOCK_KERNEL_TARGET="$k"
+              break
+            fi
+          done
+
+          if [ -z "$STOCK_KERNEL_TARGET" ]; then
+            STOCK_KERNEL_TARGET="${{ env.KERNEL_BASENAME }}"
+            echo "⚠️ No kernel image found in stock AK3 ZIP"
+            echo "⚠️ Will add new kernel as: $STOCK_KERNEL_TARGET"
+          else
+            echo "✅ Stock AK3 kernel target: $STOCK_KERNEL_TARGET"
+          fi
+
+          echo "STOCK_KERNEL_TARGET=$STOCK_KERNEL_TARGET" >> "$GITHUB_ENV"
+
+      - name: "🧹 Step 11: Replace kernel in AnyKernel3 ZIP"
+        run: |
+          set -euo pipefail
+          cd work/ak3work
+
+          echo "🧹 Removing old kernel images from AK3..."
+          rm -f Image Image.gz Image.gz-dtb Image.lz4 Image.lz4-dtb zImage zImage-dtb 2>/dev/null || true
+
+          if [ "${{ env.STOCK_KERNEL_TARGET }}" = "Image.gz-dtb" ] && [ "${{ env.KERNEL_BASENAME }}" = "Image.gz" ]; then
+            echo "⚠️ Stock AK3 expects Image.gz-dtb but artifact is Image.gz"
+            echo "⚠️ Renaming Image.gz to Image.gz-dtb"
+            echo "⚠️ Make sure your device/AK3 does not require appended DTB"
+          fi
+
+          cp "../${{ env.KERNEL_IMAGE }}" "./${{ env.STOCK_KERNEL_TARGET }}"
+          chmod 0644 "./${{ env.STOCK_KERNEL_TARGET }}"
+
+          echo "✅ AK3 kernel replaced:"
+          ls -lh "./${{ env.STOCK_KERNEL_TARGET }}"
+
+      - name: "📦 Step 12: Repack AnyKernel3 ZIP"
+        run: |
+          set -euo pipefail
+          cd work/ak3work
+
+          AK3_ZIP="${{ inputs.output_prefix }}-AnyKernel3-REPACKED.zip"
+
+          echo "📦 Creating AK3 ZIP: $AK3_ZIP"
+          zip -r9 "${{ github.workspace }}/$AK3_ZIP" . -x ".git*" "*.DS_Store"
+
+          echo "AK3_ZIP=$AK3_ZIP" >> "$GITHUB_ENV"
+
+          echo "✅ $AK3_ZIP created"
+          ls -lh "${{ github.workspace }}/$AK3_ZIP"
+
+      - name: "📦 Step 13a: Prepare boot-repacked.img for upload"
+        run: |
+          set -euo pipefail
+
+          BOOT_IMG="${{ inputs.output_prefix }}-boot-repacked.img"
+
+          cp work/boot-repacked.img "${{ github.workspace }}/$BOOT_IMG"
+
+          echo "BOOT_IMG=$BOOT_IMG" >> "$GITHUB_ENV"
+
+          echo "✅ $BOOT_IMG ready"
+          ls -lh "${{ github.workspace }}/$BOOT_IMG"
+
+      - name: "📤 Step 13b: Upload boot-repacked.img"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.output_prefix }}-boot-repacked"
+          path: ${{ github.workspace }}/${{ env.BOOT_IMG }}
+          retention-days: 30
+
+      - name: "📤 Step 13c: Upload AnyKernel3 ZIP"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.output_prefix }}-AnyKernel3-REPACKED"
+          path: ${{ github.workspace }}/${{ env.AK3_ZIP }}
+          retention-days: 30
+
+      - name: "📊 Summary"
+        run: |
+          echo "╔════════════════════════════════════════════════════╗"
+          echo "║  ✅ IMAGE/IMAGE.GZ → BOOT.IMG + AK3 ZIP DONE      ║"
+          echo "╚════════════════════════════════════════════════════╝"
+          echo ""
+          echo "  Source artifact ZIP:"
+          echo "    ${{ inputs.kernel_zip_url }}"
+          echo ""
+          echo "  Kernel found:"
+          echo "    ${{ env.KERNEL_BASENAME }}"
+          echo ""
+          echo "  AK3 target:"
+          echo "    ${{ env.STOCK_KERNEL_TARGET }}"
+          echo ""
+          echo "  💾 Output 1 — boot.img:"
+          echo "    ${{ env.BOOT_IMG }}"
+          echo "    📱 fastboot flash boot ${{ env.BOOT_IMG }}"
+          echo ""
+          echo "  💾 Output 2 — AnyKernel3 ZIP:"
+          echo "    ${{ env.AK3_ZIP }}"
+          echo "    📱 adb sideload ${{ env.AK3_ZIP }}"
