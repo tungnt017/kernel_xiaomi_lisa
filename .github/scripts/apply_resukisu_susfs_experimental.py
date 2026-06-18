@@ -114,136 +114,169 @@ def find_kernel_patch(susfs_dir, requested):
             return matches[0]
     raise FileNotFoundError("cannot auto-find SUSFS kernel patch under kernel_patches")
 
+def insert_after_last_decl_in_function(data, func_regex, hook, label):
+    m = re.search(func_regex, data, re.S)
+    if not m:
+        print(f"[WARN] {label}: function not found")
+        return data, False
+    brace = data.find("{", m.start())
+    depth = 0
+    end = None
+    for i in range(brace, len(data)):
+        if data[i] == "{": depth += 1
+        elif data[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end is None:
+        print(f"[WARN] {label}: function end not found")
+        return data, False
+    body = data[brace+1:end]
+    if hook.strip() in body:
+        print(f"[SKIP] {label}: hook already exists")
+        return data, True
+    lines = body.splitlines(True)
+    decl = re.compile(r"^\s*(?:const\s+)?(?:struct|unsigned|signed|int|long|short|char|bool|kuid_t|kgid_t|uid_t|gid_t|umode_t|loff_t|size_t|ssize_t|u8|u16|u32|u64|s8|s16|s32|s64|enum)\b.*;\s*$")
+    blank_comment = re.compile(r"^\s*$|^\s*/\*.*\*/\s*$|^\s*//.*$")
+    idx = 0
+    for n, line in enumerate(lines):
+        if blank_comment.match(line) or decl.match(line):
+            idx = n + 1
+            continue
+        break
+    lines.insert(idx, hook)
+    print(f"[OK] {label}: inserted after declarations")
+    return data[:brace+1] + "".join(lines) + data[end:], True
+
 def patch_setresuid_hook():
     path = ROOT / "kernel" / "sys.c"
     if not path.exists():
-        print("[WARN] kernel/sys.c not found, cannot patch setresuid hook")
+        print("[WARN] kernel/sys.c not found")
         return
     data = read(path)
-    data = re.sub(r"\n#if defined\(CONFIG_KSU\)\s*\nextern int ksu_handle_setresuid\(uid_t ruid, uid_t euid, uid_t suid\);\s*\n#endif\s*\n\s*(?=SYSCALL_DEFINE3\s*\(\s*setresuid)", "\n", data, flags=re.S)
-    data = re.sub(r"\n\s*#if defined\(CONFIG_KSU\)\s*\n\s*ksu_handle_setresuid\(ruid, euid, suid\);\s*\n\s*#endif\s*\n", "\n", data, flags=re.S)
+    # Remove wrong hook placed before declarations from previous revisions.
+    data = re.sub(r"\n#ifdef CONFIG_KSU_SUSFS\s*\n\s*\(void\)ksu_handle_setresuid\(ruid, euid, suid\);\s*\n#endif\s*\n(?=\s*struct user_namespace \*ns)", "\n", data, flags=re.S)
+    data = re.sub(r"\n#if defined\(CONFIG_KSU\)\s*\n\s*ksu_handle_setresuid\(ruid, euid, suid\);\s*\n#endif\s*\n", "\n", data, flags=re.S)
     proto = """#ifdef CONFIG_KSU_SUSFS
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif"""
     if "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);" not in data:
-        for marker in ["long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)", "SYSCALL_DEFINE3(setresuid"]:
-            if marker in data:
-                data = data.replace(marker, proto + "\n\n" + marker, 1)
-                print("[OK] inserted ksu_handle_setresuid prototype in kernel/sys.c")
-                break
-        else:
-            print("[WARN] cannot find marker for setresuid prototype")
+        marker = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)"
+        if marker in data:
+            data = data.replace(marker, proto + "\n\n" + marker, 1)
+            print("[OK] inserted ksu_handle_setresuid prototype in kernel/sys.c")
     hook = """
 #ifdef CONFIG_KSU_SUSFS
 	(void)ksu_handle_setresuid(ruid, euid, suid);
 #endif
 """
-    if "ksu_handle_setresuid(ruid, euid, suid);" in data:
-        print("[SKIP] setresuid hook call already exists")
-        write(path, data)
-        return
-    m = re.search(r"(long\s+__sys_setresuid\s*\(\s*uid_t\s+ruid\s*,\s*uid_t\s+euid\s*,\s*uid_t\s+suid\s*\)\s*\{\s*)", data, re.S)
-    if m:
-        data = data[:m.end()] + hook + data[m.end():]
-        write(path, data)
-        print("[OK] inserted ksu_handle_setresuid call inside __sys_setresuid")
-        return
-    m = re.search(r"(SYSCALL_DEFINE3\s*\(\s*setresuid\s*,.*?\)\s*\{\s*)", data, re.S)
-    if m:
-        data = data[:m.end()] + hook + data[m.end():]
-        write(path, data)
-        print("[OK] inserted ksu_handle_setresuid call inside SYSCALL_DEFINE3(setresuid) fallback")
-        return
+    data, _ = insert_after_last_decl_in_function(
+        data,
+        r"long\s+__sys_setresuid\s*\(\s*uid_t\s+ruid\s*,\s*uid_t\s+euid\s*,\s*uid_t\s+suid\s*\)",
+        hook,
+        "kernel/sys.c __sys_setresuid",
+    )
     write(path, data)
-    print("[WARN] failed to patch setresuid hook call")
 
 def patch_sys_read_hook():
     path = ROOT / "fs" / "read_write.c"
     if not path.exists():
-        print("[WARN] fs/read_write.c not found, cannot patch sys_read hook")
+        print("[WARN] fs/read_write.c not found")
         return
     data = read(path)
     data = re.sub(r"\n\s*#ifdef\s+CONFIG_KSU(?:_SUSFS)?\s*\n\s*extern\s+int\s+ksu_handle_sys_read\s*\([^;]+;\s*\n\s*#endif\s*\n", "\n", data, flags=re.S)
     data = re.sub(r"\n\s*#ifdef\s+CONFIG_KSU(?:_SUSFS)?\s*\n\s*ksu_handle_sys_read\s*\(\s*fd\s*,\s*&buf\s*,\s*&count\s*\)\s*;\s*\n\s*#endif\s*\n", "\n", data, flags=re.S)
+    # Remove previous hook before declaration.
+    data = re.sub(r"\n#ifdef CONFIG_KSU_SUSFS\s*\n\s*ksu_handle_sys_read\(fd\);\s*\n#endif\s*\n(?=\s*struct fd f)", "\n", data, flags=re.S)
     proto = """#ifdef CONFIG_KSU_SUSFS
 extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);
 #endif"""
     if "ksu_handle_sys_read(unsigned int fd)" not in data:
-        for marker in ["ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)", "SYSCALL_DEFINE3(read,"]:
-            if marker in data:
-                data = data.replace(marker, proto + "\n\n" + marker, 1)
-                print("[OK] inserted ksu_handle_sys_read prototype in fs/read_write.c")
-                break
-        else:
-            print("[WARN] cannot find marker for sys_read prototype")
+        marker = "ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)"
+        if marker in data:
+            data = data.replace(marker, proto + "\n\n" + marker, 1)
+            print("[OK] inserted ksu_handle_sys_read prototype in fs/read_write.c")
     hook = """
 #ifdef CONFIG_KSU_SUSFS
 	ksu_handle_sys_read(fd);
 #endif
 """
-    if "ksu_handle_sys_read(fd);" in data:
-        print("[SKIP] sys_read hook call already exists")
-        write(path, data)
-        return
-    m = re.search(r"(ssize_t\s+ksys_read\s*\(\s*unsigned\s+int\s+fd\s*,\s*char\s+__user\s*\*\s*buf\s*,\s*size_t\s+count\s*\)\s*\{\s*)", data, re.S)
-    if m:
-        data = data[:m.end()] + hook + data[m.end():]
-        write(path, data)
-        print("[OK] inserted ksu_handle_sys_read call inside ksys_read")
-        return
-    m = re.search(r"(SYSCALL_DEFINE3\s*\(\s*read\s*,.*?\)\s*\{\s*)", data, re.S)
-    if m:
-        data = data[:m.end()] + hook + data[m.end():]
-        write(path, data)
-        print("[OK] inserted ksu_handle_sys_read call inside SYSCALL_DEFINE3(read) fallback")
-        return
+    data, _ = insert_after_last_decl_in_function(
+        data,
+        r"ssize_t\s+ksys_read\s*\(\s*unsigned\s+int\s+fd\s*,\s*char\s+__user\s*\*\s*buf\s*,\s*size_t\s+count\s*\)",
+        hook,
+        "fs/read_write.c ksys_read",
+    )
     write(path, data)
-    print("[WARN] failed to patch sys_read hook call")
 
 def patch_input_handle_event_hook():
     path = ROOT / "drivers" / "input" / "input.c"
     if not path.exists():
-        print("[WARN] drivers/input/input.c not found, cannot patch input hook")
+        print("[WARN] drivers/input/input.c not found")
         return
     data = read(path)
+    # Remove old fallback hook that was before local declarations in input_event().
+    data = re.sub(r"\n#ifdef CONFIG_KSU_SUSFS\s*\n\s*ksu_handle_input_handle_event\(&type, &code, &value\);\s*\n#endif\s*\n(?=\s*unsigned long flags;)", "\n", data, flags=re.S)
     proto = """#ifdef CONFIG_KSU_SUSFS
 extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
 #endif"""
-    if "ksu_handle_input_handle_event(unsigned int *type" not in data and "ksu_handle_input_handle_event (unsigned int *type" not in data:
-        markers = ["static void input_handle_event(struct input_dev *dev,", "void input_event(struct input_dev *dev,"]
-        for marker in markers:
-            if marker in data:
-                data = data.replace(marker, proto + "\n\n" + marker, 1)
-                print("[OK] inserted ksu_handle_input_handle_event prototype in drivers/input/input.c")
-                break
-        else:
-            print("[WARN] cannot find marker for input hook prototype")
+    if "ksu_handle_input_handle_event(unsigned int *type" not in data:
+        marker = "static void input_handle_event(struct input_dev *dev,"
+        if marker in data:
+            data = data.replace(marker, proto + "\n\n" + marker, 1)
+            print("[OK] inserted ksu_handle_input_handle_event prototype in drivers/input/input.c")
     hook = """
 #ifdef CONFIG_KSU_SUSFS
 	ksu_handle_input_handle_event(&type, &code, &value);
 #endif
 """
-    if "ksu_handle_input_handle_event(&type, &code, &value);" in data:
-        print("[SKIP] input_handle_event hook call already exists")
-        write(path, data)
-        return
-    # Prefer input_handle_event() before input_get_disposition(), matching common KSU input hook semantics.
-    pat = re.compile(r"(static\s+void\s+input_handle_event\s*\(\s*struct\s+input_dev\s*\*\s*dev\s*,\s*unsigned\s+int\s+type\s*,\s*unsigned\s+int\s+code\s*,\s*int\s+value\s*\)\s*\{(?P<body>.*?))(\n\s*disposition\s*=\s*input_get_disposition\s*\()", re.S)
-    m = pat.search(data)
-    if m:
-        data = data[:m.start(3)] + hook + data[m.start(3):]
-        write(path, data)
-        print("[OK] inserted ksu_handle_input_handle_event call before input_get_disposition")
-        return
-    # Fallback: input_event() top.
-    m = re.search(r"(void\s+input_event\s*\(\s*struct\s+input_dev\s*\*\s*dev\s*,\s*unsigned\s+int\s+type\s*,\s*unsigned\s+int\s+code\s*,\s*int\s+value\s*\)\s*\{\s*)", data, re.S)
-    if m:
-        data = data[:m.end()] + hook + data[m.end():]
-        write(path, data)
-        print("[OK] inserted ksu_handle_input_handle_event call inside input_event fallback")
-        return
+    if "ksu_handle_input_handle_event(&type, &code, &value);" not in data:
+        # Prefer just before input_get_disposition() in input_handle_event(), after declarations.
+        m = re.search(r"(static\s+void\s+input_handle_event\s*\([^)]*\)\s*\{.*?)(\n\s*disposition\s*=\s*input_get_disposition\s*\()", data, re.S)
+        if m:
+            data = data[:m.start(2)] + hook + data[m.start(2):]
+            print("[OK] inserted ksu_handle_input_handle_event before input_get_disposition")
+        else:
+            data, _ = insert_after_last_decl_in_function(
+                data,
+                r"void\s+input_event\s*\(\s*struct\s+input_dev\s*\*\s*dev\s*,\s*unsigned\s+int\s+type\s*,\s*unsigned\s+int\s+code\s*,\s*int\s+value\s*\)",
+                hook,
+                "drivers/input/input.c input_event fallback",
+            )
+    else:
+        print("[SKIP] input hook call already exists")
     write(path, data)
-    print("[WARN] failed to patch input_handle_event hook call")
+
+def patch_task_mmu_include():
+    path = ROOT / "fs" / "proc" / "task_mmu.c"
+    if not path.exists():
+        return
+    data = read(path)
+    if "#include <linux/susfs_def.h>" not in data:
+        marker = "#include <linux/pkeys.h>"
+        block = "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif"
+        if marker in data:
+            data = data.replace(marker, marker + "\n" + block, 1)
+            write(path, data)
+            print("[OK] inserted susfs_def include in fs/proc/task_mmu.c")
+
+def patch_mount_kabi():
+    path = ROOT / "include" / "linux" / "mount.h"
+    if not path.exists():
+        return
+    data = read(path)
+    if "susfs_mnt_id_backup" in data:
+        print("[SKIP] mount.h susfs_mnt_id_backup already exists")
+        return
+    old = "\tANDROID_KABI_RESERVE(4);"
+    new = "#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n#else\n\tANDROID_KABI_RESERVE(4);\n#endif"
+    if old in data:
+        data = data.replace(old, new, 1)
+        write(path, data)
+        print("[OK] patched include/linux/mount.h susfs_mnt_id_backup")
+    else:
+        print("[WARN] mount.h ANDROID_KABI_RESERVE(4) not found")
 
 def apply_susfs_patches():
     susfs_dir = Path(os.environ.get("SUSFS_DIR", "susfs-src")).resolve()
@@ -266,9 +299,12 @@ def apply_susfs_patches():
         copy_tree_files(optional_ksu_kernel, ROOT / "KernelSU" / "kernel")
     kernel_patch = find_kernel_patch(susfs_dir, requested_patch)
     apply_patch(kernel_patch, ROOT, continue_on_fail)
+    # Backport/fix-up rejected or checker-required parts.
     patch_setresuid_hook()
     patch_sys_read_hook()
     patch_input_handle_event_hook()
+    patch_task_mmu_include()
+    patch_mount_kabi()
     print("[INFO] Reject files after SUSFS patch:")
     for rej in sorted(ROOT.rglob("*.rej")):
         print(f"\n===== REJECT: {rej} =====")
