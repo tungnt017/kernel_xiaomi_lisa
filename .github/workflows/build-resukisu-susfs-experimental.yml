@@ -113,23 +113,47 @@ jobs:
           CONTINUE_ON_SUSFS_PATCH_FAILURE="${CONTINUE_ON_SUSFS_PATCH_FAILURE}" \
           python3 .github/scripts/apply_resukisu_susfs_experimental.py "${DEFCONFIG}" 2>&1 | tee logs/apply-susfs.log
       
-      - name: Collect SUSFS reject files
+
+      - name: Collect SUSFS reject files as txt
         if: always()
         run: |
           set -e
-          mkdir -p logs/susfs-rejects
+          mkdir -p logs/susfs-rejects-txt
 
           echo "Searching .rej files..."
-          find . -type f -name "*.rej" -print | sort | tee logs/susfs-reject-files.log || true
+          find . -type f -name "*.rej" -print | sort > logs/susfs-reject-files.log || true
 
           while IFS= read -r rej; do
             [ -z "$rej" ] && continue
-            mkdir -p "logs/susfs-rejects/$(dirname "$rej")"
-            cp -v "$rej" "logs/susfs-rejects/$rej"
+
+            safe_name="$(echo "$rej" | sed 's#^\./##; s#/#__#g')"
+            cp -v "$rej" "logs/susfs-rejects-txt/${safe_name}.txt"
           done < logs/susfs-reject-files.log
 
-          git diff > logs/susfs-partial.diff || true
-          git status --short > logs/susfs-git-status.log || true
+          {
+            echo "===== SUSFS REJECT FILE LIST ====="
+            cat logs/susfs-reject-files.log || true
+
+            echo
+            echo "===== SUSFS REJECT CONTENTS ====="
+
+            for txt in logs/susfs-rejects-txt/*.txt; do
+              [ -f "$txt" ] || continue
+              echo
+              echo "============================================================"
+              echo "FILE: $txt"
+              echo "============================================================"
+              cat "$txt" || true
+            done
+
+            echo
+            echo "===== GIT DIFF STAT ====="
+            git diff --stat || true
+
+            echo
+            echo "===== GIT DIFF FULL ====="
+            git diff || true
+          } > logs/susfs-rejects-and-diff.txt
 
       - name: Show ReSukiSU SUSFS config
         run: |
