@@ -257,7 +257,36 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
 
 def patch_stat():
     path = "fs/stat.c"
-    data = read(path)
+    data = read re.compile(    data = read(path)
+            r"SYSCALL_DEFINE2\s*\(\s*fstat64\s*,\s*unsigned\s+long\s*,\s*fd\s*,\s*"
+            r"struct\s+stat64\s+__user\s*\*\s*,\s*statbuf\s*\)\s*\{",
+            re.S,
+        )
+
+        span = find_function_span(data, fstat64_pattern)
+
+        if span:
+            start, brace_start, end = span
+            body = data[start:end]
+
+            ret_pattern = re.compile(r"\n(?P<indent>[ \t]*)return\s+error\s*;")
+            m = ret_pattern.search(body)
+
+            if m:
+                indent = m.group("indent")
+                hook = (
+                    "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                    f"{indent}ksu_handle_fstat64_ret(&fd, &statbuf);\n"
+                    "#endif"
+                )
+
+                body_new = ret_pattern.sub(hook + m.group(0), body, count=1)
+                write(path, data[:start] + body_new + data[end:])
+                print("[OK] patched fstat64 return hook")
+            else:
+                print("[WARN] return error not found in fstat64")
+        else:
+            print("[WARN] fstat64 syscall not found")
 
     proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
 __attribute__((hot))
@@ -271,78 +300,122 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd,
 #endif
 #endif"""
 
+    # Insert prototype before stat syscall functions, not before vfs_statx only.
     if "extern int ksu_handle_stat" not in data:
-        if "int vfs_statx(" in data:
-            insert_before(path, "int vfs_statx(", proto, required=False)
-        elif "SYSCALL_DEFINE4(newfstatat" in data:
-            insert_before(path, "SYSCALL_DEFINE4(newfstatat", proto, required=False)
-        else:
+        markers = [
+            "SYSCALL_DEFINE4(newfstatat",
+            "SYSCALL_DEFINE2(newfstat",
+            "int vfs_statx(",
+        ]
+
+        inserted = False
+        for marker in markers:
+            if marker in data:
+                insert_before(path, marker, proto, required=False)
+                inserted = True
+                break
+
+        if not inserted:
             print("[WARN] cannot find stat marker for prototype")
 
     data = read(path)
 
-    # lisa/kernel 5.4 commonly has vfs_statx(); hook it declaration-safe.
-    if "ksu_handle_stat(&dfd, &filename, &flags);" not in data:
-        vfs_statx_pattern = re.compile(
-            r"int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
-            r"const\s+char\s+__user\s+\*filename\s*,\s*"
-            r"int\s+flags\s*,.*?\)\s*\{",
+    # Hook newfstatat(dfd, filename, statbuf, flag)
+    if "ksu_handle_stat(&dfd, &filename, &flag);" not in data:
+        newfstatat_pattern = re.compile(
+            r"SYSCALL_DEFINE4\s*\(\s*newfstatat\s*,\s*int\s*,\s*dfd\s*,\s*"
+            r"const\s+char\s+__user\s*\*\s*,\s*filename\s*,\s*"
+            r"struct\s+stat\s+__user\s*\*\s*,\s*statbuf\s*,\s*"
+            r"int\s*,\s*flag\s*\)\s*\{",
             re.S,
         )
 
         hook = (
             "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-            "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+            "\tksu_handle_stat(&dfd, &filename, &flag);\n"
             "#endif\n"
         )
 
-        if "int vfs_statx(" in data:
-            insert_after_declarations(path, vfs_statx_pattern, hook, "stat.c vfs_statx")
+        if "SYSCALL_DEFINE4(newfstatat" in data:
+            insert_after_declarations(path, newfstatat_pattern, hook, "stat.c newfstatat")
         else:
-            print("[WARN] vfs_statx not found, trying syscall stat hooks")
+            print("[WARN] newfstatat not found, trying vfs_statx fallback")
+
+            vfs_statx_pattern = re.compile(
+                r"int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
+                r"const\s+char\s+__user\s+\*filename\s*,\s*"
+                r"int\s+flags\s*,.*?\)\s*\{",
+                re.S,
+            )
+
+            hook_vfs = (
+                "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+                "#endif\n"
+            )
+
+            if "int vfs_statx(" in data:
+                insert_after_declarations(path, vfs_statx_pattern, hook_vfs, "stat.c vfs_statx")
 
     data = read(path)
 
-    # ReSukiSU manual reference also expects newfstat return hook.
-    if "ksu_handle_newfstat_ret(&fd, &statbuf);" not in data:
-        replace_once(
-            path,
-            """\treturn error;\n}""",
-            """#ifdef CONFIG_KSU_MANUAL_HOOK
-\tksu_handle_newfstat_ret(&fd, &statbuf);
-#endif
-\treturn error;
-}""",
-            required=False,
-        )
-
-    data = read(path)
-
-    # Optional 32-bit fstat64 return hook if present.
-    if "SYSCALL_DEFINE2(fstat64" in data and "ksu_handle_fstat64_ret(&fd, &statbuf);" not in data:
-        fstat64_pattern = re.compile(
-            r"(SYSCALL_DEFINE2\(fstat64,\s*unsigned\s+long,\s*fd,\s*"
-            r"struct\s+stat64\s+__user\s+\*,\s*statbuf\)\s*\{.*?"
-            r"if\s*\(!error\).*?;\s*)"
-            r"(?P<ret>\n\s*return\s+error\s*;)",
+    # Optional fstatat64 hook for 32-bit userspace support.
+    if "SYSCALL_DEFINE4(fstatat64" in data and "ksu_handle_stat(&dfd, &filename, &flag);" not in data:
+        fstatat64_pattern = re.compile(
+            r"SYSCALL_DEFINE4\s*\(\s*fstatat64\s*,\s*int\s*,\s*dfd\s*,\s*"
+            r"const\s+char\s+__user\s*\*\s*,\s*filename\s*,.*?"
+            r"int\s*,\s*flag\s*\)\s*\{",
             re.S,
         )
 
-        def repl(m):
-            return (
-                m.group(1)
-                + "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-                + "\tksu_handle_fstat64_ret(&fd, &statbuf);\n"
-                + "#endif"
-                + m.group("ret")
-            )
+        hook = (
+            "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+            "#endif\n"
+        )
 
-        new_data, count = fstat64_pattern.subn(repl, data, count=1)
-        if count:
-            write(path, new_data)
-            print("[OK] patched fstat64 return hook")
+        insert_after_declarations(path, fstatat64_pattern, hook, "stat.c fstatat64")
+
+    data = read(path)
+
+    # Hook newfstat return ONLY inside SYSCALL_DEFINE2(newfstat,... statbuf)
+    if "ksu_handle_newfstat_ret(&fd, &statbuf);" not in data:
+        newfstat_pattern = re.compile(
+            r"SYSCALL_DEFINE2\s*\(\s*newfstat\s*,\s*unsigned\s+int\s*,\s*fd\s*,\s*"
+            r"struct\s+stat\s+__user\s*\*\s*,\s*statbuf\s*\)\s*\{",
+            re.S,
+        )
+
+        span = find_function_span(data, newfstat_pattern)
+
+        if span:
+            start, brace_start, end = span
+            body = data[start:end]
+
+            ret_pattern = re.compile(r"\n(?P<indent>[ \t]*)return\s+error\s*;")
+            m = ret_pattern.search(body)
+
+            if m:
+                indent = m.group("indent")
+                hook = (
+                    "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                    f"{indent}ksu_handle_newfstat_ret(&fd, &statbuf);\n"
+                    "#endif"
+                )
+
+                body_new = ret_pattern.sub(hook + m.group(0), body, count=1)
+                write(path, data[:start] + body_new + data[end:])
+                print("[OK] patched newfstat return hook")
+            else:
+                print("[WARN] return error not found in newfstat")
         else:
-            print("[WARN] fstat64 return hook pattern not found")
+            print("[WARN] newfstat syscall not found")
+
+    data = read(path)
+
+    # Optional fstat64 return hook.
+    if "SYSCALL_DEFINE2(fstat64" in data and "ksu_handle_fstat64_ret(&fd, &statbuf);" not in data:
+
 
 
 def patch_reboot():
