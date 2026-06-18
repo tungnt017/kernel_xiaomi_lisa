@@ -419,6 +419,66 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
     )
 
 
+def patch_selinuxfs_export():
+    path = "security/selinux/selinuxfs.c"
+
+    if not Path(path).exists():
+        print("[WARN] selinuxfs.c not found")
+        return
+
+    data = read(path)
+
+    if "EXPORT_SYMBOL_GPL(sel_handle_status_ops);" in data or "EXPORT_SYMBOL(sel_handle_status_ops);" in data:
+        print("[SKIP] sel_handle_status_ops already exported")
+        return
+
+    if "sel_handle_status_ops" not in data:
+        print("[WARN] sel_handle_status_ops not found in selinuxfs.c")
+        return
+
+    if "#include <linux/export.h>" not in data:
+        if "#include <linux/kernel.h>" in data:
+            data = data.replace(
+                "#include <linux/kernel.h>",
+                "#include <linux/kernel.h>\n#include <linux/export.h>",
+                1,
+            )
+        else:
+            data = "#include <linux/export.h>\n" + data
+
+    data = data.replace(
+        "static const struct file_operations sel_handle_status_ops",
+        "const struct file_operations sel_handle_status_ops",
+    )
+
+    data = data.replace(
+        "static struct file_operations sel_handle_status_ops",
+        "struct file_operations sel_handle_status_ops",
+    )
+
+    pattern = re.compile(
+        r"((?:const\s+)?struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{.*?\};)",
+        re.S,
+    )
+
+    m = pattern.search(data)
+
+    if not m:
+        print("[WARN] sel_handle_status_ops definition block not matched")
+        return
+
+    export_block = """
+
+#ifdef CONFIG_KSU
+EXPORT_SYMBOL_GPL(sel_handle_status_ops);
+#endif
+"""
+
+    data = data[:m.end()] + export_block + data[m.end():]
+    write(path, data)
+    print("[OK] exported sel_handle_status_ops in selinuxfs.c")
+
+
 def main():
     defconfig = sys.argv[1] if len(sys.argv) >= 2 else "lisa_defconfig"
 
@@ -427,6 +487,7 @@ def main():
     patch_open()
     patch_stat()
     patch_reboot()
+    patch_selinuxfs_export()
 
     print("[DONE] ReSukiSU manual hooks applied.")
 
