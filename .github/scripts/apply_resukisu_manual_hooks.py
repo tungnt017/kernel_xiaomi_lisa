@@ -279,19 +279,51 @@ extern void ksu_handle_fstat64_ret(unsigned long *fd,
 
 def patch_reboot():
     path = "kernel/reboot.c"
+
     proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
 extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
-                                 void __user *arg);
+                                 void __user **arg);
 #endif"""
+
+    data = read(path)
+
+    # Remove old wrong prototype if present.
+    data = data.replace(
+        """#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+                                 void __user *arg);
+#endif
+
+""",
+        "",
+    )
+
+    write(path, data)
+
     insert_before(path, "SYSCALL_DEFINE4(reboot,", proto, required=False)
+
+    data = read(path)
+
+    # Remove old wrong call if present.
+    data = data.replace(
+        """#ifdef CONFIG_KSU_MANUAL_HOOK
+\tksu_handle_sys_reboot(magic1, magic2, cmd, arg);
+#endif
+
+""",
+        "",
+    )
+
+    write(path, data)
+
     replace_once(
         path,
         """\t/* For safety, we require "magic" arguments. */""",
         """#ifdef CONFIG_KSU_MANUAL_HOOK
-	ksu_handle_sys_reboot(magic1, magic2, cmd, arg);
+\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 #endif
 
-	/* For safety, we require "magic" arguments. */""",
+\t/* For safety, we require "magic" arguments. */""",
         required=False,
     )
 
