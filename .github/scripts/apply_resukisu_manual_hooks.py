@@ -419,6 +419,20 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
     )
 
 
+def ensure_export_header(data):
+    if "#include <linux/export.h>" in data:
+        return data
+
+    if "#include <linux/kernel.h>" in data:
+        return data.replace(
+            "#include <linux/kernel.h>",
+            "#include <linux/kernel.h>\n#include <linux/export.h>",
+            1,
+        )
+
+    return "#include <linux/export.h>\n" + data
+
+
 def patch_selinuxfs_export():
     path = "security/selinux/selinuxfs.c"
 
@@ -428,55 +442,110 @@ def patch_selinuxfs_export():
 
     data = read(path)
 
-    if "EXPORT_SYMBOL_GPL(sel_handle_status_ops);" in data or "EXPORT_SYMBOL(sel_handle_status_ops);" in data:
-        print("[SKIP] sel_handle_status_ops already exported")
-        return
-
     if "sel_handle_status_ops" not in data:
         print("[WARN] sel_handle_status_ops not found in selinuxfs.c")
         return
 
-    if "#include <linux/export.h>" not in data:
-        if "#include <linux/kernel.h>" in data:
-            data = data.replace(
-                "#include <linux/kernel.h>",
-                "#include <linux/kernel.h>\n#include <linux/export.h>",
-                1,
-            )
-        else:
-            data = "#include <linux/export.h>\n" + data
+    data = ensure_export_header(data)
 
+    # Make symbol globally visible if it is static.
     data = data.replace(
         "static const struct file_operations sel_handle_status_ops",
         "const struct file_operations sel_handle_status_ops",
     )
-
     data = data.replace(
         "static struct file_operations sel_handle_status_ops",
         "struct file_operations sel_handle_status_ops",
     )
 
-    pattern = re.compile(
-        r"((?:const\s+)?struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{.*?\};)",
-        re.S,
-    )
+    if "EXPORT_SYMBOL_GPL(sel_handle_status_ops);" not in data and "EXPORT_SYMBOL(sel_handle_status_ops);" not in data:
+        pattern = re.compile(
+            r"((?:const\s+)?struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{.*?\};)",
+            re.S,
+        )
+        m = pattern.search(data)
 
-    m = pattern.search(data)
+        if not m:
+            print("[WARN] sel_handle_status_ops definition block not matched")
+            write(path, data)
+            return
 
-    if not m:
-        print("[WARN] sel_handle_status_ops definition block not matched")
-        return
-
-    export_block = """
+        export_block = """
 
 #ifdef CONFIG_KSU
 EXPORT_SYMBOL_GPL(sel_handle_status_ops);
 #endif
 """
+        data = data[:m.end()] + export_block + data[m.end():]
+        print("[OK] exported sel_handle_status_ops in selinuxfs.c")
+    else:
+        print("[SKIP] sel_handle_status_ops already exported")
 
-    data = data[:m.end()] + export_block + data[m.end():]
     write(path, data)
-    print("[OK] exported sel_handle_status_ops in selinuxfs.c")
+
+
+def patch_selinuxfs_write_op_export():
+    path = "security/selinux/selinuxfs.c"
+
+    if not Path(path).exists():
+        print("[WARN] selinuxfs.c not found for write_op")
+        return
+
+    data = read(path)
+    data = ensure_export_header(data)
+
+    # Remove dangling write_op export lines that may be present without a real definition.
+    data = re.sub(
+        r"\n\s*EXPORT_SYMBOL(?:_GPL)?\s*\(\s*write_op\s*\)\s*;\s*\n",
+        "\n",
+        data,
+    )
+
+    # If write_op is already defined as a variable/pointer, only export it.
+    write_op_defined = (
+        re.search(r"\bwrite_op\s*=", data) is not None
+        or re.search(r"\(\s*\*\s*write_op\s*\)", data) is not None
+    )
+
+    if write_op_defined:
+        if "EXPORT_SYMBOL_GPL(write_op);" not in data and "EXPORT_SYMBOL(write_op);" not in data:
+            data += """
+
+#ifdef CONFIG_KSU
+EXPORT_SYMBOL_GPL(write_op);
+#endif
+"""
+            print("[OK] exported existing write_op")
+        else:
+            print("[SKIP] write_op already defined/exported")
+        write(path, data)
+        return
+
+    # ReSukiSU references write_op from selinux_hide. Define it here so vmlinux links.
+    # On this kernel, sel_write_load should exist in selinuxfs.c. If it does not, keep
+    # a NULL-initialized pointer so the symbol still resolves; ReSukiSU can handle export checks.
+    if "sel_write_load" in data:
+        define_block = """
+
+#ifdef CONFIG_KSU
+ssize_t (*write_op)(struct file *file, const char __user *buf,
+		    size_t count, loff_t *ppos) = sel_write_load;
+EXPORT_SYMBOL_GPL(write_op);
+#endif
+"""
+    else:
+        define_block = """
+
+#ifdef CONFIG_KSU
+ssize_t (*write_op)(struct file *file, const char __user *buf,
+		    size_t count, loff_t *ppos);
+EXPORT_SYMBOL_GPL(write_op);
+#endif
+"""
+
+    data += define_block
+    write(path, data)
+    print("[OK] defined and exported write_op in selinuxfs.c")
 
 
 def main():
@@ -488,6 +557,7 @@ def main():
     patch_stat()
     patch_reboot()
     patch_selinuxfs_export()
+    patch_selinuxfs_write_op_export()
 
     print("[DONE] ReSukiSU manual hooks applied.")
 
