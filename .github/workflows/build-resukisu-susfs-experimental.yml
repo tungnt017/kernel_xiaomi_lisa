@@ -112,6 +112,24 @@ jobs:
           APPLY_SUSFS_KSU_PATCH="${APPLY_SUSFS_KSU_PATCH}" \
           CONTINUE_ON_SUSFS_PATCH_FAILURE="${CONTINUE_ON_SUSFS_PATCH_FAILURE}" \
           python3 .github/scripts/apply_resukisu_susfs_experimental.py "${DEFCONFIG}" 2>&1 | tee logs/apply-susfs.log
+      
+      - name: Collect SUSFS reject files
+        if: always()
+        run: |
+          set -e
+          mkdir -p logs/susfs-rejects
+
+          echo "Searching .rej files..."
+          find . -type f -name "*.rej" -print | sort | tee logs/susfs-reject-files.log || true
+
+          while IFS= read -r rej; do
+            [ -z "$rej" ] && continue
+            mkdir -p "logs/susfs-rejects/$(dirname "$rej")"
+            cp -v "$rej" "logs/susfs-rejects/$rej"
+          done < logs/susfs-reject-files.log
+
+          git diff > logs/susfs-partial.diff || true
+          git status --short > logs/susfs-git-status.log || true
 
       - name: Show ReSukiSU SUSFS config
         run: |
