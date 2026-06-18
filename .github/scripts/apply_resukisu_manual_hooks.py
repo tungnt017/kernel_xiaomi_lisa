@@ -142,6 +142,10 @@ def patch_defconfig(defconfig):
         sys.exit(1)
 
     remove_prefixes = [
+        "CONFIG_KALLSYMS=",
+        "CONFIG_KALLSYMS_ALL=",
+        "# CONFIG_KALLSYMS is not set",
+        "# CONFIG_KALLSYMS_ALL is not set",
         "CONFIG_KSU=",
         "CONFIG_KSU_MANUAL_HOOK=",
         "CONFIG_KSU_KPROBE_HOOKS=",
@@ -167,6 +171,8 @@ def patch_defconfig(defconfig):
         "# ReSukiSU",
         "CONFIG_KSU=y",
         "CONFIG_KSU_MANUAL_HOOK=y",
+        "CONFIG_KALLSYMS=y",
+        "CONFIG_KALLSYMS_ALL=y",
         "# CONFIG_KSU_KPROBE_HOOKS is not set",
         "# CONFIG_KSU_KPROBES_HOOK is not set",
         "# CONFIG_KSU_KPROBES_HOOKS is not set",
