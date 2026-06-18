@@ -27,6 +27,10 @@ on:
         description: "Kernel patch file name inside kernel_patches, empty = auto find *5.4*.patch"
         required: false
         default: ""
+      apply_susfs_ksu_patch:
+        description: "Apply SUSFS KernelSU patch. For ReSukiSU keep false because layout differs from official KernelSU."
+        required: true
+        default: "false"
       continue_on_susfs_patch_failure:
         description: "true = continue even if SUSFS patch has rejects; false = fail fast"
         required: true
@@ -48,6 +52,7 @@ jobs:
       SUSFS_REPO: ${{ github.event.inputs.susfs_repo }}
       SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch }}
       SUSFS_KERNEL_PATCH: ${{ github.event.inputs.susfs_kernel_patch }}
+      APPLY_SUSFS_KSU_PATCH: ${{ github.event.inputs.apply_susfs_ksu_patch }}
       CONTINUE_ON_SUSFS_PATCH_FAILURE: ${{ github.event.inputs.continue_on_susfs_patch_failure }}
 
     steps:
@@ -104,6 +109,7 @@ jobs:
           mkdir -p logs
           SUSFS_DIR="susfs-src" \
           SUSFS_KERNEL_PATCH="${SUSFS_KERNEL_PATCH}" \
+          APPLY_SUSFS_KSU_PATCH="${APPLY_SUSFS_KSU_PATCH}" \
           CONTINUE_ON_SUSFS_PATCH_FAILURE="${CONTINUE_ON_SUSFS_PATCH_FAILURE}" \
           python3 .github/scripts/apply_resukisu_susfs_experimental.py "${DEFCONFIG}" 2>&1 | tee logs/apply-susfs.log
 
@@ -156,6 +162,7 @@ jobs:
             echo "SUSFS_REPO=${SUSFS_REPO}"
             echo "SUSFS_BRANCH=${SUSFS_BRANCH}"
             echo "SUSFS_KERNEL_PATCH=${SUSFS_KERNEL_PATCH}"
+            echo "APPLY_SUSFS_KSU_PATCH=${APPLY_SUSFS_KSU_PATCH}"
             echo "GITHUB_SHA=${GITHUB_SHA}"
             echo "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}"
           } | tee logs/build-env.log
@@ -228,7 +235,7 @@ jobs:
           else
             gh release create "${RELEASE_TAG}" \
               --title "${RELEASE_NAME}" \
-              --notes "Experimental ReSukiSU + SUSFS AnyKernel3 build for Xiaomi lisa. SUSFS patch may require manual backport if upstream patch hunks reject."
+              --notes "Experimental ReSukiSU + SUSFS AnyKernel3 build for Xiaomi lisa."
           fi
           ZIPS="$(find artifacts/zips -type f -name "*.zip" | sort)"
           if [ -z "${ZIPS}" ]; then
