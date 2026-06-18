@@ -70,6 +70,36 @@ jobs:
 
           python3 .github/scripts/apply_resukisu_manual_hooks.py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
 
+      - name: Force ReSukiSU required config
+        run: |
+          set -e
+
+          DEFCONFIG_PATH=""
+
+          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+          else
+            echo "ERROR: defconfig not found: ${DEFCONFIG}"
+            exit 1
+          fi
+
+          sed -i '/CONFIG_KALLSYMS=/d' "${DEFCONFIG_PATH}"
+          sed -i '/CONFIG_KALLSYMS_ALL=/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS is not set/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS_ALL is not set/d' "${DEFCONFIG_PATH}"
+
+          cat >> "${DEFCONFIG_PATH}" <<'EOF'
+
+          # ReSukiSU static symbol export requirement
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          EOF
+
+          echo "Updated ${DEFCONFIG_PATH}:"
+          grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
+
       - name: Show ReSukiSU config
         run: |
           set -e
