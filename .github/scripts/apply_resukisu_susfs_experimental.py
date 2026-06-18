@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -165,6 +166,102 @@ def find_kernel_patch(susfs_dir, requested):
     raise FileNotFoundError("cannot auto-find SUSFS kernel patch under kernel_patches")
 
 
+def insert_after_declarations_in_function(data, func_pattern, hook, label):
+    m = func_pattern.search(data)
+    if not m:
+        print(f"[WARN] {label}: function not found")
+        return data, False
+
+    brace_start = data.find("{", m.start())
+    if brace_start < 0:
+        print(f"[WARN] {label}: opening brace not found")
+        return data, False
+
+    depth = 0
+    end = None
+    for i in range(brace_start, len(data)):
+        if data[i] == "{":
+            depth += 1
+        elif data[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        print(f"[WARN] {label}: function end not found")
+        return data, False
+
+    body = data[brace_start + 1:end - 1]
+    if hook.strip() in body:
+        print(f"[SKIP] {label}: already patched")
+        return data, True
+
+    lines = body.splitlines(True)
+    insert_index = 0
+    declaration_regex = re.compile(
+        r"^\s*(?:const\s+)?(?:struct|unsigned|signed|int|long|short|char|bool|kuid_t|kgid_t|uid_t|gid_t|"
+        r"umode_t|loff_t|size_t|ssize_t|u8|u16|u32|u64|s8|s16|s32|s64|enum)\b.*;\s*(?:/\*.*\*/)?\s*$"
+    )
+    blank_or_comment_regex = re.compile(r"^\s*$|^\s*/\*.*\*/\s*$|^\s*//.*$")
+
+    for idx, line in enumerate(lines):
+        if blank_or_comment_regex.match(line):
+            insert_index = idx + 1
+            continue
+        if declaration_regex.match(line):
+            insert_index = idx + 1
+            continue
+        break
+
+    lines.insert(insert_index, hook)
+    new_body = "".join(lines)
+    data = data[:brace_start + 1] + new_body + data[end - 1:]
+    print(f"[OK] {label}: patched after declarations")
+    return data, True
+
+
+def patch_setresuid_hook():
+    """Fix ReSukiSU/SUSFS inline hook check: ksu_handle_setresuid must exist in kernel/sys.c."""
+    path = ROOT / "kernel" / "sys.c"
+    if not path.exists():
+        print("[WARN] kernel/sys.c not found, cannot patch setresuid hook")
+        return
+
+    data = read(path)
+
+    proto = """#if defined(CONFIG_KSU)
+extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif"""
+
+    if "ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)" not in data:
+        marker = "SYSCALL_DEFINE3(setresuid"
+        if marker in data:
+            data = data.replace(marker, proto + "\n\n" + marker, 1)
+            print("[OK] inserted ksu_handle_setresuid prototype in kernel/sys.c")
+        else:
+            print("[WARN] setresuid syscall marker not found for prototype")
+
+    hook = "\n#if defined(CONFIG_KSU)\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n"
+
+    if "ksu_handle_setresuid(ruid, euid, suid);" in data:
+        print("[SKIP] setresuid hook call already exists")
+        write(path, data)
+        return
+
+    patterns = [
+        re.compile(r"SYSCALL_DEFINE3\s*\(\s*setresuid\s*,\s*uid_t\s*,\s*ruid\s*,\s*uid_t\s*,\s*euid\s*,\s*uid_t\s*,\s*suid\s*\)\s*\{", re.S),
+        re.compile(r"SYSCALL_DEFINE3\s*\(\s*setresuid\s*,.*?\)\s*\{", re.S),
+    ]
+    for pat in patterns:
+        data_new, ok = insert_after_declarations_in_function(data, pat, hook, "kernel/sys.c setresuid")
+        if ok:
+            write(path, data_new)
+            return
+
+    write(path, data)
+    print("[WARN] failed to patch setresuid hook call")
+
+
 def apply_susfs_patches():
     susfs_dir = Path(os.environ.get("SUSFS_DIR", "susfs-src")).resolve()
     requested_patch = os.environ.get("SUSFS_KERNEL_PATCH", "").strip()
@@ -178,9 +275,7 @@ def apply_susfs_patches():
     copy_tree_files(susfs_dir / "kernel_patches" / "fs", ROOT / "fs")
     copy_tree_files(susfs_dir / "kernel_patches" / "include" / "linux", ROOT / "include" / "linux")
 
-    # ReSukiSU layout differs from official KernelSU. The upstream SUSFS KernelSU patch
-    # targets files like kernel/allowlist.c, kernel/apk_sign.c, kernel/core_hook.c, etc.
-    # In ReSukiSU these files are reorganized, so default is to skip this patch.
+    # ReSukiSU layout differs from official KernelSU; skip upstream KernelSU patch by default.
     ksu_patch = susfs_dir / "kernel_patches" / "KernelSU" / "10_enable_susfs_for_ksu.patch"
     if apply_ksu_patch:
         if not (ROOT / "KernelSU").exists():
@@ -189,7 +284,6 @@ def apply_susfs_patches():
     else:
         print("[SKIP] Skipping upstream SUSFS KernelSU patch for ReSukiSU layout. Set apply_susfs_ksu_patch=true only for testing.")
 
-    # Copy optional KernelSU/kernel files like sucompat.h if present. Safe enough for experiment.
     optional_ksu_kernel = susfs_dir / "kernel_patches" / "KernelSU" / "kernel"
     if optional_ksu_kernel.exists() and (ROOT / "KernelSU" / "kernel").exists():
         copy_tree_files(optional_ksu_kernel, ROOT / "KernelSU" / "kernel")
@@ -197,6 +291,10 @@ def apply_susfs_patches():
     # Apply main kernel patch to device kernel source.
     kernel_patch = find_kernel_patch(susfs_dir, requested_patch)
     apply_patch(kernel_patch, ROOT, continue_on_fail)
+
+    # ReSukiSU switches to SuSFS Inline hook when CONFIG_KSU_SUSFS=y. Ensure the
+    # setresuid hook exists so inline_hook_check.mk does not fail.
+    patch_setresuid_hook()
 
 
 def main():
