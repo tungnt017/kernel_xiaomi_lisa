@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +22,13 @@ def run(cmd, cwd=None, check=True):
     if check and p.returncode != 0:
         raise RuntimeError(f"command failed: {cmd}")
     return p.returncode
+
+
+def bool_env(name, default=False):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def find_defconfig(defconfig):
@@ -124,7 +130,8 @@ def apply_patch(patch_file, cwd, continue_on_fail):
             return
         raise FileNotFoundError(str(patch_file))
 
-    rc = run(f"patch -p1 --forward --reject-file=- < '{patch_file}'", cwd=cwd, check=False)
+    # --batch prevents interactive "File to patch:" prompts in CI.
+    rc = run(f"patch -p1 --forward --batch < '{patch_file}'", cwd=cwd, check=False)
     if rc != 0:
         msg = f"[WARN] patch failed/rejected: {patch_file}"
         if continue_on_fail:
@@ -161,7 +168,8 @@ def find_kernel_patch(susfs_dir, requested):
 def apply_susfs_patches():
     susfs_dir = Path(os.environ.get("SUSFS_DIR", "susfs-src")).resolve()
     requested_patch = os.environ.get("SUSFS_KERNEL_PATCH", "").strip()
-    continue_on_fail = os.environ.get("CONTINUE_ON_SUSFS_PATCH_FAILURE", "false").lower() == "true"
+    continue_on_fail = bool_env("CONTINUE_ON_SUSFS_PATCH_FAILURE", False)
+    apply_ksu_patch = bool_env("APPLY_SUSFS_KSU_PATCH", False)
 
     if not susfs_dir.exists():
         raise FileNotFoundError(f"SUSFS_DIR not found: {susfs_dir}")
@@ -170,19 +178,23 @@ def apply_susfs_patches():
     copy_tree_files(susfs_dir / "kernel_patches" / "fs", ROOT / "fs")
     copy_tree_files(susfs_dir / "kernel_patches" / "include" / "linux", ROOT / "include" / "linux")
 
-    # Copy optional KernelSU-side helper headers/files if present.
+    # ReSukiSU layout differs from official KernelSU. The upstream SUSFS KernelSU patch
+    # targets files like kernel/allowlist.c, kernel/apk_sign.c, kernel/core_hook.c, etc.
+    # In ReSukiSU these files are reorganized, so default is to skip this patch.
     ksu_patch = susfs_dir / "kernel_patches" / "KernelSU" / "10_enable_susfs_for_ksu.patch"
-    if ksu_patch.exists():
+    if apply_ksu_patch:
+        if not (ROOT / "KernelSU").exists():
+            raise FileNotFoundError("KernelSU directory not found")
         apply_patch(ksu_patch, ROOT / "KernelSU", continue_on_fail)
     else:
-        print("[WARN] KernelSU SUSFS enable patch not found; ReSukiSU may already contain SUSFS glue or may fail build")
+        print("[SKIP] Skipping upstream SUSFS KernelSU patch for ReSukiSU layout. Set apply_susfs_ksu_patch=true only for testing.")
 
-    # Copy optional KernelSU/kernel files like sucompat.h if present.
+    # Copy optional KernelSU/kernel files like sucompat.h if present. Safe enough for experiment.
     optional_ksu_kernel = susfs_dir / "kernel_patches" / "KernelSU" / "kernel"
     if optional_ksu_kernel.exists() and (ROOT / "KernelSU" / "kernel").exists():
         copy_tree_files(optional_ksu_kernel, ROOT / "KernelSU" / "kernel")
 
-    # Apply main kernel patch.
+    # Apply main kernel patch to device kernel source.
     kernel_patch = find_kernel_patch(susfs_dir, requested_patch)
     apply_patch(kernel_patch, ROOT, continue_on_fail)
 
