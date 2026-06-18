@@ -50,40 +50,55 @@ jobs:
             gcc-aarch64-linux-gnu \
             cpio rsync file gzip
 
+      - name: Prepare logs directory
+        run: |
+          mkdir -p logs
+
       - name: Add ReSukiSU source
         run: |
           set -e
+          set -o pipefail
+          mkdir -p logs
 
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash 2>&1 | tee logs/resukisu-setup.log
 
       - name: Apply ReSukiSU manual hooks
         run: |
           set -e
+          set -o pipefail
+          mkdir -p logs
 
-          python3 .github/scripts/apply_resukisu_manual_hooks.py "${DEFCONFIG}"
+          python3 .github/scripts/apply_resukisu_manual_hooks.py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
 
       - name: Show ReSukiSU config
         run: |
           set -e
+          set -o pipefail
+          mkdir -p logs
 
-          DEFCONFIG_PATH=""
+          {
+            DEFCONFIG_PATH=""
 
-          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
-            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
-          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
-            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
-          else
-            echo "ERROR: defconfig not found: ${DEFCONFIG}"
-            find arch/arm64/configs -name "*defconfig" | sort
-            exit 1
-          fi
+            if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+            elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+            else
+              echo "ERROR: defconfig not found: ${DEFCONFIG}"
+              find arch/arm64/configs -name "*defconfig" | sort
+              exit 1
+            fi
 
-          echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
-          grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+            echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
+            grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+            grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
+          } 2>&1 | tee logs/config.log
 
       - name: Build kernel using build.sh
         run: |
           set -e
+          set -o pipefail
+          mkdir -p logs
 
           chmod +x build.sh
 
@@ -98,61 +113,80 @@ jobs:
           export OUT_DIR="${OUT_DIR}"
           export DEFCONFIG="${DEFCONFIG}"
 
-          echo "ARCH=${ARCH}"
-          echo "SUBARCH=${SUBARCH}"
-          echo "OUT_DIR=${OUT_DIR}"
-          echo "DEFCONFIG=${DEFCONFIG}"
-          echo "JOBS=${JOBS}"
+          {
+            echo "ARCH=${ARCH}"
+            echo "SUBARCH=${SUBARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "JOBS=${JOBS}"
+            echo "GITHUB_SHA=${GITHUB_SHA}"
+            echo "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}"
+          } | tee logs/build-env.log
 
-          bash build.sh
+          bash build.sh 2>&1 | tee logs/build.log
 
       - name: Collect flashable zip
+        if: always()
         run: |
           set -e
+          set -o pipefail
 
           mkdir -p artifacts/zips
+          mkdir -p logs
 
-          echo "Searching for flashable zip from build.sh..."
+          {
+            echo "Searching for flashable zip from build.sh..."
 
-          mapfile -t ZIP_FILES < <(
-            find . -type f -name "*.zip" \
-              ! -path "./.git/*" \
-              ! -path "./artifacts/*" \
-              ! -path "./KernelSU-Next/*" \
-              ! -path "./ReSukiSU/*" \
-              | sort
-          )
+            mapfile -t ZIP_FILES < <(
+              find . -type f -name "*.zip" \
+                ! -path "./.git/*" \
+                ! -path "./artifacts/*" \
+                ! -path "./KernelSU-Next/*" \
+                ! -path "./ReSukiSU/*" \
+                | sort
+            )
 
-          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-            echo "ERROR: No zip found!"
-            echo "Available zip files:"
-            find . -type f -name "*.zip" || true
-            exit 1
-          fi
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "WARNING: No zip found."
+              echo "Available zip files:"
+              find . -type f -name "*.zip" || true
+            else
+              echo "Found zip(s):"
+              printf '%s\n' "${ZIP_FILES[@]}"
 
-          echo "Found zip(s):"
-          printf '%s\n' "${ZIP_FILES[@]}"
+              for zipfile in "${ZIP_FILES[@]}"; do
+                cp -v "${zipfile}" artifacts/zips/
+              done
+            fi
 
-          for zipfile in "${ZIP_FILES[@]}"; do
-            cp -v "${zipfile}" artifacts/zips/
-          done
+            echo "Artifacts ready:"
+            find artifacts -type f -print || true
+          } 2>&1 | tee logs/collect.log
 
-          echo "Artifacts ready:"
-          find artifacts -type f -print
-
-      - name: Upload kernel artifacts
+      - name: Upload build logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lisa-kernel-resukisu-manual
+          name: lisa-resukisu-build-logs-${{ github.run_number }}
+          path: logs/**
+          if-no-files-found: warn
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-kernel-resukisu-manual-${{ github.run_number }}
           path: artifacts/**
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Upload zip to GitHub Release
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           set -e
+          set -o pipefail
 
           if [ -z "${INPUT_RELEASE_TAG}" ]; then
             RELEASE_TAG="resukisu-lisa-${{ github.run_number }}"
@@ -173,7 +207,6 @@ jobs:
               --notes "ReSukiSU manual hook AnyKernel3 build for Xiaomi lisa."
           fi
 
-          echo "Finding zip..."
           ZIPS="$(find artifacts/zips -type f -name "*.zip" | sort)"
 
           if [ -z "${ZIPS}" ]; then
