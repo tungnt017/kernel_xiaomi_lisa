@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+import sys
+import re
+from pathlib import Path
+
+ROOT = Path(".").resolve()
+
+
+def read(path):
+    return Path(path).read_text(errors="ignore")
+
+
+def write(path, data):
+    Path(path).write_text(data)
+
+
+def insert_before(path, marker, block, required=True):
+    p = Path(path)
+    data = read(p)
+
+    if block.strip() in data:
+        print(f"[SKIP] block already exists: {path}")
+        return True
+
+    if marker not in data:
+        msg = f"[MISS] marker not found in {path}: {marker}"
+        if required:
+            raise RuntimeError(msg)
+        print(msg)
+        return False
+
+    data = data.replace(marker, block + "\n\n" + marker, 1)
+    write(p, data)
+    print(f"[OK] inserted block: {path}")
+    return True
+
+
+def replace_once(path, old, new, required=True):
+    p = Path(path)
+    data = read(p)
+
+    if new in data:
+        print(f"[SKIP] already patched: {path}")
+        return True
+
+    if old not in data:
+        msg = f"[MISS] context not found in {path}:\n{old}"
+        if required:
+            raise RuntimeError(msg)
+        print(msg)
+        return False
+
+    data = data.replace(old, new, 1)
+    write(p, data)
+    print(f"[OK] patched: {path}")
+    return True
+
+
+def find_function_span(data, pattern):
+    m = pattern.search(data)
+    if not m:
+        return None
+
+    brace_start = data.find("{", m.start())
+    if brace_start < 0:
+        return None
+
+    depth = 0
+    for i in range(brace_start, len(data)):
+        if data[i] == "{":
+            depth += 1
+        elif data[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return m.start(), brace_start, i + 1
+
+    return None
+
+
+def insert_after_declarations(path, func_pattern, hook, label):
+    data = read(path)
+    span = find_function_span(data, func_pattern)
+
+    if not span:
+        print(f"[WARN] {label} function not found")
+        return False
+
+    start, brace_start, end = span
+    body = data[brace_start + 1:end - 1]
+
+    if hook.strip() in body:
+        print(f"[SKIP] {label} already patched")
+        return True
+
+    lines = body.splitlines(True)
+    insert_index = 0
+
+    declaration_regex = re.compile(
+        r"^\s*(?:const\s+)?(?:"
+        r"struct|unsigned|signed|int|long|short|char|bool|umode_t|"
+        r"uid_t|gid_t|kuid_t|kgid_t|loff_t|size_t|ssize_t|u8|u16|u32|u64|"
+        r"s8|s16|s32|s64|enum"
+        r")\b.*;\s*(?:/\*.*\*/)?\s*$"
+    )
+
+    blank_or_comment_regex = re.compile(
+        r"^\s*$|^\s*/\*.*\*/\s*$|^\s*//.*$"
+    )
+
+    for idx, line in enumerate(lines):
+        if blank_or_comment_regex.match(line):
+            insert_index = idx + 1
+            continue
+
+        if declaration_regex.match(line):
+            insert_index = idx + 1
+            continue
+
+        break
+
+    lines.insert(insert_index, hook)
+    new_body = "".join(lines)
+
+    write(path, data[:brace_start + 1] + new_body + data[end - 1:])
+    print(f"[OK] patched {label} after declarations")
+    return True
+
+
+def patch_defconfig(defconfig):
+    candidates = [
+        ROOT / "arch" / "arm64" / "configs" / defconfig,
+        ROOT / "arch" / "arm64" / "configs" / "vendor" / defconfig,
+    ]
+
+    path = next((c for c in candidates if c.exists()), None)
+
+    if path is None:
+        print("[ERROR] defconfig not found.")
+        print("Available defconfigs:")
+        for f in sorted((ROOT / "arch" / "arm64" / "configs").rglob("*defconfig")):
+            print(f" - {f}")
+        sys.exit(1)
+
+    remove_prefixes = [
+        "CONFIG_KSU=",
+        "CONFIG_KSU_MANUAL_HOOK=",
+        "CONFIG_KSU_KPROBE_HOOKS=",
+        "CONFIG_KSU_KPROBES_HOOK=",
+        "CONFIG_KSU_KPROBES_HOOKS=",
+        "CONFIG_KSU_WITH_KPROBES=",
+        "# CONFIG_KSU is not set",
+        "# CONFIG_KSU_MANUAL_HOOK is not set",
+        "# CONFIG_KSU_KPROBE_HOOKS is not set",
+        "# CONFIG_KSU_KPROBES_HOOK is not set",
+        "# CONFIG_KSU_KPROBES_HOOKS is not set",
+        "# CONFIG_KSU_WITH_KPROBES is not set",
+    ]
+
+    lines = []
+    for line in read(path).splitlines():
+        if any(line.startswith(prefix) for prefix in remove_prefixes):
+            continue
+        lines.append(line)
+
+    lines += [
+        "",
+        "# ReSukiSU",
+        "CONFIG_KSU=y",
+        "CONFIG_KSU_MANUAL_HOOK=y",
+        "# CONFIG_KSU_KPROBE_HOOKS is not set",
+        "# CONFIG_KSU_KPROBES_HOOK is not set",
+        "# CONFIG_KSU_KPROBES_HOOKS is not set",
+        "# CONFIG_KSU_WITH_KPROBES is not set",
+        "",
+    ]
+
+    write(path, "\n".join(lines))
+    print(f"[OK] enabled ReSukiSU manual hook in {path}")
+
+
+def patch_exec():
+    path = "fs/exec.c"
+
+    proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
+__attribute__((hot))
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                               void *argv, void *envp, int *flags);
+#endif"""
+
+    insert_before(path, "int do_execve(struct filename *filename,", proto, required=False)
+
+    replace_once(
+        path,
+        """\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
+        """#ifdef CONFIG_KSU_MANUAL_HOOK
+\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+#endif
+\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);""",
+        required=False,
+    )
+
+    replace_once(
+        path,
+        """\treturn do_execveat_common(fd, filename, argv, envp, flags);""",
+        """#ifdef CONFIG_KSU_MANUAL_HOOK
+\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+#endif
+\treturn do_execveat_common(fd, filename, argv, envp, flags);""",
+        required=False,
+    )
+
+
+def patch_open():
+    path = "fs/open.c"
+    data = read(path)
+
+    proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+                                int *mode, int *flags);
+#endif"""
+
+    func_pattern = re.compile(
+        r"(?:static\s+)?(?:long|int)\s+do_faccessat\s*\(\s*"
+        r"int\s+dfd\s*,\s*"
+        r"const\s+char\s+__user\s+\*filename\s*,\s*"
+        r"int\s+mode\s*\)\s*\{",
+        re.S,
+    )
+
+    span = find_function_span(data, func_pattern)
+
+    if not span:
+        print("[WARN] do_faccessat() not found in fs/open.c, faccessat hook not applied")
+        return
+
+    start, brace_start, end = span
+
+    if "extern int ksu_handle_faccessat" not in data:
+        data = data[:start] + proto + "\n\n" + data[start:]
+        write(path, data)
+        print("[OK] inserted faccessat prototype")
+
+    hook = (
+        "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+        "#endif\n"
+    )
+
+    insert_after_declarations(path, func_pattern, hook, "open.c faccessat")
+
+
+def patch_stat():
+    path = "fs/stat.c"
+    data = read(path)
+
+    proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
+__attribute__((hot))
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+                           int *flags);
+extern void ksu_handle_newfstat_ret(unsigned int *fd,
+                                    struct stat __user **statbuf_ptr);
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+extern void ksu_handle_fstat64_ret(unsigned long *fd,
+                                   struct stat64 __user **statbuf_ptr);
+#endif
+#endif"""
+
+    if "extern int ksu_handle_stat" not in data:
+        if "int vfs_statx(" in data:
+            insert_before(path, "int vfs_statx(", proto, required=False)
+        elif "SYSCALL_DEFINE4(newfstatat" in data:
+            insert_before(path, "SYSCALL_DEFINE4(newfstatat", proto, required=False)
+        else:
+            print("[WARN] cannot find stat marker for prototype")
+
+    data = read(path)
+
+    # lisa/kernel 5.4 commonly has vfs_statx(); hook it declaration-safe.
+    if "ksu_handle_stat(&dfd, &filename, &flags);" not in data:
+        vfs_statx_pattern = re.compile(
+            r"int\s+vfs_statx\s*\(\s*int\s+dfd\s*,\s*"
+            r"const\s+char\s+__user\s+\*filename\s*,\s*"
+            r"int\s+flags\s*,.*?\)\s*\{",
+            re.S,
+        )
+
+        hook = (
+            "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+            "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+            "#endif\n"
+        )
+
+        if "int vfs_statx(" in data:
+            insert_after_declarations(path, vfs_statx_pattern, hook, "stat.c vfs_statx")
+        else:
+            print("[WARN] vfs_statx not found, trying syscall stat hooks")
+
+    data = read(path)
+
+    # ReSukiSU manual reference also expects newfstat return hook.
+    if "ksu_handle_newfstat_ret(&fd, &statbuf);" not in data:
+        replace_once(
+            path,
+            """\treturn error;\n}""",
+            """#ifdef CONFIG_KSU_MANUAL_HOOK
+\tksu_handle_newfstat_ret(&fd, &statbuf);
+#endif
+\treturn error;
+}""",
+            required=False,
+        )
+
+    data = read(path)
+
+    # Optional 32-bit fstat64 return hook if present.
+    if "SYSCALL_DEFINE2(fstat64" in data and "ksu_handle_fstat64_ret(&fd, &statbuf);" not in data:
+        fstat64_pattern = re.compile(
+            r"(SYSCALL_DEFINE2\(fstat64,\s*unsigned\s+long,\s*fd,\s*"
+            r"struct\s+stat64\s+__user\s+\*,\s*statbuf\)\s*\{.*?"
+            r"if\s*\(!error\).*?;\s*)"
+            r"(?P<ret>\n\s*return\s+error\s*;)",
+            re.S,
+        )
+
+        def repl(m):
+            return (
+                m.group(1)
+                + "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                + "\tksu_handle_fstat64_ret(&fd, &statbuf);\n"
+                + "#endif"
+                + m.group("ret")
+            )
+
+        new_data, count = fstat64_pattern.subn(repl, data, count=1)
+        if count:
+            write(path, new_data)
+            print("[OK] patched fstat64 return hook")
+        else:
+            print("[WARN] fstat64 return hook pattern not found")
+
+
+def patch_reboot():
+    path = "kernel/reboot.c"
+
+    proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+                                 void __user *arg);
+#endif"""
+
+    insert_before(path, "SYSCALL_DEFINE4(reboot,", proto, required=False)
+
+    replace_once(
+        path,
+        """\t/* For safety, we require "magic" arguments. */""",
+        """#ifdef CONFIG_KSU_MANUAL_HOOK
+\tksu_handle_sys_reboot(magic1, magic2, cmd, arg);
+#endif
+
+\t/* For safety, we require "magic" arguments. */""",
+        required=False,
+    )
+
+
+def main():
+    defconfig = sys.argv[1] if len(sys.argv) >= 2 else "lisa_defconfig"
+
+    patch_defconfig(defconfig)
+    patch_exec()
+    patch_open()
+    patch_stat()
+    patch_reboot()
+
+    print("[DONE] ReSukiSU manual hooks applied.")
+
+
+if __name__ == "__main__":
+    main()
