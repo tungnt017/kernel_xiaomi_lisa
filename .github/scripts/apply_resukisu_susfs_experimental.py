@@ -165,13 +165,19 @@ def find_kernel_patch(susfs_dir, requested):
     raise FileNotFoundError("cannot auto-find SUSFS kernel patch under kernel_patches")
 
 
-def remove_old_setresuid_wrapper_hook(data):
-    """Remove old wrong hook location from earlier experimental script revisions."""
+def patch_setresuid_hook():
+    path = ROOT / "kernel" / "sys.c"
+    if not path.exists():
+        print("[WARN] kernel/sys.c not found, cannot patch setresuid hook")
+        return
+
+    data = read(path)
+
+    # Remove previous wrong wrapper-only hook if present.
     data = re.sub(
         r"\n#if defined\(CONFIG_KSU\)\s*\n"
         r"extern int ksu_handle_setresuid\(uid_t ruid, uid_t euid, uid_t suid\);\s*\n"
-        r"#endif\s*\n\s*"
-        r"(?=SYSCALL_DEFINE3\s*\(\s*setresuid)",
+        r"#endif\s*\n\s*(?=SYSCALL_DEFINE3\s*\(\s*setresuid)",
         "\n",
         data,
         flags=re.S,
@@ -184,41 +190,18 @@ def remove_old_setresuid_wrapper_hook(data):
         data,
         flags=re.S,
     )
-    return data
-
-
-def patch_setresuid_hook():
-    """Fix ReSukiSU/SUSFS inline hook check.
-
-    ReSukiSU issue #97 shows the hook must be in __sys_setresuid(), before uid
-    conversion/checks, not only in SYSCALL_DEFINE3(setresuid).
-    """
-    path = ROOT / "kernel" / "sys.c"
-    if not path.exists():
-        print("[WARN] kernel/sys.c not found, cannot patch setresuid hook")
-        return
-
-    data = read(path)
-    data = remove_old_setresuid_wrapper_hook(data)
 
     proto = """#ifdef CONFIG_KSU_SUSFS
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #endif"""
 
     if "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);" not in data:
-        markers = [
-            "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)",
-            "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)\n",
-            "SYSCALL_DEFINE3(setresuid",
-        ]
-        inserted = False
-        for marker in markers:
+        for marker in ["long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)", "SYSCALL_DEFINE3(setresuid"]:
             if marker in data:
                 data = data.replace(marker, proto + "\n\n" + marker, 1)
-                inserted = True
                 print("[OK] inserted ksu_handle_setresuid prototype in kernel/sys.c")
                 break
-        if not inserted:
+        else:
             print("[WARN] cannot find marker for setresuid prototype")
 
     hook = """
@@ -232,7 +215,6 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
         write(path, data)
         return
 
-    # Preferred target: long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
     pat = re.compile(
         r"(long\s+__sys_setresuid\s*\(\s*uid_t\s+ruid\s*,\s*uid_t\s+euid\s*,\s*uid_t\s+suid\s*\)\s*\{\s*)",
         re.S,
@@ -244,7 +226,6 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
         print("[OK] inserted ksu_handle_setresuid call inside __sys_setresuid")
         return
 
-    # Fallback for kernels without __sys_setresuid wrapper.
     pat = re.compile(r"(SYSCALL_DEFINE3\s*\(\s*setresuid\s*,.*?\)\s*\{\s*)", re.S)
     m = pat.search(data)
     if m:
@@ -255,6 +236,80 @@ extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
 
     write(path, data)
     print("[WARN] failed to patch setresuid hook call")
+
+
+def patch_sys_read_hook():
+    path = ROOT / "fs" / "read_write.c"
+    if not path.exists():
+        print("[WARN] fs/read_write.c not found, cannot patch sys_read hook")
+        return
+
+    data = read(path)
+
+    # Remove wrong multi-argument sys_read hook variants if present.
+    data = re.sub(
+        r"\n\s*#ifdef\s+CONFIG_KSU(?:_SUSFS)?\s*\n"
+        r"\s*extern\s+int\s+ksu_handle_sys_read\s*\([^;]+;\s*\n"
+        r"\s*#endif\s*\n",
+        "\n",
+        data,
+        flags=re.S,
+    )
+    data = re.sub(
+        r"\n\s*#ifdef\s+CONFIG_KSU(?:_SUSFS)?\s*\n"
+        r"\s*ksu_handle_sys_read\s*\(\s*fd\s*,\s*&buf\s*,\s*&count\s*\)\s*;\s*\n"
+        r"\s*#endif\s*\n",
+        "\n",
+        data,
+        flags=re.S,
+    )
+
+    proto = """#ifdef CONFIG_KSU_SUSFS
+extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);
+#endif"""
+
+    if "ksu_handle_sys_read(unsigned int fd)" not in data:
+        for marker in ["ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)", "SYSCALL_DEFINE3(read,"]:
+            if marker in data:
+                data = data.replace(marker, proto + "\n\n" + marker, 1)
+                print("[OK] inserted ksu_handle_sys_read prototype in fs/read_write.c")
+                break
+        else:
+            print("[WARN] cannot find marker for sys_read prototype")
+
+    hook = """
+#ifdef CONFIG_KSU_SUSFS
+	ksu_handle_sys_read(fd);
+#endif
+"""
+
+    if "ksu_handle_sys_read(fd);" in data:
+        print("[SKIP] sys_read hook call already exists")
+        write(path, data)
+        return
+
+    # Preferred target on Linux 5.4.
+    pat = re.compile(
+        r"(ssize_t\s+ksys_read\s*\(\s*unsigned\s+int\s+fd\s*,\s*char\s+__user\s*\*\s*buf\s*,\s*size_t\s+count\s*\)\s*\{\s*)",
+        re.S,
+    )
+    m = pat.search(data)
+    if m:
+        data = data[:m.end()] + hook + data[m.end():]
+        write(path, data)
+        print("[OK] inserted ksu_handle_sys_read call inside ksys_read")
+        return
+
+    pat = re.compile(r"(SYSCALL_DEFINE3\s*\(\s*read\s*,.*?\)\s*\{\s*)", re.S)
+    m = pat.search(data)
+    if m:
+        data = data[:m.end()] + hook + data[m.end():]
+        write(path, data)
+        print("[OK] inserted ksu_handle_sys_read call inside SYSCALL_DEFINE3(read) fallback")
+        return
+
+    write(path, data)
+    print("[WARN] failed to patch sys_read hook call")
 
 
 def apply_susfs_patches():
@@ -284,8 +339,9 @@ def apply_susfs_patches():
     kernel_patch = find_kernel_patch(susfs_dir, requested_patch)
     apply_patch(kernel_patch, ROOT, continue_on_fail)
 
-    # Must run after kernel patch, because SUSFS patch can touch kernel/sys.c too.
+    # ReSukiSU SUSFS inline mode currently fails checks one missing hook at a time.
     patch_setresuid_hook()
+    patch_sys_read_hook()
 
     print("[INFO] Reject files after SUSFS patch:")
     for rej in sorted(ROOT.rglob("*.rej")):
