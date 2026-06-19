@@ -171,6 +171,19 @@ jobs:
           echo "SUSFS kernel patch tree:" | tee logs/susfs-tree.log
           find susfs-src/kernel_patches -maxdepth 4 -type f | sort | tee -a logs/susfs-tree.log
 
+      - name: Validate SUSFS patch tree
+        run: |
+          set -e
+          echo "SUSFS HEAD:"
+          git -C susfs-src log -1 --oneline || true
+
+          echo "SUSFS kernel_patches tree:"
+          find susfs-src/kernel_patches -maxdepth 3 -type f | sort || true
+
+          test -d susfs-src/kernel_patches/fs
+          test -d susfs-src/kernel_patches/include/linux
+          ls susfs-src/kernel_patches/50_add_susfs_in_kernel-5.4*.patch
+
 
       - name: Dump ReSukiSU kernel layout
         run: |
