@@ -118,6 +118,10 @@ jobs:
         run: |
           python3 .github/scripts/fix_susfs_proc_fd_unused.py
 
+      - name: Fix optional ReSukiSU SUSFS dispatch commands
+        run: |
+          python3 .github/scripts/fix_resukisu_susfs_dispatch_optional_cmds.py
+
       - name: Collect SUSFS reject files as txt
         if: always()
         run: |
