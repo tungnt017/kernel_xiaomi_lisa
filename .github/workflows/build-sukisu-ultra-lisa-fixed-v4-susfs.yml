@@ -313,6 +313,13 @@ jobs:
           set -o pipefail
           python3 .github/scripts/fix_susfs_lisa_5_4_rejects.py 2>&1 | tee logs/fix-susfs-rejects.log
 
+      - name: Fix SukiSU dispatch for SUSFS v1.5.5
+        if: github.event.inputs.apply_susfs_kernel == 'true'
+        run: |
+          set -e
+          set -o pipefail
+          python3 .github/scripts/fix_sukisu_dispatch_susfs_v155.py 2>&1 | tee logs/fix-sukisu-dispatch-susfs-v155.log
+
       - name: Export SUSFS debug source files
         if: always()
         run: |
