@@ -1,4 +1,4 @@
-name: Experimental ReSukiSU SUSFS Build For Lisa
+name: ReSukiSU SUSFS Build For Lisa
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   build:
-    name: Build ReSukiSU SUSFS experimental kernel
+    name: Build ReSukiSU SUSFS kernel
     runs-on: ubuntu-22.04
 
     env:
@@ -102,7 +102,7 @@ jobs:
           echo "SUSFS tree:"
           find susfs-src/kernel_patches -maxdepth 3 -type f | sort | tee logs/susfs-tree.log
 
-      - name: Apply SUSFS experimental patches
+      - name: Apply ReSukiSU SUSFS
         run: |
           set -e
           set -o pipefail
