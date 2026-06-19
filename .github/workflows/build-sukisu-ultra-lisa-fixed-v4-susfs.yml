@@ -313,6 +313,20 @@ jobs:
           set -o pipefail
           python3 .github/scripts/fix_susfs_lisa_5_4_rejects.py 2>&1 | tee logs/fix-susfs-rejects.log
 
+      - name: Export SUSFS debug source files
+        if: always()
+        run: |
+          mkdir -p logs/susfs-debug
+
+          cp drivers/kernelsu/supercall/dispatch.c logs/susfs-debug/dispatch.c.txt || true
+          cp include/linux/susfs.h logs/susfs-debug/susfs.h.txt || true
+          cp include/linux/susfs_def.h logs/susfs-debug/susfs_def.h.txt || true
+          cp fs/proc/fd.c logs/susfs-debug/fd.c.txt || true
+          cp fs/proc/fd.c.rej logs/susfs-debug/fd.c.rej.txt || true
+
+          echo "===== exported files =====" | tee logs/susfs-debug/exported-files.log
+          ls -la logs/susfs-debug | tee -a logs/susfs-debug/exported-files.log
+
       - name: Dump SukiSU and SUSFS layout
         run: |
           set +e
