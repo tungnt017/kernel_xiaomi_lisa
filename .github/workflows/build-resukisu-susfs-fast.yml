@@ -171,6 +171,10 @@ jobs:
           echo "SUSFS kernel patch tree:" | tee logs/susfs-tree.log
           find susfs-src/kernel_patches -maxdepth 4 -type f | sort | tee -a logs/susfs-tree.log
 
+      - name: Fix full SUSFS script to try patch -p2
+        run: |
+          python3 .github/scripts/fix_full_impl_try_p2.py
+
       - name: Apply ReSukiSU SUSFS full implementation
         run: |
           set -e
