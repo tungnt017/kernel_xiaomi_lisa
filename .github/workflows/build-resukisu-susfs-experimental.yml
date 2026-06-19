@@ -111,7 +111,7 @@ jobs:
           SUSFS_KERNEL_PATCH="${SUSFS_KERNEL_PATCH}" \
           APPLY_SUSFS_KSU_PATCH="${APPLY_SUSFS_KSU_PATCH}" \
           CONTINUE_ON_SUSFS_PATCH_FAILURE="${CONTINUE_ON_SUSFS_PATCH_FAILURE}" \
-          python3 .github/scripts/apply_resukisu_susfs_experimental.py "${DEFCONFIG}" 2>&1 | tee logs/apply-susfs.log
+          python3 .github/scripts/apply_resukisu_susfs_full_impl.py "${DEFCONFIG}" 2>&1 | tee logs/apply-susfs.log
       
       - name: Fix SUSFS proc fd unused mnt
         if: always()
@@ -125,10 +125,6 @@ jobs:
       - name: Fix ReSukiSU SUSFS magic define
         run: |
           python3 .github/scripts/fix_resukisu_susfs_magic.py
-
-      - name: Fix ReSukiSU SUSFS undefined fallback symbols
-        run: |
-          python3 .github/scripts/fix_resukisu_susfs_undefined_symbols.py
 
       - name: Collect SUSFS reject files as txt
         if: always()
