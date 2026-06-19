@@ -199,6 +199,10 @@ jobs:
         run: |
           python3 .github/scripts/fix_full_impl_try_p2.py
 
+      - name: Fix full SUSFS script to dry-run KSU patch first
+        run: |
+          python3 .github/scripts/fix_full_impl_dry_run_ksu_patch.py
+
       - name: Apply ReSukiSU SUSFS full implementation
         run: |
           set -e
