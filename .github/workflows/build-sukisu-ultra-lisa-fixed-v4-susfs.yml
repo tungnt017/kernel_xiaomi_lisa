@@ -306,6 +306,13 @@ jobs:
               log(f'[CHECK] {p.relative_to(ROOT)} exists={p.exists()}')
           PY
 
+      - name: Fix SUSFS lisa 5.4 rejects
+        if: github.event.inputs.apply_susfs_kernel == 'true'
+        run: |
+          set -e
+          set -o pipefail
+          python3 .github/scripts/fix_susfs_lisa_5_4_rejects.py 2>&1 | tee logs/fix-susfs-rejects.log
+
       - name: Dump SukiSU and SUSFS layout
         run: |
           set +e
