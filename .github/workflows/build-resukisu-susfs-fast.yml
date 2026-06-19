@@ -171,6 +171,17 @@ jobs:
           echo "SUSFS kernel patch tree:" | tee logs/susfs-tree.log
           find susfs-src/kernel_patches -maxdepth 4 -type f | sort | tee -a logs/susfs-tree.log
 
+
+      - name: Dump ReSukiSU kernel layout
+        run: |
+          {
+            echo "===== KernelSU file layout ====="
+            find KernelSU -maxdepth 3 -type f | sort | grep -E 'allowlist|apk_sign|core_hook|ksu.c|ksud|sucompat|selinux|Makefile|Kconfig' || true
+            echo
+            echo "===== drivers/kernelsu file layout ====="
+            find drivers/kernelsu -maxdepth 3 -type f | sort | grep -E 'allowlist|apk_sign|core_hook|ksu.c|ksud|sucompat|selinux|Makefile|Kconfig' || true
+          } | tee logs/resukisu-layout.log
+
       - name: Fix full SUSFS script to try patch -p2
         run: |
           python3 .github/scripts/fix_full_impl_try_p2.py
