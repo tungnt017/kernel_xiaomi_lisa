@@ -126,6 +126,10 @@ jobs:
         run: |
           python3 .github/scripts/fix_resukisu_susfs_magic.py
 
+      - name: Fix ReSukiSU SUSFS undefined fallback symbols
+        run: |
+          python3 .github/scripts/fix_resukisu_susfs_undefined_symbols.py
+
       - name: Collect SUSFS reject files as txt
         if: always()
         run: |
