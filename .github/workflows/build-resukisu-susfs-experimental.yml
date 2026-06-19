@@ -122,6 +122,10 @@ jobs:
         run: |
           python3 .github/scripts/fix_resukisu_susfs_dispatch_optional_cmds.py
 
+      - name: Fix ReSukiSU SUSFS magic define
+        run: |
+          python3 .github/scripts/fix_resukisu_susfs_magic.py
+
       - name: Collect SUSFS reject files as txt
         if: always()
         run: |
