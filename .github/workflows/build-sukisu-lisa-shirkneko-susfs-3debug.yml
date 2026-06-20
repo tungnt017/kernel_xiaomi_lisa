@@ -1,0 +1,532 @@
+name: Build Lisa SukiSU-Ultra Manual Hook + ShirkNeko SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Kernel defconfig"
+        required: true
+        default: "lisa_defconfig"
+      sukisu_mode:
+        description: "SukiSU-Ultra setup mode"
+        required: true
+        type: choice
+        default: "builtin"
+        options:
+          - builtin
+          - main
+      sukisu_ref:
+        description: "Optional SukiSU-Ultra commit/tag/branch after setup. Empty = keep setup result"
+        required: false
+        default: ""
+      susfs_repo:
+        description: "SUSFS repository"
+        required: true
+        default: "https://github.com/ShirkNeko/susfs4ksu.git"
+      susfs_ref:
+        description: "SUSFS branch/tag/commit. Empty = default repo branch"
+        required: false
+        default: "kernel-5.4"
+      apply_susfs_ksu_patch:
+        description: "Apply kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch to SukiSU dir"
+        required: true
+        type: boolean
+        default: true
+      apply_susfs_kernel_patch:
+        description: "Apply 50_add_susfs_in_kernel-5.4*.patch to kernel tree"
+        required: true
+        type: boolean
+        default: true
+      run_manual_hooks:
+        description: "Run .github/scripts/apply_sukisu_manual_hooks.py"
+        required: true
+        type: boolean
+        default: true
+      jobs:
+        description: "Parallel build jobs. Leave as $(nproc) for auto"
+        required: true
+        default: "$(nproc)"
+      upload_full_out:
+        description: "Upload out/ on failure"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  OUT_DIR: out
+  DEFCONFIG: ${{ github.event.inputs.defconfig }}
+  SUKISU_MODE: ${{ github.event.inputs.sukisu_mode }}
+  SUKISU_REF: ${{ github.event.inputs.sukisu_ref }}
+  SUSFS_REPO: ${{ github.event.inputs.susfs_repo }}
+  SUSFS_REF: ${{ github.event.inputs.susfs_ref }}
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+
+jobs:
+  build:
+    name: Lisa SukiSU ${{ github.event.inputs.sukisu_mode }} + ShirkNeko SUSFS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare build dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git git-lfs gnupg \
+            libelf-dev libssl-dev lld llvm make openssl python3 python3-pip \
+            rsync unzip wget zip zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p logs artifacts
+
+      - name: Capture initial environment
+        run: |
+          set -e
+          {
+            echo "DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "SUKISU_MODE=${SUKISU_MODE}"
+            echo "SUKISU_REF=${SUKISU_REF}"
+            echo "SUSFS_REPO=${SUSFS_REPO}"
+            echo "SUSFS_REF=${SUSFS_REF}"
+            echo "ARCH=${ARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+            echo "CROSS_COMPILE=${CROSS_COMPILE}"
+            echo "CLANG_TRIPLE=${CLANG_TRIPLE}"
+          } | tee logs/environment.log
+
+      - name: Add SukiSU-Ultra source
+        run: |
+          set -e
+          set -o pipefail
+
+          case "${SUKISU_MODE}" in
+            builtin) SETUP_ARG="builtin" ;;
+            main) SETUP_ARG="main" ;;
+            *) echo "ERROR: unsupported SUKISU_MODE=${SUKISU_MODE}" | tee logs/sukisu-setup.log; exit 1 ;;
+          esac
+
+          echo "Running SukiSU-Ultra setup with arg: ${SETUP_ARG}" | tee logs/sukisu-setup.log
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s "${SETUP_ARG}" 2>&1 | tee -a logs/sukisu-setup.log
+
+          KSU_DIR=""
+          if [ -d drivers/kernelsu ]; then
+            KSU_DIR="drivers/kernelsu"
+          elif [ -d KernelSU ]; then
+            KSU_DIR="KernelSU"
+          elif [ -d kernel/KernelSU ]; then
+            KSU_DIR="kernel/KernelSU"
+          fi
+
+          if [ -z "${KSU_DIR}" ]; then
+            echo "ERROR: SukiSU/KernelSU directory not found" | tee logs/sukisu-commit.log
+            find . -maxdepth 5 -type d \( -iname "kernelsu" -o -iname "SukiSU*" \) | tee -a logs/sukisu-commit.log || true
+            exit 1
+          fi
+
+          echo "KSU_DIR=${KSU_DIR}" | tee logs/sukisu-commit.log
+          echo "KSU_DIR=${KSU_DIR}" >> "$GITHUB_ENV"
+
+          if [ -d "${KSU_DIR}/.git" ]; then
+            git -C "${KSU_DIR}" fetch --unshallow 2>/dev/null || true
+            git -C "${KSU_DIR}" fetch --all --tags --force || true
+            if [ -n "${SUKISU_REF}" ]; then
+              echo "Checking out SukiSU ref: ${SUKISU_REF}" | tee -a logs/sukisu-commit.log
+              git -C "${KSU_DIR}" checkout "${SUKISU_REF}" 2>&1 | tee -a logs/sukisu-commit.log
+            fi
+            git -C "${KSU_DIR}" rev-parse HEAD | tee -a logs/sukisu-commit.log || true
+            git -C "${KSU_DIR}" log -1 --oneline | tee -a logs/sukisu-commit.log || true
+          fi
+
+      - name: Clone ShirkNeko SUSFS
+        run: |
+          set -e
+          set -o pipefail
+          rm -rf susfs-src
+
+          if [ -n "${SUSFS_REF}" ]; then
+            if git ls-remote --exit-code --heads "${SUSFS_REPO}" "${SUSFS_REF}" >/dev/null 2>&1; then
+              echo "Cloning SUSFS branch: ${SUSFS_REF}" | tee logs/susfs-clone.log
+              git clone --depth 1 --branch "${SUSFS_REF}" "${SUSFS_REPO}" susfs-src 2>&1 | tee -a logs/susfs-clone.log
+            else
+              echo "SUSFS ref is not a branch; cloning default branch then checking out: ${SUSFS_REF}" | tee logs/susfs-clone.log
+              git clone --depth 1 "${SUSFS_REPO}" susfs-src 2>&1 | tee -a logs/susfs-clone.log
+              git -C susfs-src fetch --unshallow 2>/dev/null || true
+              git -C susfs-src fetch --all --tags --force || true
+              git -C susfs-src checkout "${SUSFS_REF}" 2>&1 | tee -a logs/susfs-clone.log
+            fi
+          else
+            echo "Cloning SUSFS default branch" | tee logs/susfs-clone.log
+            git clone --depth 1 "${SUSFS_REPO}" susfs-src 2>&1 | tee -a logs/susfs-clone.log
+          fi
+
+          {
+            echo "===== SUSFS HEAD ====="
+            git -C susfs-src rev-parse HEAD || true
+            git -C susfs-src log -1 --oneline || true
+            echo
+            echo "===== SUSFS tree ====="
+            find susfs-src/kernel_patches -maxdepth 4 -type f | sort || true
+          } | tee logs/susfs-tree.log
+
+      - name: Apply ShirkNeko SUSFS files and patches
+        run: |
+          set -e
+          set -o pipefail
+
+          python3 - <<'PY' 2>&1 | tee logs/apply-shirkneko-susfs.log
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+
+          ROOT = Path.cwd()
+          SUS = ROOT / "susfs-src" / "kernel_patches"
+          KSU_DIR = Path(__import__('os').environ.get("KSU_DIR", "drivers/kernelsu"))
+
+          def log(msg):
+              print(msg, flush=True)
+
+          def run(cmd, cwd=ROOT, check=False):
+              log(f"[RUN] {cmd}  (cwd={cwd})")
+              p = subprocess.run(cmd, shell=True, cwd=cwd)
+              if check and p.returncode != 0:
+                  raise SystemExit(p.returncode)
+              return p.returncode
+
+          if not SUS.exists():
+              raise SystemExit(f"[ERROR] missing {SUS}")
+
+          # Copy kernel-side SUSFS implementation files.
+          for rel in ["fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"]:
+              src = SUS / rel
+              dst = ROOT / rel
+              if src.exists():
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+                  log(f"[OK] copied {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}")
+              else:
+                  log(f"[WARN] missing optional SUSFS file: {src.relative_to(ROOT)}")
+
+          # Apply SukiSU/KernelSU-side SUSFS patch if requested.
+          apply_ksu = "${{ github.event.inputs.apply_susfs_ksu_patch }}" == "true"
+          if apply_ksu:
+              patch = SUS / "KernelSU" / "10_enable_susfs_for_ksu.patch"
+              if patch.exists():
+                  if not KSU_DIR.exists():
+                      raise SystemExit(f"[ERROR] KSU_DIR missing: {KSU_DIR}")
+                  rc = run(f"git apply --whitespace=fix --reject '{patch.resolve()}'", cwd=KSU_DIR)
+                  if rc != 0:
+                      log("[WARN] git apply failed in KSU_DIR, trying patch -p1")
+                      rc = run(f"patch -p1 --forward --batch < '{patch.resolve()}'", cwd=KSU_DIR)
+                  if rc != 0:
+                      log("[WARN] KSU-side SUSFS patch did not apply cleanly; check *.rej artifacts")
+                  else:
+                      log("[OK] KSU-side SUSFS patch applied")
+              else:
+                  log(f"[WARN] KSU-side SUSFS patch not found: {patch}")
+          else:
+              log("[SKIP] KSU-side SUSFS patch disabled by input")
+
+          # Apply kernel-side patch.
+          apply_kernel = "${{ github.event.inputs.apply_susfs_kernel_patch }}" == "true"
+          if apply_kernel:
+              patches = []
+              patches += sorted(SUS.glob("50_add_susfs_in_kernel-5.4*.patch"))
+              patches += sorted(SUS.glob("*susfs*kernel*5.4*.patch"))
+              # De-duplicate while preserving order.
+              unique = []
+              for p in patches:
+                  if p not in unique:
+                      unique.append(p)
+              if not unique:
+                  raise SystemExit("[ERROR] no kernel 5.4 SUSFS patch found under kernel_patches")
+              patch = unique[0]
+              log(f"[OK] selected kernel patch: {patch.relative_to(ROOT)}")
+              rc = run(f"git apply --whitespace=fix --reject '{patch.resolve()}'", cwd=ROOT)
+              if rc != 0:
+                  log("[WARN] git apply failed, trying patch -p1")
+                  rc = run(f"patch -p1 --forward --batch < '{patch.resolve()}'", cwd=ROOT)
+              if rc != 0:
+                  log("[WARN] kernel-side SUSFS patch did not apply cleanly; check *.rej artifacts")
+              else:
+                  log("[OK] kernel-side SUSFS patch applied")
+          else:
+              log("[SKIP] kernel-side SUSFS patch disabled by input")
+
+          # Print rejects for debugging.
+          rejs = sorted(ROOT.rglob("*.rej"))
+          if rejs:
+              log("[WARN] reject files present:")
+              for r in rejs:
+                  log(f"  - {r.relative_to(ROOT)}")
+          else:
+              log("[OK] no reject files present after SUSFS apply")
+          PY
+
+      - name: Apply existing manual hook script
+        if: github.event.inputs.run_manual_hooks == 'true'
+        run: |
+          set -e
+          set -o pipefail
+
+          if [ ! -f .github/scripts/apply_sukisu_manual_hooks.py ]; then
+            echo "ERROR: .github/scripts/apply_sukisu_manual_hooks.py not found" | tee logs/apply-sukisu-manual-hooks.log
+            echo "Upload/copy your existing manual hook script to .github/scripts/apply_sukisu_manual_hooks.py" | tee -a logs/apply-sukisu-manual-hooks.log
+            exit 1
+          fi
+
+          python3 .github/scripts/apply_sukisu_manual_hooks.py "${DEFCONFIG}" 2>&1 | tee logs/apply-sukisu-manual-hooks.log
+
+      - name: Enable SUSFS configs
+        run: |
+          set -e
+          set -o pipefail
+
+          python3 - <<'PY' 2>&1 | tee logs/enable-susfs-configs.log
+          from pathlib import Path
+          import os
+
+          ROOT = Path.cwd()
+          defconfig = os.environ.get("DEFCONFIG", "lisa_defconfig")
+          candidates = [
+              ROOT / "arch" / "arm64" / "configs" / defconfig,
+              ROOT / "arch" / "arm64" / "configs" / "vendor" / defconfig,
+          ]
+          path = next((p for p in candidates if p.exists()), None)
+          if path is None:
+              raise SystemExit(f"[ERROR] defconfig not found: {defconfig}")
+
+          def set_config(text, key, value="y"):
+              lines = []
+              seen = False
+              for line in text.splitlines():
+                  if line.startswith(key + "=") or line.startswith("# " + key + " is not set"):
+                      if not seen:
+                          lines.append(f"{key}={value}")
+                          seen = True
+                      continue
+                  lines.append(line)
+              if not seen:
+                  lines.append(f"{key}={value}")
+              return "\n".join(lines) + "\n"
+
+          text = path.read_text(errors="ignore")
+          for key in [
+              "CONFIG_KSU",
+              "CONFIG_KSU_MANUAL_HOOK",
+              "CONFIG_KALLSYMS",
+              "CONFIG_KALLSYMS_ALL",
+              "CONFIG_KSU_SUSFS",
+              "CONFIG_KSU_SUSFS_SUS_PATH",
+              "CONFIG_KSU_SUSFS_SUS_MOUNT",
+              "CONFIG_KSU_SUSFS_SUS_KSTAT",
+              "CONFIG_KSU_SUSFS_TRY_UMOUNT",
+              "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT",
+              "CONFIG_KSU_SUSFS_SPOOF_UNAME",
+              "CONFIG_KSU_SUSFS_ENABLE_LOG",
+              "CONFIG_KSU_SUSFS_OPEN_REDIRECT",
+          ]:
+              text = set_config(text, key, "y")
+
+          path.write_text(text)
+          print(f"[OK] enabled KSU manual hook + SUSFS configs in {path.relative_to(ROOT)}")
+          PY
+
+      - name: Dump integration status
+        if: always()
+        run: |
+          set +e
+          mkdir -p logs/debug
+          {
+            echo "===== KSU_DIR ====="
+            echo "${KSU_DIR}"
+            echo
+            echo "===== SUSFS files ====="
+            ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
+            echo
+            echo "===== Reject files ====="
+            find . -name '*.rej' -type f -print | sort || true
+            echo
+            echo "===== Manual hook grep ====="
+            grep -R "ksu_handle_execveat\|ksu_handle_faccessat\|ksu_handle_stat\|ksu_handle_sys_reboot" fs kernel security 2>/dev/null || true
+            echo
+            echo "===== Defconfig KSU/SUSFS ====="
+            grep -E 'CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KPM' "arch/arm64/configs/${DEFCONFIG}" 2>/dev/null || true
+          } | tee logs/integration-status.log
+
+          cp fs/susfs.c logs/debug/susfs.c.txt 2>/dev/null || true
+          cp include/linux/susfs.h logs/debug/susfs.h.txt 2>/dev/null || true
+          cp include/linux/susfs_def.h logs/debug/susfs_def.h.txt 2>/dev/null || true
+          cp "arch/arm64/configs/${DEFCONFIG}" logs/debug/patched-defconfig.txt 2>/dev/null || true
+
+      - name: Configure kernel
+        run: |
+          set -e
+          set -o pipefail
+          make O="${OUT_DIR}" ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            "${DEFCONFIG}" 2>&1 | tee logs/configure.log
+          make O="${OUT_DIR}" ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            olddefconfig 2>&1 | tee -a logs/configure.log
+          cp "${OUT_DIR}/.config" logs/debug/effective-dot-config.txt 2>/dev/null || true
+          grep -E 'CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KPM|CONFIG_KSU_SUSFS' "${OUT_DIR}/.config" | tee logs/kernel-config-ksu-susfs.log || true
+
+      - name: Build kernel
+        run: |
+          set -e
+          set -o pipefail
+          JOBS_INPUT='${{ github.event.inputs.jobs }}'
+          if [ "${JOBS_INPUT}" = '$(nproc)' ] || [ -z "${JOBS_INPUT}" ]; then
+            JOBS="$(nproc)"
+          else
+            JOBS="${JOBS_INPUT}"
+          fi
+          echo "Starting compilation with -j${JOBS}" | tee logs/build.log
+          make -j"${JOBS}" O="${OUT_DIR}" ARCH="${ARCH}" \
+            LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            2>&1 | tee -a logs/build.log
+
+      - name: Extract build error tail
+        if: always()
+        run: |
+          mkdir -p logs
+          echo "===== build.log tail 300 =====" > logs/build-tail.log
+          tail -300 logs/build.log >> logs/build-tail.log 2>/dev/null || true
+          echo "===== errors/warnings grep =====" > logs/build-errors.log
+          grep -nEi "error:|undefined reference|No rule to make target|fatal error|ld.lld|make\\[[0-9]+\\]: \\*\\*\\*" logs/build.log \
+            >> logs/build-errors.log 2>/dev/null || true
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          set +e
+          mkdir -p artifacts logs
+          {
+            echo "===== OUTPUT FILES ====="
+            find "${OUT_DIR}" -type f \( \
+              -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' -o \
+              -name '*.dtb' -o -name '*.dtbo' -o -name '*.ko' -o -name 'vmlinux' \
+            \) -print | sort
+          } | tee logs/output-files.log
+          cp "${OUT_DIR}/arch/arm64/boot/Image" artifacts/ 2>/dev/null || true
+          cp "${OUT_DIR}/arch/arm64/boot/Image.gz" artifacts/ 2>/dev/null || true
+          cp "${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" artifacts/ 2>/dev/null || true
+          find "${OUT_DIR}/arch/arm64/boot/dts" -type f \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp -t artifacts {} + 2>/dev/null || true
+
+      - name: Create compact debug summary
+        if: always()
+        run: |
+          set +e
+          mkdir -p logs
+
+          SUMMARY="logs/debug-summary.log"
+          : > "$SUMMARY"
+
+          add_section() {
+            local title="$1"
+            local file="$2"
+            {
+              echo
+              echo "================================================================"
+              echo "===== ${title}"
+              echo "===== file: ${file}"
+              echo "================================================================"
+              if [ -f "$file" ]; then
+                cat "$file"
+              else
+                echo "[MISSING] $file"
+              fi
+            } >> "$SUMMARY"
+          }
+
+          {
+            echo "Compact debug summary for Copilot upload"
+            echo "Generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "GitHub run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "SUKISU_MODE=${SUKISU_MODE}"
+            echo "SUSFS_REPO=${SUSFS_REPO}"
+            echo "SUSFS_REF=${SUSFS_REF}"
+            echo "KSU_DIR=${KSU_DIR}"
+          } >> "$SUMMARY"
+
+          add_section "environment" "logs/environment.log"
+          add_section "SukiSU setup" "logs/sukisu-setup.log"
+          add_section "SukiSU commit" "logs/sukisu-commit.log"
+          add_section "SUSFS clone/tree" "logs/susfs-tree.log"
+          add_section "SUSFS apply" "logs/apply-shirkneko-susfs.log"
+          add_section "manual hook" "logs/apply-sukisu-manual-hooks.log"
+          add_section "SUSFS/config enable" "logs/enable-susfs-configs.log"
+          add_section "integration status" "logs/integration-status.log"
+          add_section "configure" "logs/configure.log"
+          add_section "effective KSU/SUSFS config" "logs/kernel-config-ksu-susfs.log"
+          add_section "build errors" "logs/build-errors.log"
+          add_section "build tail" "logs/build-tail.log"
+
+          {
+            echo
+            echo "================================================================"
+            echo "===== reject files"
+            echo "================================================================"
+            find . -name '*.rej' -type f | sort
+            echo
+            echo "================================================================"
+            echo "===== reject file contents"
+            echo "================================================================"
+          } >> "$SUMMARY"
+
+          while IFS= read -r rej; do
+            [ -z "$rej" ] && continue
+            {
+              echo
+              echo "----- ${rej} -----"
+              cat "$rej"
+            } >> "$SUMMARY"
+          done < <(find . -name '*.rej' -type f | sort)
+
+          echo "Created $SUMMARY"
+
+      - name: Upload 3 debug files only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-debug-3files-sukisu-shirkneko-susfs-${{ github.run_number }}
+          path: |
+            logs/debug-summary.log
+            logs/build-errors.log
+            logs/build-tail.log
+          if-no-files-found: warn
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts-sukisu-shirkneko-susfs-${{ github.run_number }}
+          path: artifacts/**
+          if-no-files-found: warn
+
+      - name: Upload full out directory on failure
+        if: failure() && github.event.inputs.upload_full_out == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-debug-sukisu-shirkneko-susfs-${{ github.run_number }}
+          path: out/**
+          if-no-files-found: warn
