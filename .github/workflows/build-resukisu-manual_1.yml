@@ -1,4 +1,4 @@
-name: Build Lisa Kernel With ReSukiSU Manual Hooks
+name: Build Lisa Kernel With ReSukiSU Manual Hooks_No weak
 
 on:
   workflow_dispatch:
