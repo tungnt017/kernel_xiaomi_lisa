@@ -73,7 +73,7 @@ jobs:
       - name: Verify ReSukiSU hooks
         run: |
             chmod +x verify_hooks.sh
-            ./verify_hooks.sh --strict --json hook-verification.json
+            .github/scripts/verify_hooks.sh --strict --json hook-verification.json
 
       - name: Upload verification report
         if: always()    # upload kể cả khi fail
