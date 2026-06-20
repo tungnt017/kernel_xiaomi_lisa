@@ -70,6 +70,18 @@ jobs:
 
           python3 .github/scripts/apply_resukisu_manual_hooks_1.py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
 
+      - name: Verify ReSukiSU hooks
+        run: |
+            chmod +x verify_hooks.sh
+            ./verify_hooks.sh --strict --json hook-verification.json
+
+      - name: Upload verification report
+        if: always()    # upload kể cả khi fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: hook-verification
+          path: hook-verification.json
+
       - name: Force ReSukiSU required config
         run: |
           set -e
