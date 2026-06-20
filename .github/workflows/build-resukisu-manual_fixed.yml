@@ -68,7 +68,7 @@ jobs:
           set -o pipefail
           mkdir -p logs
 
-          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed (1).py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
+          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
 
       - name: Force ReSukiSU required config
         run: |
