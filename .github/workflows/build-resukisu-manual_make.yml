@@ -315,8 +315,8 @@ jobs:
             cp -v "${dtb}" "${AK3_DIR}/dtb"
 
             PYTHON_DTC="python3"
-            if command -v python2 >/dev/null 2>&1; then
-              PYTHON_DTC="python2"
+            if command -v python3 >/dev/null 2>&1; then
+              PYTHON_DTC="python3"
             fi
             "${PYTHON_DTC}" scripts/dtc/libfdt/mkdtboimg.py create "${AK3_DIR}/dtbo.img" --page_size=4096 "${dtbo}"
 
