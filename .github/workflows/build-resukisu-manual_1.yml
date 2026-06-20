@@ -72,8 +72,8 @@ jobs:
 
       - name: Verify ReSukiSU hooks
         run: |
-            chmod +x verify_hooks.sh
-            .github/scripts/verify_hooks.sh --strict --json hook-verification.json
+            chmod +x .github/scripts/verify_hooks.sh
+            sh .github/scripts/verify_hooks.sh --strict --json hook-verification.json
 
       - name: Upload verification report
         if: always()    # upload kể cả khi fail
