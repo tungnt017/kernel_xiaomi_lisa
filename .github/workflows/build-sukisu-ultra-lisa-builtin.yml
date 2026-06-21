@@ -18,29 +18,39 @@ on:
         type: choice
         options:
           - builtin
+      build_config:
+        description: "ACK BUILD_CONFIG file"
+        required: true
+        default: "build.config.msm.lahaina"
+      susfs_branch:
+        description: "ShirkNeko/susfs4ksu branch"
+        required: true
+        default: "kernel-5.4"
 
 permissions:
   contents: read
 
 env:
-  KERNEL_REPO: tungnt017/kernel_xiaomi_lisa
-  KERNEL_DIR:  kernel_xiaomi_lisa
-  ARCH: arm64
-  SUBARCH: arm64
-  DEFCONFIG: ${{ github.event.inputs.defconfig || 'lisa_defconfig' }}
-  SUKISU_MODE: ${{ github.event.inputs.sukisu_mode || 'builtin' }}
-  KBRANCH: ${{ github.event.inputs.kernel_branch || 'thirteen' }}
+  KERNEL_REPO:  tungnt017/kernel_xiaomi_lisa
+  KERNEL_DIR:   kernel_xiaomi_lisa
+  ARCH:         arm64
+  SUBARCH:      arm64
+  DEFCONFIG:    ${{ github.event.inputs.defconfig     || 'lisa_defconfig' }}
+  SUKISU_MODE:  ${{ github.event.inputs.sukisu_mode   || 'builtin' }}
+  KBRANCH:      ${{ github.event.inputs.kernel_branch || 'thirteen' }}
+  BUILD_CONFIG: ${{ github.event.inputs.build_config  || 'build.config.msm.lahaina' }}
+  SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch  || 'kernel-5.4' }}
 
 jobs:
   build:
     name: Build (${{ github.event.inputs.sukisu_mode || 'builtin' }})
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-      # ────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────
       # 0. Checkout
-      # ────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────
       - name: Checkout workflow repo (scripts)
         uses: actions/checkout@v4
         with:
@@ -60,51 +70,41 @@ jobs:
           mkdir -p "$KERNEL_DIR/.github/scripts"
           cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py \
                 "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_rmnet_ipa_enum_cast.py \
+                "$KERNEL_DIR/.github/scripts/"
 
-      # ────────────────────────────────────────────────────────────
-      # 1. Toolchain
-      # ────────────────────────────────────────────────────────────
-      - name: Install build deps
+      # ────────────────────────────────────────────────
+      # 1. Minimal build deps (build.sh tự lo Clang)
+      # ────────────────────────────────────────────────
+      - name: Install minimal build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libssl-dev \
-            libelf-dev zip unzip python3 python3-pip cpio rsync
+            bc bison build-essential ccache curl flex git \
+            libssl-dev libelf-dev zip unzip python3 python3-pip \
+            cpio rsync kmod patch
 
-      - name: Setup AOSP Clang + GCC
+      # ────────────────────────────────────────────────
+      # 2. SukiSU-Ultra builtin (module-side SUSFS caller)
+      # ────────────────────────────────────────────────
+      - name: Integrate SukiSU-Ultra (builtin)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          mkdir -p toolchain
-          # AOSP Clang (chỉnh version theo nhu cầu)
-          git clone --depth=1 https://gitlab.com/PixelOS-Devices/playgroundtc.git toolchain/clang
-          # arm64 + arm32 binutils
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 toolchain/gcc64
-          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 toolchain/gcc32
-          echo "PATH=$PWD/toolchain/clang/bin:$PWD/toolchain/gcc64/bin:$PWD/toolchain/gcc32/bin:$PATH" >> "$GITHUB_ENV"
-
-      # ────────────────────────────────────────────────────────────
-      # 2. Integrate SukiSU-Ultra builtin  (SUSFS ĐÃ CÓ SẴN)
-      # ────────────────────────────────────────────────────────────
-      - name: Integrate SukiSU-Ultra (builtin → SUSFS included)
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          echo "==> Running SukiSU-Ultra setup.sh '$SUKISU_MODE'"
+          echo "==> setup.sh '$SUKISU_MODE'"
           curl -LSs \
             "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s "$SUKISU_MODE"
-          # Xác định nơi đặt module
           if [ -d "KernelSU" ]; then
             echo "KSU_DIR=KernelSU" >> "$GITHUB_ENV"
           elif [ -d "drivers/kernelsu" ]; then
             echo "KSU_DIR=drivers/kernelsu" >> "$GITHUB_ENV"
           else
-            echo "::error::setup.sh did not produce KernelSU/ or drivers/kernelsu/"
+            echo "::error::setup.sh khong tao KernelSU/ hoac drivers/kernelsu/"
             exit 1
           fi
 
-      - name: Verify SUSFS is built-in (fail-fast)
+      - name: Verify SukiSU module-side has SUSFS callers (fail-fast)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -112,18 +112,96 @@ jobs:
           REF=$(grep -RnE "CONFIG_KSU_SUSFS|susfs_" "$KSU_DIR" \
                   --include="*.c" --include="*.h" 2>/dev/null | wc -l || echo 0)
           echo "Kconfig SUSFS options: $KCFG"
-          echo "Source SUSFS references: $REF"
+          echo "Module SUSFS references: $REF"
           if [ "$KCFG" -lt 5 ] || [ "$REF" -lt 50 ]; then
-            echo "::error::SUSFS NOT properly built-in (KCFG=$KCFG, REF=$REF)"
-            echo "         => sai branch hoac setup.sh fail. KHONG clone susfs4ksu."
+            echo "::error::SukiSU module-side SUSFS thieu (KCFG=$KCFG, REF=$REF)"
             exit 1
           fi
-          echo "OK - SUSFS built-in xac nhan."
+          echo "OK - SukiSU module-side caller xac nhan."
 
-      # ────────────────────────────────────────────────────────────
-      # 3. Defconfig: enable SUSFS options (chỉ những cái Kconfig có)
-      # ────────────────────────────────────────────────────────────
-      - name: Enable SUSFS configs in defconfig (whitelist by Kconfig)
+      # ────────────────────────────────────────────────
+      # 2b. SUSFS kernel-side (ShirkNeko/susfs4ksu)
+      # ────────────────────────────────────────────────
+      - name: Clone ShirkNeko/susfs4ksu (${{ env.SUSFS_BRANCH }})
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/susfs4ksu
+          git clone --depth=1 -b "$SUSFS_BRANCH" \
+            https://github.com/ShirkNeko/susfs4ksu.git /tmp/susfs4ksu
+          echo "----- patches available -----"
+          ls -la /tmp/susfs4ksu/kernel_patches/*.patch 2>/dev/null || true
+          echo "----- fs/ files -----"
+          ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
+          echo "----- include/linux/ files -----"
+          ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
+
+      - name: Apply SUSFS to kernel tree (official, fail-fast)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          SRC=/tmp/susfs4ksu/kernel_patches
+
+          echo "==> Copy fs/susfs.c"
+          [ -f "$SRC/fs/susfs.c" ] || { echo "::error::Missing $SRC/fs/susfs.c"; exit 1; }
+          cp -v "$SRC/fs/susfs.c" fs/
+
+          echo "==> Copy include/linux/susfs.h"
+          [ -f "$SRC/include/linux/susfs.h" ] || { echo "::error::Missing $SRC/include/linux/susfs.h"; exit 1; }
+          cp -v "$SRC/include/linux/susfs.h" include/linux/
+
+          echo "==> Copy include/linux/susfs_def.h (if any)"
+          [ -f "$SRC/include/linux/susfs_def.h" ] && cp -v "$SRC/include/linux/susfs_def.h" include/linux/ || true
+
+          PATCH=""
+          for cand in "$SRC/50_add_susfs_in_kernel-${SUSFS_BRANCH#kernel-}.patch" \
+                     "$SRC"/50_add_susfs_in_kernel-*.patch; do
+            [ -f "$cand" ] && PATCH="$cand" && break
+          done
+          [ -n "$PATCH" ] || { echo "::error::Khong tim thay 50_add_susfs_in_kernel*.patch"; ls -la "$SRC"; exit 1; }
+          echo "==> Apply $PATCH"
+
+          if ! patch -p1 --dry-run -i "$PATCH" >/tmp/susfs_dryrun.log 2>&1; then
+            echo "::error::Dry-run apply patch FAILED — KHONG bypass"
+            cat /tmp/susfs_dryrun.log
+            exit 1
+          fi
+          echo "Dry-run OK, applying..."
+          patch -p1 -i "$PATCH" | tee /tmp/susfs_apply.log
+
+          REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
+          if [ -n "$REJ" ]; then
+            echo "::error::.rej files xuat hien - patch khong sach"
+            echo "$REJ"
+            exit 1
+          fi
+
+      - name: Verify SUSFS kernel-side integrated (fail-fast)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+          for f in fs/susfs.c include/linux/susfs.h; do
+            if [ -f "$f" ]; then
+              echo "OK  $f ($(wc -l < "$f") lines)"
+            else
+              echo "::error::Missing $f"
+              FAIL=1
+            fi
+          done
+          REF=$(grep -RnE "susfs_|SUSFS" fs/ include/linux/ kernel/ 2>/dev/null | wc -l || echo 0)
+          echo "Kernel-side SUSFS references: $REF"
+          if [ "$REF" -lt 30 ]; then
+            echo "::error::Kernel-side SUSFS reference qua thap ($REF < 30)"
+            FAIL=1
+          fi
+          [ "$FAIL" -ne 0 ] && exit 1
+          echo "ALL SUSFS kernel-side checks PASSED."
+
+      # ────────────────────────────────────────────────
+      # 3. Enable SUSFS options in defconfig
+      # ────────────────────────────────────────────────
+      - name: Enable SUSFS configs in defconfig
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -133,10 +211,7 @@ jobs:
             "arch/arm64/configs/vendor/$DEFCONFIG"; do
             [ -f "$cand" ] && DC="$cand" && break
           done
-          if [ -z "$DC" ]; then
-            echo "::error::Khong tim thay defconfig: $DEFCONFIG"
-            exit 1
-          fi
+          [ -n "$DC" ] || { echo "::error::Khong tim thay defconfig: $DEFCONFIG"; exit 1; }
           echo "Defconfig: $DC"
 
           WANTED=(
@@ -166,25 +241,20 @@ jobs:
             fi
           done
           echo "Added=$ADDED Skipped=$SKIP"
-          if [ "$ADDED" -lt 5 ]; then
-            echo "::error::Qua it config duoc enable ($ADDED < 5)"
-            exit 1
-          fi
+          [ "$ADDED" -ge 5 ] || { echo "::error::Qua it config enable ($ADDED < 5)"; exit 1; }
           echo "----- Defconfig tail -----"
           tail -n 40 "$DC"
 
-      # ────────────────────────────────────────────────────────────
-      # 4. Apply manual hooks (non-GKI 5.4)
-      # ────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────
+      # 4. Apply + verify manual hooks (non-GKI 5.4)
+      # ────────────────────────────────────────────────
       - name: Apply manual hooks
-        id: apply_hooks
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           chmod +x .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
           python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$DEFCONFIG" \
             | tee /tmp/apply_hooks.log
-          # Fail-fast neu script log [MISS] hoac error
           if grep -qE "\[ERROR\]|RuntimeError|Traceback" /tmp/apply_hooks.log; then
             echo "::error::apply_resukisu_manual_hooks_1_fixed.py reported errors"
             exit 1
@@ -195,64 +265,23 @@ jobs:
         run: |
           set -euo pipefail
           FAIL=0
-
-          echo "::group::Check fs/exec.c"
-          if grep -q "ksu_handle_execveat" fs/exec.c; then
-            echo "OK - execveat hook present"
-          else
-            echo "::error::fs/exec.c thieu ksu_handle_execveat"
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Check fs/open.c"
-          if grep -q "ksu_handle_faccessat" fs/open.c; then
-            echo "OK - faccessat hook present"
-          else
-            echo "::error::fs/open.c thieu ksu_handle_faccessat"
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Check fs/stat.c"
-          if grep -q "ksu_handle_stat" fs/stat.c; then
-            echo "OK - stat hook present"
-          else
-            echo "::error::fs/stat.c thieu ksu_handle_stat"
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Check kernel/reboot.c"
-          if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
-            echo "OK - reboot hook present"
-          else
-            echo "::error::kernel/reboot.c thieu ksu_handle_sys_reboot"
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Check selinuxfs export"
-          if grep -q "EXPORT_SYMBOL.*sel_handle_status_ops" security/selinux/selinuxfs.c; then
-            echo "OK - sel_handle_status_ops exported"
-          else
-            echo "::warning::sel_handle_status_ops chua export (co the optional)"
-          fi
-          echo "::endgroup::"
-
-          echo "::group::Check CONFIG_KSU_MANUAL_HOOK markers"
+          for pair in \
+            "fs/exec.c:ksu_handle_execveat" \
+            "fs/open.c:ksu_handle_faccessat" \
+            "fs/stat.c:ksu_handle_stat" \
+            "kernel/reboot.c:ksu_handle_sys_reboot"; do
+            f="${pair%%:*}"; sym="${pair##*:}"
+            if grep -q "$sym" "$f"; then
+              echo "OK  $f  has $sym"
+            else
+              echo "::error::$f thieu $sym"
+              FAIL=1
+            fi
+          done
           MH=$(grep -RnE "CONFIG_KSU_MANUAL_HOOK" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | wc -l || echo 0)
-          echo "CONFIG_KSU_MANUAL_HOOK occurrences: $MH"
-          if [ "$MH" -lt 4 ]; then
-            echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          if [ "$FAIL" -ne 0 ]; then
-            echo "::error::Manual hook verify FAILED"
-            exit 1
-          fi
+          echo "CONFIG_KSU_MANUAL_HOOK markers: $MH"
+          [ "$MH" -ge 4 ] || { echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"; FAIL=1; }
+          [ "$FAIL" -ne 0 ] && exit 1
           echo "ALL manual hooks verified."
 
       - name: Upload manual hook backup (always)
@@ -264,35 +293,64 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ────────────────────────────────────────────────────────────
-      # 5. Build kernel
-      # ────────────────────────────────────────────────────────────
-      - name: Configure defconfig
+      # ────────────────────────────────────────────────
+      # 4b. Official source fixes (explicit cast)
+      # ────────────────────────────────────────────────
+      - name: Fix rmnet_ipa enum-conversion (-Werror)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          make O=out \
-            ARCH=$ARCH SUBARCH=$SUBARCH \
-            CC=clang LD=ld.lld \
-            "$DEFCONFIG"
+          chmod +x .github/scripts/fix_rmnet_ipa_enum_cast.py
+          python3 .github/scripts/fix_rmnet_ipa_enum_cast.py | tee /tmp/fix_rmnet_ipa.log
+          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_rmnet_ipa.log; then
+            echo "::error::fix_rmnet_ipa_enum_cast.py reported errors"
+            exit 1
+          fi
 
-      - name: Build Image.gz + dtbs
+      - name: Verify rmnet_ipa cast applied (fail-fast)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          make O=out -j$(nproc --all) \
-            ARCH=$ARCH SUBARCH=$SUBARCH \
-            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            Image.gz dtbs 2>&1 | tee /tmp/build.log
+          F=techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c
+          grep -q "(enum ipa_ip_type)flt_spec_ptr->ip_type" "$F" \
+            || { echo "::error::Cast 'ip_type' chua duoc apply trong $F"; exit 1; }
+          grep -q "(enum ipa_flt_action)flt_spec_ptr->filter_action" "$F" \
+            || { echo "::error::Cast 'filter_action' chua duoc apply trong $F"; exit 1; }
+          echo "OK - rmnet_ipa enum casts applied."
 
-      # ────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────
+      # 5. Build kernel via ./build.sh
+      # ────────────────────────────────────────────────
+      - name: Build kernel via ./build.sh
+        working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          BUILD_CONFIG: ${{ env.BUILD_CONFIG }}
+          V: "1"
+        run: |
+          set -euo pipefail
+          [ -f "./build.sh" ]      || { echo "::error::Khong tim thay ./build.sh"; ls -la; exit 1; }
+          [ -f "$BUILD_CONFIG" ]   || { echo "::error::Khong tim thay BUILD_CONFIG=$BUILD_CONFIG";
+                                       ls -1 build.config.* 2>/dev/null || true; exit 1; }
+          chmod +x ./build.sh
+          echo "==> BUILD_CONFIG=$BUILD_CONFIG"
+          echo "==> Running ./build.sh ..."
+          ./build.sh 2>&1 | tee /tmp/build.log
+
+      # ────────────────────────────────────────────────
       # 6. Logs + artifacts (always)
-      # ────────────────────────────────────────────────────────────
-      - name: Upload build logs
+      # ────────────────────────────────────────────────
+      - name: Locate build output dir
+        if: always()
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          OUT_DIR=$(find out -type d -name "dist" 2>/dev/null | head -n 1 || true)
+          [ -z "$OUT_DIR" ] && OUT_DIR="out/arch/arm64/boot"
+          echo "OUT_DIR=$OUT_DIR" >> "$GITHUB_ENV"
+          echo "Detected OUT_DIR=$OUT_DIR"
+          ls -la "$OUT_DIR" 2>/dev/null || true
+
+      - name: Upload build logs (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -300,6 +358,9 @@ jobs:
           path: |
             /tmp/build.log
             /tmp/apply_hooks.log
+            /tmp/fix_rmnet_ipa.log
+            /tmp/susfs_dryrun.log
+            /tmp/susfs_apply.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -309,8 +370,10 @@ jobs:
         with:
           name: kernel-image
           path: |
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/**/*.dtb
+            ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/Image
+            ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/Image.gz
+            ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/Image.gz-dtb
+            ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/dtbo.img
+            ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/*.dtb
           if-no-files-found: warn
           retention-days: 14
