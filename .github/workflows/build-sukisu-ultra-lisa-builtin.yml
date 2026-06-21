@@ -1,0 +1,316 @@
+name: Build SukiSU-Ultra builtin (lisa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Kernel branch (lisa)"
+        required: true
+        default: "thirteen"
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lisa_defconfig"
+      sukisu_mode:
+        description: "setup.sh mode"
+        required: true
+        default: "builtin"
+        type: choice
+        options:
+          - builtin
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: tungnt017/kernel_xiaomi_lisa
+  KERNEL_DIR:  kernel_xiaomi_lisa
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'lisa_defconfig' }}
+  SUKISU_MODE: ${{ github.event.inputs.sukisu_mode || 'builtin' }}
+  KBRANCH: ${{ github.event.inputs.kernel_branch || 'thirteen' }}
+
+jobs:
+  build:
+    name: Build (${{ github.event.inputs.sukisu_mode || 'builtin' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ────────────────────────────────────────────────────────────
+      # 0. Checkout
+      # ────────────────────────────────────────────────────────────
+      - name: Checkout workflow repo (scripts)
+        uses: actions/checkout@v4
+        with:
+          path: workflow-repo
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KBRANCH }}
+          path: ${{ env.KERNEL_DIR }}
+          fetch-depth: 1
+
+      - name: Copy scripts into kernel tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$KERNEL_DIR/.github/scripts"
+          cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py \
+                "$KERNEL_DIR/.github/scripts/"
+
+      # ────────────────────────────────────────────────────────────
+      # 1. Toolchain
+      # ────────────────────────────────────────────────────────────
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libssl-dev \
+            libelf-dev zip unzip python3 python3-pip cpio rsync
+
+      - name: Setup AOSP Clang + GCC
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p toolchain
+          # AOSP Clang (chỉnh version theo nhu cầu)
+          git clone --depth=1 https://gitlab.com/PixelOS-Devices/playgroundtc.git toolchain/clang
+          # arm64 + arm32 binutils
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 toolchain/gcc64
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 toolchain/gcc32
+          echo "PATH=$PWD/toolchain/clang/bin:$PWD/toolchain/gcc64/bin:$PWD/toolchain/gcc32/bin:$PATH" >> "$GITHUB_ENV"
+
+      # ────────────────────────────────────────────────────────────
+      # 2. Integrate SukiSU-Ultra builtin  (SUSFS ĐÃ CÓ SẴN)
+      # ────────────────────────────────────────────────────────────
+      - name: Integrate SukiSU-Ultra (builtin → SUSFS included)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          echo "==> Running SukiSU-Ultra setup.sh '$SUKISU_MODE'"
+          curl -LSs \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s "$SUKISU_MODE"
+          # Xác định nơi đặt module
+          if [ -d "KernelSU" ]; then
+            echo "KSU_DIR=KernelSU" >> "$GITHUB_ENV"
+          elif [ -d "drivers/kernelsu" ]; then
+            echo "KSU_DIR=drivers/kernelsu" >> "$GITHUB_ENV"
+          else
+            echo "::error::setup.sh did not produce KernelSU/ or drivers/kernelsu/"
+            exit 1
+          fi
+
+      - name: Verify SUSFS is built-in (fail-fast)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          KCFG=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" | wc -l || echo 0)
+          REF=$(grep -RnE "CONFIG_KSU_SUSFS|susfs_" "$KSU_DIR" \
+                  --include="*.c" --include="*.h" 2>/dev/null | wc -l || echo 0)
+          echo "Kconfig SUSFS options: $KCFG"
+          echo "Source SUSFS references: $REF"
+          if [ "$KCFG" -lt 5 ] || [ "$REF" -lt 50 ]; then
+            echo "::error::SUSFS NOT properly built-in (KCFG=$KCFG, REF=$REF)"
+            echo "         => sai branch hoac setup.sh fail. KHONG clone susfs4ksu."
+            exit 1
+          fi
+          echo "OK - SUSFS built-in xac nhan."
+
+      # ────────────────────────────────────────────────────────────
+      # 3. Defconfig: enable SUSFS options (chỉ những cái Kconfig có)
+      # ────────────────────────────────────────────────────────────
+      - name: Enable SUSFS configs in defconfig (whitelist by Kconfig)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          DC=""
+          for cand in \
+            "arch/arm64/configs/$DEFCONFIG" \
+            "arch/arm64/configs/vendor/$DEFCONFIG"; do
+            [ -f "$cand" ] && DC="$cand" && break
+          done
+          if [ -z "$DC" ]; then
+            echo "::error::Khong tim thay defconfig: $DEFCONFIG"
+            exit 1
+          fi
+          echo "Defconfig: $DC"
+
+          WANTED=(
+            CONFIG_KSU
+            CONFIG_KSU_SUSFS
+            CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
+            CONFIG_KSU_SUSFS_SUS_KSTAT
+            CONFIG_KSU_SUSFS_SUS_MAP
+            CONFIG_KSU_SUSFS_SPOOF_UNAME
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_ENABLE_LOG
+            CONFIG_KSU_MANUAL_HOOK
+          )
+          ADDED=0; SKIP=0
+          for cfg in "${WANTED[@]}"; do
+            sym="${cfg#CONFIG_}"
+            if grep -RqE "^[[:space:]]*config[[:space:]]+${sym}\b" "$KSU_DIR"; then
+              sed -i -E "/^# ?${cfg}( is not set)?$/d;/^${cfg}=.*/d" "$DC"
+              echo "${cfg}=y" >> "$DC"
+              ADDED=$((ADDED+1))
+            else
+              echo "::notice::Skip $cfg (Kconfig khong dinh nghia)"
+              SKIP=$((SKIP+1))
+            fi
+          done
+          echo "Added=$ADDED Skipped=$SKIP"
+          if [ "$ADDED" -lt 5 ]; then
+            echo "::error::Qua it config duoc enable ($ADDED < 5)"
+            exit 1
+          fi
+          echo "----- Defconfig tail -----"
+          tail -n 40 "$DC"
+
+      # ────────────────────────────────────────────────────────────
+      # 4. Apply manual hooks (non-GKI 5.4)
+      # ────────────────────────────────────────────────────────────
+      - name: Apply manual hooks
+        id: apply_hooks
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
+          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$DEFCONFIG" \
+            | tee /tmp/apply_hooks.log
+          # Fail-fast neu script log [MISS] hoac error
+          if grep -qE "\[ERROR\]|RuntimeError|Traceback" /tmp/apply_hooks.log; then
+            echo "::error::apply_resukisu_manual_hooks_1_fixed.py reported errors"
+            exit 1
+          fi
+
+      - name: Verify manual hooks were applied (fail-fast)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+
+          echo "::group::Check fs/exec.c"
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "OK - execveat hook present"
+          else
+            echo "::error::fs/exec.c thieu ksu_handle_execveat"
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Check fs/open.c"
+          if grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "OK - faccessat hook present"
+          else
+            echo "::error::fs/open.c thieu ksu_handle_faccessat"
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Check fs/stat.c"
+          if grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "OK - stat hook present"
+          else
+            echo "::error::fs/stat.c thieu ksu_handle_stat"
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Check kernel/reboot.c"
+          if grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+            echo "OK - reboot hook present"
+          else
+            echo "::error::kernel/reboot.c thieu ksu_handle_sys_reboot"
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Check selinuxfs export"
+          if grep -q "EXPORT_SYMBOL.*sel_handle_status_ops" security/selinux/selinuxfs.c; then
+            echo "OK - sel_handle_status_ops exported"
+          else
+            echo "::warning::sel_handle_status_ops chua export (co the optional)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Check CONFIG_KSU_MANUAL_HOOK markers"
+          MH=$(grep -RnE "CONFIG_KSU_MANUAL_HOOK" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | wc -l || echo 0)
+          echo "CONFIG_KSU_MANUAL_HOOK occurrences: $MH"
+          if [ "$MH" -lt 4 ]; then
+            echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Manual hook verify FAILED"
+            exit 1
+          fi
+          echo "ALL manual hooks verified."
+
+      - name: Upload manual hook backup (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-hook-backup
+          path: ${{ env.KERNEL_DIR }}/.resukisu_backup
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ────────────────────────────────────────────────────────────
+      # 5. Build kernel
+      # ────────────────────────────────────────────────────────────
+      - name: Configure defconfig
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          make O=out \
+            ARCH=$ARCH SUBARCH=$SUBARCH \
+            CC=clang LD=ld.lld \
+            "$DEFCONFIG"
+
+      - name: Build Image.gz + dtbs
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          make O=out -j$(nproc --all) \
+            ARCH=$ARCH SUBARCH=$SUBARCH \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            Image.gz dtbs 2>&1 | tee /tmp/build.log
+
+      # ────────────────────────────────────────────────────────────
+      # 6. Logs + artifacts (always)
+      # ────────────────────────────────────────────────────────────
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/build.log
+            /tmp/apply_hooks.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: |
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/**/*.dtb
+          if-no-files-found: warn
+          retention-days: 14
