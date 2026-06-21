@@ -60,31 +60,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$KERNEL_DIR/.github/scripts"
-          cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py \
-                "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/apply_susfs_backport_lisa.py "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git \
-            libssl-dev libelf-dev zip unzip python3 python3-pip \
-            cpio rsync kmod patch python2
+          sudo apt-get install -y --no-install-recommends bc bison build-essential ccache curl flex git libssl-dev libelf-dev zip unzip python3 python3-pip cpio rsync kmod patch python2
 
       - name: Integrate SukiSU-Ultra builtin
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           echo "==> setup.sh '$SUKISU_MODE'"
-          curl -LSs \
-            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s "$SUKISU_MODE"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$SUKISU_MODE"
           if [ -d "KernelSU" ]; then
             echo "KSU_DIR=KernelSU" >> "$GITHUB_ENV"
           elif [ -d "drivers/kernelsu" ]; then
             echo "KSU_DIR=drivers/kernelsu" >> "$GITHUB_ENV"
           else
-            echo "::error::setup.sh khong tao KernelSU/ hoac drivers/kernelsu/"
+            echo "::error::setup.sh did not produce KernelSU/ or drivers/kernelsu/"
             exit 1
           fi
 
@@ -93,8 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           KCFG=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" | wc -l || echo 0)
-          REF=$(grep -RnE "CONFIG_KSU_SUSFS|susfs_" "$KSU_DIR" \
-                  --include="*.c" --include="*.h" 2>/dev/null | wc -l || echo 0)
+          REF=$(grep -RnE "CONFIG_KSU_SUSFS|susfs_" "$KSU_DIR" --include="*.c" --include="*.h" 2>/dev/null | wc -l || echo 0)
           echo "Kconfig SUSFS options: $KCFG"
           echo "Module SUSFS references: $REF"
           if [ "$KCFG" -lt 5 ] || [ "$REF" -lt 50 ]; then
@@ -108,84 +102,88 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/susfs4ksu
-          git clone --depth=1 -b "$SUSFS_BRANCH" \
-            https://github.com/ShirkNeko/susfs4ksu.git /tmp/susfs4ksu
-          ls -la /tmp/susfs4ksu/kernel_patches/*.patch 2>/dev/null || true
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://github.com/ShirkNeko/susfs4ksu.git /tmp/susfs4ksu
           ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
           ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
 
-          - name: Copy fs/susfs.c + headers from susfs4ksu
-                  working-directory: ${{ env.KERNEL_DIR }}
-                  run: |
-                    set -euo pipefail
-                    SRC=/tmp/susfs4ksu/kernel_patches
-                    [ -f "$SRC/fs/susfs.c" ] || { echo "::error::Missing $SRC/fs/susfs.c"; exit 1; }
-                    [ -f "$SRC/include/linux/susfs.h" ] || { echo "::error::Missing susfs.h"; exit 1; }
-                    cp -v "$SRC/fs/susfs.c" fs/
-                    cp -v "$SRC/include/linux/susfs.h" include/linux/
-                    [ -f "$SRC/include/linux/susfs_def.h" ] && cp -v "$SRC/include/linux/susfs_def.h" include/linux/ || true
-                    # Add susfs.o to fs/Makefile if not already
-                    if ! grep -q "susfs.o" fs/Makefile; then
-                      echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
-                    fi
+      - name: Copy SUSFS source files into kernel tree
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          SRC=/tmp/susfs4ksu/kernel_patches
+          if [ ! -f "$SRC/fs/susfs.c" ]; then
+            echo "::error::Missing $SRC/fs/susfs.c"
+            exit 1
+          fi
+          if [ ! -f "$SRC/include/linux/susfs.h" ]; then
+            echo "::error::Missing $SRC/include/linux/susfs.h"
+            exit 1
+          fi
+          cp -v "$SRC/fs/susfs.c" fs/
+          cp -v "$SRC/include/linux/susfs.h" include/linux/
+          if [ -f "$SRC/include/linux/susfs_def.h" ]; then
+            cp -v "$SRC/include/linux/susfs_def.h" include/linux/
+          fi
+          # Ensure fs/Makefile builds susfs.o
+          if ! grep -qE 'susfs\.o' fs/Makefile; then
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+            echo "==> Added susfs.o to fs/Makefile"
+          fi
 
-      - name: Apply SUSFS anchor-based backport (lisa refactored)
+      - name: Apply SUSFS anchor-based backport (lisa)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           chmod +x .github/scripts/apply_susfs_backport_lisa.py
           python3 .github/scripts/apply_susfs_backport_lisa.py | tee /tmp/susfs_backport.log
           if grep -qE "\[ERROR\]|Traceback" /tmp/susfs_backport.log; then
-            echo "::error::SUSFS backport failed"
+            echo "::error::SUSFS anchor backport failed"
             exit 1
           fi
 
-      - name: Verify SUSFS backport applied
+      - name: Verify SUSFS backport hooks present
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           FAIL=0
-          grep -q "susfs_sus_ino_for_filldir64" fs/readdir.c || { echo "::error::readdir.c missing hook"; FAIL=1; }
-          grep -q "linux/susfs_def.h" fs/namei.c || { echo "::error::namei.c missing include"; FAIL=1; }
-          grep -q "susfs_is_current_ksu_domain" fs/namespace.c || { echo "::error::namespace.c missing extern"; FAIL=1; }
-          [ "$FAIL" -ne 0 ] && exit 1
-          echo "All SUSFS backport hooks verified."
-
-      - name: Verify SUSFS kernel-side integrated
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          FAIL=0
-          for f in fs/susfs.c include/linux/susfs.h; do
-            if [ -f "$f" ]; then
-              echo "OK  $f ($(wc -l < "$f") lines)"
-            else
-              echo "::error::Missing $f"
-              FAIL=1
-            fi
-          done
-          REF=$(grep -RnE "susfs_|SUSFS" fs/ include/linux/ kernel/ 2>/dev/null | wc -l || echo 0)
-          echo "Kernel-side SUSFS references: $REF"
-          if [ "$REF" -lt 30 ]; then
-            echo "::error::Kernel-side SUSFS reference qua thap ($REF < 30)"
+          if ! grep -q "linux/susfs_def.h" fs/namei.c; then
+            echo "::error::fs/namei.c missing susfs_def.h include"
+            FAIL=1
+          fi
+          if ! grep -q "susfs_is_current_ksu_domain" fs/namespace.c; then
+            echo "::error::fs/namespace.c missing susfs extern"
+            FAIL=1
+          fi
+          if ! grep -q "susfs_sus_ino_for_filldir64" fs/readdir.c; then
+            echo "::error::fs/readdir.c missing filldir hook"
+            FAIL=1
+          fi
+          MARKS=$(grep -cE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c || echo 0)
+          echo "Filldir hook markers in readdir.c: $MARKS"
+          if [ "$MARKS" -lt 2 ]; then
+            echo "::error::Quá ít filldir hooks ($MARKS < 2)"
             FAIL=1
           fi
           if [ "$FAIL" -ne 0 ]; then
             exit 1
           fi
-          echo "ALL SUSFS kernel-side checks PASSED."
+          echo "ALL SUSFS backport hooks verified."
 
       - name: Enable SUSFS configs in defconfig
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           DC=""
-          for cand in \
-            "arch/arm64/configs/$DEFCONFIG" \
-            "arch/arm64/configs/vendor/$DEFCONFIG"; do
-            [ -f "$cand" ] && DC="$cand" && break
+          for cand in "arch/arm64/configs/$DEFCONFIG" "arch/arm64/configs/vendor/$DEFCONFIG"; do
+            if [ -f "$cand" ]; then
+              DC="$cand"
+              break
+            fi
           done
-          [ -n "$DC" ] || { echo "::error::Khong tim thay defconfig: $DEFCONFIG"; exit 1; }
+          if [ -z "$DC" ]; then
+            echo "::error::Khong tim thay defconfig: $DEFCONFIG"
+            exit 1
+          fi
           echo "Defconfig: $DC"
 
           WANTED=(
@@ -227,8 +225,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
-          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$DEFCONFIG" \
-            | tee /tmp/apply_hooks.log
+          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$DEFCONFIG" | tee /tmp/apply_hooks.log
           if grep -qE "\[ERROR\]|RuntimeError|Traceback" /tmp/apply_hooks.log; then
             echo "::error::apply_resukisu_manual_hooks_1_fixed.py reported errors"
             exit 1
@@ -239,11 +236,7 @@ jobs:
         run: |
           set -euo pipefail
           FAIL=0
-          for pair in \
-            "fs/exec.c:ksu_handle_execveat" \
-            "fs/open.c:ksu_handle_faccessat" \
-            "fs/stat.c:ksu_handle_stat" \
-            "kernel/reboot.c:ksu_handle_sys_reboot"; do
+          for pair in "fs/exec.c:ksu_handle_execveat" "fs/open.c:ksu_handle_faccessat" "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot"; do
             f="${pair%%:*}"
             sym="${pair##*:}"
             if grep -q "$sym" "$f"; then
@@ -273,6 +266,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Upload susfs backport backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-backport-backup
+          path: |
+            ${{ env.KERNEL_DIR }}/fs/namei.c.bak_susfs
+            ${{ env.KERNEL_DIR }}/fs/namespace.c.bak_susfs
+            ${{ env.KERNEL_DIR }}/fs/readdir.c.bak_susfs
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -294,8 +299,7 @@ jobs:
           path: |
             /tmp/build.log
             /tmp/apply_hooks.log
-            /tmp/susfs_dryrun.log
-            /tmp/susfs_apply.log
+            /tmp/susfs_backport.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -308,4 +312,7 @@ jobs:
             ${{ env.KERNEL_DIR }}/*.zip
             ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image
             ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
-            ${{ env.KERNEL_DIR }}/out/arch/arm64
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/yupik.dtb
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/lisa-sm7325-overlay.dtbo
+          if-no-files-found: warn
+          retention-days: 14
