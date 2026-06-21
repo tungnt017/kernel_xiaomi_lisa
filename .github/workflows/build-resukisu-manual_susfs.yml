@@ -1,0 +1,384 @@
+name: ReSukiSU Manual SUSFS Phase2B Context
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: Kernel defconfig
+        required: true
+        default: lisa_defconfig
+      susfs_ref:
+        description: ShirkNeko SUSFS ref/branch
+        required: false
+        default: kernel-5.4
+      manual_hook_script:
+        description: Existing manual hook script path
+        required: true
+        default: .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
+      jobs:
+        description: Parallel build jobs
+        required: true
+        default: $(nproc)
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  OUT_DIR: out
+  DEFCONFIG: lisa_defconfig
+  SUSFS_REPO: https://github.com/ShirkNeko/susfs4ksu.git
+  SUSFS_REF: kernel-5.4
+  MANUAL_HOOK_SCRIPT: .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+
+jobs:
+  build:
+    name: Official ReSukiSU SUSFS Phase2B Context
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Normalize workflow inputs
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DEFCONFIG=${{ github.event.inputs.defconfig }}" >> "$GITHUB_ENV"
+            echo "SUSFS_REF=${{ github.event.inputs.susfs_ref }}" >> "$GITHUB_ENV"
+            echo "MANUAL_HOOK_SCRIPT=${{ github.event.inputs.manual_hook_script }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git git-lfs gnupg libelf-dev libssl-dev lld llvm make openssl python3 python3-pip rsync unzip wget zip zstd gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p logs artifacts logs/debug
+
+      - name: Capture environment
+        run: |
+          set -euo pipefail
+          {
+            echo "DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "GITHUB_RUN=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "SUSFS_REF=${SUSFS_REF}"
+            echo "MANUAL_HOOK_SCRIPT=${MANUAL_HOOK_SCRIPT}"
+            echo "ARCH=${ARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+          } | tee logs/environment.log
+
+      - name: Add ReSukiSU source
+        run: |
+          set -euo pipefail
+          echo "Running ReSukiSU setup" | tee logs/resukisu-setup.log
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash 2>&1 | tee -a logs/resukisu-setup.log
+          KSU_DIR=""
+          [ -d KernelSU ] && KSU_DIR="KernelSU"
+          [ -z "$KSU_DIR" ] && [ -d drivers/kernelsu ] && KSU_DIR="drivers/kernelsu"
+          [ -z "$KSU_DIR" ] && [ -d kernel/KernelSU ] && KSU_DIR="kernel/KernelSU"
+          if [ -z "$KSU_DIR" ]; then
+            echo "ERROR: ReSukiSU/KernelSU directory not found" | tee logs/resukisu-commit.log
+            exit 1
+          fi
+          echo "KSU_DIR=$KSU_DIR" | tee logs/resukisu-commit.log
+          echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
+          git -C "$KSU_DIR" rev-parse HEAD | tee -a logs/resukisu-commit.log || true
+          git -C "$KSU_DIR" log -1 --oneline | tee -a logs/resukisu-commit.log || true
+
+      - name: Clone ShirkNeko SUSFS
+        run: |
+          set -euo pipefail
+          rm -rf susfs-src
+          if git ls-remote --exit-code --heads "$SUSFS_REPO" "$SUSFS_REF" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$SUSFS_REF" "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log
+          else
+            git clone --depth 1 "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log
+            git -C susfs-src fetch --unshallow 2>/dev/null || true
+            git -C susfs-src fetch --all --tags --force || true
+            git -C susfs-src checkout "$SUSFS_REF" 2>&1 | tee -a logs/susfs-clone.log
+          fi
+          {
+            echo "===== SUSFS HEAD ====="
+            git -C susfs-src rev-parse HEAD || true
+            git -C susfs-src log -1 --oneline || true
+            echo "===== SUSFS kernel-side files only ====="
+            find susfs-src/kernel_patches -maxdepth 4 -type f | grep -v 'kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch' | sort || true
+          } | tee logs/susfs-tree.log
+
+      - name: Copy SUSFS kernel implementation files only
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee logs/copy-susfs-files.log
+          from pathlib import Path
+          import shutil
+          root = Path.cwd()
+          srcroot = root / 'susfs-src' / 'kernel_patches'
+          required = ['fs/susfs.c', 'include/linux/susfs.h', 'include/linux/susfs_def.h']
+          optional = ['fs/sus_su.c', 'include/linux/sus_su.h']
+          for rel in required:
+              src = srcroot / rel
+              dst = root / rel
+              if not src.exists():
+                  raise SystemExit(f'[ERROR] missing required SUSFS file: {src}')
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(src, dst)
+              print(f'[OK] copied {src} -> {dst}')
+          for rel in optional:
+              src = srcroot / rel
+              dst = root / rel
+              if src.exists():
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+                  print(f'[OK] copied optional {src} -> {dst}')
+          print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is not copied, checked, applied, or used.')
+          PY
+
+      - name: Apply official SUSFS Phase1 and Phase2A minimal ports
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee logs/port-susfs-phase1-phase2a.log
+          from pathlib import Path
+          import re
+          root = Path.cwd()
+          def read(rel):
+              p = root / rel
+              if not p.exists():
+                  raise SystemExit(f'[ERROR] missing {rel}')
+              return p.read_text(errors='ignore')
+          def write(rel, text):
+              (root / rel).write_text(text)
+              print(f'[OK] updated {rel}')
+          def after(text, anchor, insertion, marker):
+              if marker in text:
+                  return text
+              pos = text.find(anchor)
+              if pos < 0:
+                  raise SystemExit(f'[ERROR] anchor not found: {anchor[:80]!r}')
+              pos += len(anchor)
+              return text[:pos] + insertion + text[pos:]
+          def before(text, anchor, insertion, marker):
+              if marker in text:
+                  return text
+              pos = text.find(anchor)
+              if pos < 0:
+                  raise SystemExit(f'[ERROR] anchor not found: {anchor[:80]!r}')
+              return text[:pos] + insertion + text[pos:]
+          def replace(text, old, new, marker):
+              if marker in text:
+                  return text
+              if old not in text:
+                  raise SystemExit(f'[ERROR] target block not found: {marker}')
+              return text.replace(old, new, 1)
+
+          # Phase 1: fs/Makefile
+          text = read('fs/Makefile')
+          if 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' not in text:
+              text = after(text, '\t\tfs_types.o fs_context.o fs_parser.o fsopen.o\n', '\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n', 'obj-$(CONFIG_KSU_SUSFS) += susfs.o')
+              write('fs/Makefile', text)
+          else:
+              print('[SKIP] fs/Makefile')
+
+          # Phase 1: fs/proc/task_mmu.c
+          text = read('fs/proc/task_mmu.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              anchor = '#include <linux/ctype.h>\n' if '#include <linux/ctype.h>\n' in text else '#include <linux/mm_inline.h>\n'
+              text = after(text, anchor, '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_sus_ino_for_show_map_vma' not in text:
+              text = before(text, 'static void\nshow_map_vma', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nextern void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned long *out_ino);\n#endif\n\n', 'susfs_sus_ino_for_show_map_vma')
+          old = '\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+          new = '\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t\t/* SUSFS: spoof map VMA inode/dev for SUS_KSTAT */\n\t\tif (unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tsusfs_sus_ino_for_show_map_vma(inode->i_ino, &dev, &ino);\n\t\t\tgoto susfs_skip_orig_map_vma_stat;\n\t\t}\n#endif\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nsusfs_skip_orig_map_vma_stat:\n#endif\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+          text = replace(text, old, new, 'SUSFS: spoof map VMA inode/dev for SUS_KSTAT')
+          write('fs/proc/task_mmu.c', text)
+
+          # Phase 1: fdinfo marker
+          text = read('fs/notify/fdinfo.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text = after(text, '#include <linux/exportfs.h>\n', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'SUSFS: show original inode information for SUS_KSTAT fdinfo' not in text:
+              text = after(text, '\tinode = igrab(fsnotify_conn_inode(mark->connector));\n\tif (inode) {\n', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\t/* SUSFS: show original inode information for SUS_KSTAT fdinfo */\n#endif\n', 'SUSFS: show original inode information for SUS_KSTAT fdinfo')
+          write('fs/notify/fdinfo.c', text)
+
+          # Phase 2A: namei marker
+          text = read('fs/namei.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text = after(text, '#include <linux/uaccess.h>\n', '#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_namei_phase2a_marker' not in text:
+              text = after(text, '#include "mount.h"\n', '\n/* SUSFS phase2A marker: namei include/state preparation only. */\nstatic const bool susfs_namei_phase2a_marker = true;\n', 'susfs_namei_phase2a_marker')
+          write('fs/namei.c', text)
+
+          # Phase 2A: readdir marker
+          text = read('fs/readdir.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text = after(text, '#include <linux/uaccess.h>\n', '#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_is_inode_sus_path' not in text:
+              externs = '\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\nextern bool susfs_is_inode_sus_path(struct inode *inode);\nextern bool susfs_is_base_dentry_android_data_dir(struct dentry *dentry);\nextern bool susfs_is_base_dentry_sdcard_dir(struct dentry *dentry);\nextern bool susfs_is_sus_android_data_d_name_found(const char *d_name);\nextern bool susfs_is_sus_sdcard_d_name_found(const char *d_name);\n#endif\n'
+              text = after(text, '#include <asm/unaligned.h>\n', externs, 'susfs_is_inode_sus_path')
+          def add_fields(src, name):
+              marker = f'susfs_phase2a_{name}_fields'
+              if marker in src:
+                  return src
+              match = re.search(r'(struct\s+' + re.escape(name) + r'\s*\{.*?)(\n\};)', src, re.S)
+              if not match:
+                  return src
+              fields = '\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\t/* ' + marker + ' */\n\tstruct super_block *susfs_sb;\n\tbool susfs_is_android_data_root;\n\tbool susfs_is_sdcard_root;\n#endif'
+              return src[:match.start(2)] + fields + src[match.start(2):]
+          for name in ['readdir_callback','getdents_callback','getdents_callback64','compat_readdir_callback','compat_getdents_callback']:
+              text = add_fields(text, name)
+          if 'susfs_phase2a_readdir_callback_fields' not in text:
+              raise SystemExit('[ERROR] readdir phase2A marker missing')
+          write('fs/readdir.c', text)
+          print('[OK] Phase 1 + Phase 2A SUSFS port completed')
+          PY
+
+      - name: Official SUSFS pre-compile check with Phase2B context export
+        run: |
+          set +e
+          mkdir -p logs/debug
+          python3 - <<'PY' 2>&1 | tee logs/susfs-precompile-check.log
+          from pathlib import Path
+          import subprocess, re
+          root = Path.cwd()
+          original = root / 'susfs-src/kernel_patches/50_add_susfs_in_kernel-5.4.patch'
+          patch = root / 'logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase2a.patch'
+          failures = []
+          filter_files = {'fs/Makefile','fs/proc/task_mmu.c','fs/notify/fdinfo.c','fs/readdir.c'}
+          markers = {
+              'fs/Makefile':'obj-$(CONFIG_KSU_SUSFS) += susfs.o',
+              'fs/proc/task_mmu.c':'SUSFS: spoof map VMA inode/dev for SUS_KSTAT',
+              'fs/notify/fdinfo.c':'SUSFS: show original inode information for SUS_KSTAT fdinfo',
+              'fs/readdir.c':'susfs_phase2a_readdir_callback_fields',
+              'fs/namei.c':'susfs_namei_phase2a_marker',
+          }
+          def write(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(data, errors='ignore')
+          def source_context(path, center, radius=90):
+              f = root / path
+              out = [f'===== SOURCE CONTEXT: {path} =====']
+              if not f.exists():
+                  out.append(f'[MISSING] {path}')
+                  return '\n'.join(out) + '\n'
+              lines = f.read_text(errors='ignore').splitlines()
+              start = max(1, center - radius)
+              end = min(len(lines), center + radius)
+              out.append(f'lines {start}-{end} of {len(lines)}')
+              for i in range(start, end + 1):
+                  out.append(f'{i:05d}: {lines[i-1]}')
+              return '\n'.join(out) + '\n'
+          for rel, marker in markers.items():
+              p = root / rel
+              if not p.exists() or marker not in p.read_text(errors='ignore'):
+                  failures.append(f'port marker missing in {rel}: {marker}')
+              else:
+                  print(f'[OK] marker verified in {rel}: {marker}')
+          for rel in ['fs/susfs.c','include/linux/susfs.h','include/linux/susfs_def.h']:
+              if not (root / rel).exists():
+                  failures.append(f'missing copied SUSFS file: {rel}')
+              else:
+                  print(f'[OK] copied SUSFS file exists: {rel}')
+          print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is excluded from official ReSukiSU workflow path')
+          if not original.exists():
+              failures.append('missing kernel-side patch: 50_add_susfs_in_kernel-5.4.patch')
+              output = ''
+          else:
+              text = original.read_text(errors='ignore')
+              parts = re.split(r'(?=^diff --git )', text, flags=re.M)
+              kept = [parts[0]]
+              skipped = []
+              for section in parts[1:]:
+                  match = re.match(r'diff --git a/(.*?) b/\1', section)
+                  if match and match.group(1) in filter_files:
+                      skipped.append(match.group(1))
+                      continue
+                  kept.append(section)
+              patch.write_text(''.join(kept), errors='ignore')
+              for item in sorted(set(skipped)):
+                  print(f'[OK] skipped already-ported hunk file: {item}')
+              print(f'[INFO] selected remaining kernel-side patch after phase2A: {patch}')
+              cmd = f"git apply --check --whitespace=error '{patch.resolve()}'"
+              print(f'[CHECK] {cmd}  (cwd={root})')
+              proc = subprocess.run(cmd, shell=True, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              output = proc.stdout
+              print(output, end='')
+              if proc.returncode != 0:
+                  failures.append('remaining kernel-side SUSFS patch does not apply cleanly to this lisa source')
+          failed_files = [(m.group(1), int(m.group(2))) for m in re.finditer(r'error: patch failed: ([^:]+):(\d+)', output)]
+          unique = []
+          for f, _ in failed_files:
+              if f not in unique:
+                  unique.append(f)
+          patch_text = patch.read_text(errors='ignore') if patch.exists() else ''
+          hunk_out = []
+          allctx = ['===== ALL SOURCE CONTEXTS FOR EVERY HUNK TARGET LINE =====']
+          for f in unique:
+              section_match = re.search(r'(^diff --git a/' + re.escape(f) + r' b/' + re.escape(f) + r'\n.*?)(?=^diff --git |\Z)', patch_text, re.M | re.S)
+              section = section_match.group(1) if section_match else ''
+              hunk_out.append('===== PATCH SECTION FOR ' + f + ' =====\n' + (section if section else '[MISSING]'))
+              allctx.append('##### FILE: ' + f + ' #####')
+              for h in re.finditer(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', section, re.M):
+                  allctx.append(source_context(f, int(h.group(1)), 70))
+          write(root/'logs/debug/susfs-patch-check-output.log', output)
+          write(root/'logs/debug/susfs-phase2a-filtered-patch-path.log', str(patch)+'\n')
+          write(root/'logs/debug/susfs-source-context.log', '\n'.join(source_context(f,l) for f,l in failed_files))
+          write(root/'logs/debug/susfs-patch-hunks.log', '\n'.join(hunk_out))
+          write(root/'logs/debug/susfs-all-hunk-source-contexts.log', '\n'.join(allctx))
+          if any(root.rglob('*.rej')):
+              failures.append('.rej files found before compile')
+          if failures:
+              print('\n[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.')
+              print('[INFO] Exported official porting context without applying patch.')
+              for item in failures:
+                  print(f'  - {item}')
+              raise SystemExit(1)
+          print('[OK] SUSFS pre-compile check passed')
+          PY
+          exit ${PIPESTATUS[0]}
+
+      - name: Create compact debug summary
+        if: always()
+        run: |
+          set +e
+          SUMMARY="logs/debug-summary.log"; : > "$SUMMARY"
+          add_section(){ title="$1"; file="$2"; { echo; echo "================================================================"; echo "===== $title"; echo "===== file: $file"; echo "================================================================"; [ -f "$file" ] && cat "$file" || echo "[MISSING] $file"; } >> "$SUMMARY"; }
+          { echo "ReSukiSU manual SUSFS official Phase2B context summary"; echo "Generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "GitHub run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"; echo "DEFCONFIG=$DEFCONFIG"; echo "SUSFS_REF=$SUSFS_REF"; echo "KSU_DIR=${KSU_DIR:-}"; } >> "$SUMMARY"
+          add_section environment logs/environment.log
+          add_section "ReSukiSU setup" logs/resukisu-setup.log
+          add_section "SUSFS tree" logs/susfs-tree.log
+          add_section "copy SUSFS files" logs/copy-susfs-files.log
+          add_section "SUSFS phase ports" logs/port-susfs-phase1-phase2a.log
+          add_section "SUSFS pre-compile check" logs/susfs-precompile-check.log
+          add_section "SUSFS patch check output" logs/debug/susfs-patch-check-output.log
+          add_section "SUSFS source context" logs/debug/susfs-source-context.log
+          add_section "SUSFS all hunk source contexts" logs/debug/susfs-all-hunk-source-contexts.log
+          add_section "SUSFS patch hunks" logs/debug/susfs-patch-hunks.log
+          add_section "build errors" logs/build-errors.log
+          add_section "build tail" logs/build-tail.log
+          { echo; echo "===== reject files ====="; find . -name '*.rej' -type f | sort; } >> "$SUMMARY"
+
+      - name: Extract build error tail
+        if: always()
+        run: |
+          mkdir -p logs
+          echo "===== build.log tail 300 =====" > logs/build-tail.log
+          tail -300 logs/build.log >> logs/build-tail.log 2>/dev/null || true
+          echo "===== errors/warnings grep =====" > logs/build-errors.log
+          grep -nEi "error:|undefined reference|No rule to make target|fatal error|ld.lld|make\[[0-9]+\]: \*\*\*|OFFICIAL FAIL-FAST|SUSFS pre-compile check failed|manual hook script emitted" logs/*.log >> logs/build-errors.log 2>/dev/null || true
+
+      - name: Upload 3 debug files only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-debug-3files-resukisu-phase2b-context-${{ github.run_number }}
+          path: |
+            logs/debug-summary.log
+            logs/build-errors.log
+            logs/build-tail.log
+          if-no-files-found: warn
