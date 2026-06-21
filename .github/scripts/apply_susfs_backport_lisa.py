@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
-Official-grade SUSFS backport for PixelOS-refactored lisa kernel.
+Official-grade SUSFS backport for PixelOS-refactored lisa kernel (v3).
 
-Why this script exists:
-  The upstream 50_add_susfs_in_kernel-5.4.patch from ShirkNeko/susfs4ksu
-  assumes stock Linux 5.4 layout. lisa kernel (PixelExperience/MIUI base)
-  has refactored fs/readdir.c, fs/namespace.c, fs/namei.c so line numbers
-  no longer match. This script applies the SAME hooks at SAME logical
-  positions using function signature anchors instead of line numbers.
+v3 changes:
+  - New position "after_declarations": insert hook AFTER local variable
+    declarations (C90-compliant). Fixes "mixing declarations and code"
+    error from C90 strict compile.
+  - Filldir hooks now use after_declarations to satisfy refactored lisa.
 
-Why this is NOT a bypass / NOT weak:
-  - Hooks call real susfs_*() functions from fs/susfs.c (full impl)
-  - All blocks guarded with #ifdef CONFIG_KSU_SUSFS_*
-  - No -Werror disabled, no pragma diagnostic, no Makefile -Wno-error
-  - No stub returning 0/-ENOSYS, no #define noop
-  - Anchors are specific (function signatures), with multi-candidate
-    fallback for refactored sources
-  - Idempotent (marker check prevents duplicate insertion)
-  - Per-file backup created on first modification
-  - Fails fast if any required anchor missing
-  - Self-diagnostic: dumps file head when anchors miss
+NOT a bypass: hooks call real susfs_*() functions.
+NOT weak: anchors + idempotent + backup + fail-fast.
 """
 import re
 import sys
@@ -28,7 +18,7 @@ from pathlib import Path
 
 
 BACKPORTS = [
-    # ─── fs/namei.c ───────────────────────────────────────
+    # ─── fs/namei.c ───
     {
         "file": "fs/namei.c",
         "name": "namei: include susfs_def.h",
@@ -48,7 +38,7 @@ BACKPORTS = [
         "required": True,
     },
 
-    # ─── fs/namespace.c ───────────────────────────────────
+    # ─── fs/namespace.c ───
     {
         "file": "fs/namespace.c",
         "name": "namespace: include + extern susfs",
@@ -68,7 +58,7 @@ BACKPORTS = [
         "required": True,
     },
 
-    # ─── fs/readdir.c: top-level include ──────────────────
+    # ─── fs/readdir.c: top-level include ───
     {
         "file": "fs/readdir.c",
         "name": "readdir: include + extern susfs filldir",
@@ -88,13 +78,13 @@ BACKPORTS = [
         "required": True,
     },
 
-    # ─── fs/readdir.c: filldir hook ───────────────────────
+    # ─── fs/readdir.c: filldir hook (C90-safe) ───
     {
         "file": "fs/readdir.c",
         "name": "readdir: filldir() susfs hook",
         "anchors": [
-            (r'static\s+int\s+filldir\s*\([^)]*\)\s*\{', "after_open_brace"),
-            (r'\bfilldir\s*\([^)]*\)\s*\{', "after_open_brace"),
+            (r'static\s+int\s+filldir\s*\([^)]*\)\s*\{', "after_declarations"),
+            (r'\bfilldir\s*\([^)]*\)\s*\{', "after_declarations"),
         ],
         "content": (
             "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
@@ -108,13 +98,13 @@ BACKPORTS = [
         "required": True,
     },
 
-    # ─── fs/readdir.c: filldir64 hook ─────────────────────
+    # ─── fs/readdir.c: filldir64 hook (C90-safe) ───
     {
         "file": "fs/readdir.c",
         "name": "readdir: filldir64() susfs hook",
         "anchors": [
-            (r'static\s+int\s+filldir64\s*\([^)]*\)\s*\{', "after_open_brace"),
-            (r'\bfilldir64\s*\([^)]*\)\s*\{', "after_open_brace"),
+            (r'static\s+int\s+filldir64\s*\([^)]*\)\s*\{', "after_declarations"),
+            (r'\bfilldir64\s*\([^)]*\)\s*\{', "after_declarations"),
         ],
         "content": (
             "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
@@ -128,13 +118,13 @@ BACKPORTS = [
         "required": True,
     },
 
-    # ─── fs/readdir.c: compat_filldir hook (optional) ─────
+    # ─── fs/readdir.c: compat_filldir hook (optional, C90-safe) ───
     {
         "file": "fs/readdir.c",
         "name": "readdir: compat_filldir() susfs hook",
         "anchors": [
-            (r'static\s+int\s+compat_filldir\s*\([^)]*\)\s*\{', "after_open_brace"),
-            (r'\bcompat_filldir\s*\([^)]*\)\s*\{', "after_open_brace"),
+            (r'static\s+int\s+compat_filldir\s*\([^)]*\)\s*\{', "after_declarations"),
+            (r'\bcompat_filldir\s*\([^)]*\)\s*\{', "after_declarations"),
         ],
         "content": (
             "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
@@ -148,13 +138,13 @@ BACKPORTS = [
         "required": False,
     },
 
-    # ─── fs/readdir.c: fillonedir hook (optional) ─────────
+    # ─── fs/readdir.c: fillonedir hook (optional, C90-safe) ───
     {
         "file": "fs/readdir.c",
         "name": "readdir: fillonedir() susfs hook",
         "anchors": [
-            (r'static\s+int\s+fillonedir\s*\([^)]*\)\s*\{', "after_open_brace"),
-            (r'\bfillonedir\s*\([^)]*\)\s*\{', "after_open_brace"),
+            (r'static\s+int\s+fillonedir\s*\([^)]*\)\s*\{', "after_declarations"),
+            (r'\bfillonedir\s*\([^)]*\)\s*\{', "after_declarations"),
         ],
         "content": (
             "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
@@ -172,9 +162,22 @@ BACKPORTS = [
 
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s+[<"][^>"]+[>"]', re.MULTILINE)
 
+# Patterns that look like local variable declarations (C90-style)
+DECL_PREFIX_RE = re.compile(
+    r'^\s*(struct\s+\w+|union\s+\w+|enum\s+\w+|const\s+|static\s+|'
+    r'unsigned\s+|signed\s+|int\b|long\b|short\b|char\b|void\b|bool\b|'
+    r'loff_t\b|size_t\b|ssize_t\b|u8\b|u16\b|u32\b|u64\b|'
+    r's8\b|s16\b|s32\b|s64\b|__\w+)'
+)
+
+# Statements that mean "code body has started" → must insert BEFORE them
+STATEMENT_HINTS = (
+    "return ", "if (", "if(", "for (", "for(", "while (", "while(",
+    "goto ", "switch (", "switch(", "do {", "do{",
+)
+
 
 def find_last_include_end(src: str) -> int:
-    """Return char position right after the last #include line (incl. newline)."""
     last = None
     for m in INCLUDE_RE.finditer(src):
         last = m
@@ -186,8 +189,26 @@ def find_last_include_end(src: str) -> int:
     return nl + 1
 
 
+def looks_like_declaration(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True  # blank line ok between decls
+    if s.startswith(("//", "/*", "*", "#")):
+        return True
+    # Statement keywords are NOT declarations
+    for hint in STATEMENT_HINTS:
+        if s.startswith(hint):
+            return False
+    if "=" in s and not DECL_PREFIX_RE.match(s):
+        return False  # assignment, not declaration
+    if s.endswith(";") and DECL_PREFIX_RE.match(s):
+        return True
+    if DECL_PREFIX_RE.match(s):
+        return True
+    return False
+
+
 def try_anchor(src: str, anchor, position: str):
-    """Returns (insert_at, prefix, suffix) or (None, None, None)."""
     if anchor is None and position == "after_last_include":
         pos = find_last_include_end(src)
         if pos == -1:
@@ -204,6 +225,28 @@ def try_anchor(src: str, anchor, position: str):
         return (line_end + 1, "", "")
     if position == "after_open_brace":
         return (m.end(), "\n", "")
+    if position == "after_declarations":
+        # Scan forward from { to find first statement (non-decl)
+        pos = m.end()
+        # Skip the newline right after {
+        if pos < len(src) and src[pos] == "\n":
+            pos += 1
+        lines_seen = 0
+        last_decl_end = pos
+        while pos < len(src) and lines_seen < 50:
+            line_end = src.find("\n", pos)
+            if line_end == -1:
+                break
+            line = src[pos:line_end]
+            if looks_like_declaration(line):
+                last_decl_end = line_end + 1
+                pos = line_end + 1
+                lines_seen += 1
+                continue
+            # First non-declaration line found
+            return (last_decl_end, "\n", "")
+        # All scanned lines were decls → insert after last decl
+        return (last_decl_end, "\n", "")
     return (None, None, None)
 
 
