@@ -1,4 +1,4 @@
-name: ReSukiSU Manual SUSFS Official Phase2A
+name: ReSukiSU Manual SUSFS Official Phase2A Fixed
 
 on:
   workflow_dispatch:
@@ -16,11 +16,11 @@ on:
         required: true
         default: .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
       jobs:
-        description: Parallel build jobs. Leave as $(nproc) for auto
+        description: Parallel build jobs
         required: true
         default: $(nproc)
       upload_full_out:
-        description: Upload out/ on failure
+        description: Upload out on failure
         required: false
         type: boolean
         default: false
@@ -41,7 +41,7 @@ env:
 
 jobs:
   build:
-    name: Official ReSukiSU manual SUSFS Phase2A
+    name: Official ReSukiSU manual SUSFS Phase2A Fixed
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
@@ -64,20 +64,34 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential ccache curl flex git git-lfs gnupg libelf-dev libssl-dev lld llvm make openssl python3 python3-pip rsync unzip wget zip zstd gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          mkdir -p logs artifacts logs/debug .github/scripts
+          mkdir -p logs artifacts logs/debug
 
       - name: Capture environment
         run: |
           set -euo pipefail
-          { echo "DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "GITHUB_RUN=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"; echo "DEFCONFIG=${DEFCONFIG}"; echo "SUSFS_REF=${SUSFS_REF}"; echo "MANUAL_HOOK_SCRIPT=${MANUAL_HOOK_SCRIPT}"; echo "ARCH=${ARCH}"; echo "OUT_DIR=${OUT_DIR}"; } | tee logs/environment.log
+          {
+            echo "DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "GITHUB_RUN=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "SUSFS_REF=${SUSFS_REF}"
+            echo "MANUAL_HOOK_SCRIPT=${MANUAL_HOOK_SCRIPT}"
+            echo "ARCH=${ARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+          } | tee logs/environment.log
 
       - name: Add ReSukiSU source
         run: |
           set -euo pipefail
           echo "Running ReSukiSU setup" | tee logs/resukisu-setup.log
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash 2>&1 | tee -a logs/resukisu-setup.log
-          KSU_DIR=""; [ -d KernelSU ] && KSU_DIR="KernelSU"; [ -z "$KSU_DIR" ] && [ -d drivers/kernelsu ] && KSU_DIR="drivers/kernelsu"; [ -z "$KSU_DIR" ] && [ -d kernel/KernelSU ] && KSU_DIR="kernel/KernelSU"
-          if [ -z "$KSU_DIR" ]; then echo "ERROR: ReSukiSU/KernelSU directory not found" | tee logs/resukisu-commit.log; exit 1; fi
+          KSU_DIR=""
+          [ -d KernelSU ] && KSU_DIR="KernelSU"
+          [ -z "$KSU_DIR" ] && [ -d drivers/kernelsu ] && KSU_DIR="drivers/kernelsu"
+          [ -z "$KSU_DIR" ] && [ -d kernel/KernelSU ] && KSU_DIR="kernel/KernelSU"
+          if [ -z "$KSU_DIR" ]; then
+            echo "ERROR: ReSukiSU/KernelSU directory not found" | tee logs/resukisu-commit.log
+            exit 1
+          fi
           echo "KSU_DIR=$KSU_DIR" | tee logs/resukisu-commit.log
           echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
           git -C "$KSU_DIR" rev-parse HEAD | tee -a logs/resukisu-commit.log || true
@@ -87,8 +101,21 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf susfs-src
-          if git ls-remote --exit-code --heads "$SUSFS_REPO" "$SUSFS_REF" >/dev/null 2>&1; then git clone --depth 1 --branch "$SUSFS_REF" "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log; else git clone --depth 1 "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log; git -C susfs-src fetch --unshallow 2>/dev/null || true; git -C susfs-src fetch --all --tags --force || true; git -C susfs-src checkout "$SUSFS_REF" 2>&1 | tee -a logs/susfs-clone.log; fi
-          { echo "===== SUSFS HEAD ====="; git -C susfs-src rev-parse HEAD || true; git -C susfs-src log -1 --oneline || true; echo; echo "===== SUSFS kernel-side files only ====="; find susfs-src/kernel_patches -maxdepth 4 -type f | grep -v 'kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch' | sort || true; } | tee logs/susfs-tree.log
+          if git ls-remote --exit-code --heads "$SUSFS_REPO" "$SUSFS_REF" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$SUSFS_REF" "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log
+          else
+            git clone --depth 1 "$SUSFS_REPO" susfs-src 2>&1 | tee logs/susfs-clone.log
+            git -C susfs-src fetch --unshallow 2>/dev/null || true
+            git -C susfs-src fetch --all --tags --force || true
+            git -C susfs-src checkout "$SUSFS_REF" 2>&1 | tee -a logs/susfs-clone.log
+          fi
+          {
+            echo "===== SUSFS HEAD ====="
+            git -C susfs-src rev-parse HEAD || true
+            git -C susfs-src log -1 --oneline || true
+            echo "===== SUSFS kernel-side files only ====="
+            find susfs-src/kernel_patches -maxdepth 4 -type f | grep -v 'kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch' | sort || true
+          } | tee logs/susfs-tree.log
 
       - name: Copy SUSFS kernel implementation files only
         run: |
@@ -99,185 +126,116 @@ jobs:
           root=Path.cwd(); srcroot=root/'susfs-src/kernel_patches'
           for rel in ['fs/susfs.c','include/linux/susfs.h','include/linux/susfs_def.h']:
               src=srcroot/rel; dst=root/rel
-              if not src.exists(): raise SystemExit(f'[ERROR] missing required SUSFS file: {src}')
-              dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src,dst); print(f'[OK] copied {src} -> {dst}')
+              if not src.exists():
+                  raise SystemExit(f'[ERROR] missing required SUSFS file: {src}')
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(src,dst)
+              print(f'[OK] copied {src} -> {dst}')
           for rel in ['fs/sus_su.c','include/linux/sus_su.h']:
               src=srcroot/rel; dst=root/rel
-              if src.exists(): dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src,dst); print(f'[OK] copied optional {src} -> {dst}')
+              if src.exists():
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src,dst)
+                  print(f'[OK] copied optional {src} -> {dst}')
           print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is not copied, checked, applied, or used.')
           PY
 
-      - name: Create official SUSFS phase scripts
+      - name: Apply official SUSFS phase 1 and phase 2A ports
         run: |
           set -euo pipefail
-          cat > /tmp/phase1.b64 <<'B64'
-IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKaW1wb3J0IHN5
-cwpST09UPVBhdGguY3dkKCkKY2xhc3MgRShFeGNlcHRpb24pOiBwYXNzCmRlZiByKGYpOgogICAg
-cD1ST09UL2YKICAgIGlmIG5vdCBwLmV4aXN0cygpOiByYWlzZSBFKGYnbWlzc2luZyB7Zn0nKQog
-ICAgcmV0dXJuIHAucmVhZF90ZXh0KGVycm9ycz0naWdub3JlJykKZGVmIHcoZix0KTogKFJPT1Qv
-Zikud3JpdGVfdGV4dCh0KTsgcHJpbnQoZidbT0tdIHVwZGF0ZWQge2Z9JykKZGVmIG5lZWQoeCxt
-KToKICAgIGlmIG5vdCB4OiByYWlzZSBFKG0pCmRlZiBpYSh0LGEsaSxtKToKICAgIGlmIG0gaW4g
-dDogcmV0dXJuIHQKICAgIHA9dC5maW5kKGEpOyBuZWVkKHAhPS0xLCdhbmNob3Igbm90IGZvdW5k
-ICcrcmVwcihhWzo4MF0pKTsgcCs9bGVuKGEpOyByZXR1cm4gdFs6cF0raSt0W3A6XQpkZWYgaWIo
-dCxhLGksbSk6CiAgICBpZiBtIGluIHQ6IHJldHVybiB0CiAgICBwPXQuZmluZChhKTsgbmVlZChw
-IT0tMSwnYW5jaG9yIG5vdCBmb3VuZCAnK3JlcHIoYVs6ODBdKSk7IHJldHVybiB0WzpwXStpK3Rb
-cDpdCmRlZiBycCh0LG8sbixtKToKICAgIGlmIG0gaW4gdDogcmV0dXJuIHQKICAgIG5lZWQobyBp
-biB0LCd0YXJnZXQgbm90IGZvdW5kICcrbSk7IHJldHVybiB0LnJlcGxhY2UobyxuLDEpCnRyeToK
-ICAgIHQ9cignZnMvTWFrZWZpbGUnKQogICAgaWYgJ29iai0kKENPTkZJR19LU1VfU1VTRlMpICs9
-IHN1c2ZzLm8nIG5vdCBpbiB0OgogICAgICAgIHQ9aWEodCwnCQlmc190eXBlcy5vIGZzX2NvbnRl
-eHQubyBmc19wYXJzZXIubyBmc29wZW4ubwonLCcKb2JqLSQoQ09ORklHX0tTVV9TVVNGUykgKz0g
-c3VzZnMubwonLCdvYmotJChDT05GSUdfS1NVX1NVU0ZTKSArPSBzdXNmcy5vJyk7IHcoJ2ZzL01h
-a2VmaWxlJyx0KQogICAgZWxzZTogcHJpbnQoJ1tTS0lQXSBmcy9NYWtlZmlsZScpCiAgICB0PXIo
-J2ZzL3Byb2MvdGFza19tbXUuYycpCiAgICBpZiAnI2luY2x1ZGUgPGxpbnV4L3N1c2ZzX2RlZi5o
-Picgbm90IGluIHQ6CiAgICAgICAgYW5jaG9yPScjaW5jbHVkZSA8bGludXgvY3R5cGUuaD4KJyBp
-ZiAnI2luY2x1ZGUgPGxpbnV4L2N0eXBlLmg+CicgaW4gdCBlbHNlICcjaW5jbHVkZSA8bGludXgv
-bW1faW5saW5lLmg+CicKICAgICAgICB0PWlhKHQsYW5jaG9yLCcjaWZkZWYgQ09ORklHX0tTVV9T
-VVNGU19TVVNfS1NUQVQKI2luY2x1ZGUgPGxpbnV4L3N1c2ZzX2RlZi5oPgojZW5kaWYKJywnI2lu
-Y2x1ZGUgPGxpbnV4L3N1c2ZzX2RlZi5oPicpCiAgICBpZiAnc3VzZnNfc3VzX2lub19mb3Jfc2hv
-d19tYXBfdm1hJyBub3QgaW4gdDoKICAgICAgICB0PWliKHQsJ3N0YXRpYyB2b2lkCnNob3dfbWFw
-X3ZtYScsJyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19LU1RBVApleHRlcm4gdm9pZCBzdXNm
-c19zdXNfaW5vX2Zvcl9zaG93X21hcF92bWEodW5zaWduZWQgbG9uZyBpbm8sIGRldl90ICpvdXRf
-ZGV2LCB1bnNpZ25lZCBsb25nICpvdXRfaW5vKTsKI2VuZGlmCgonLCdzdXNmc19zdXNfaW5vX2Zv
-cl9zaG93X21hcF92bWEnKQogICAgb2xkPScJaWYgKGZpbGUpIHsKCQlzdHJ1Y3QgaW5vZGUgKmlu
-b2RlID0gZmlsZV9pbm9kZSh2bWEtPnZtX2ZpbGUpOwoJCWRldiA9IGlub2RlLT5pX3NiLT5zX2Rl
-djsKCQlpbm8gPSBpbm9kZS0+aV9pbm87CgkJcGdvZmYgPSAoKGxvZmZfdCl2bWEtPnZtX3Bnb2Zm
-KSA8PCBQQUdFX1NISUZUOwoJfQonCiAgICBuZXc9JwlpZiAoZmlsZSkgewoJCXN0cnVjdCBpbm9k
-ZSAqaW5vZGUgPSBmaWxlX2lub2RlKHZtYS0+dm1fZmlsZSk7CiNpZmRlZiBDT05GSUdfS1NVX1NV
-U0ZTX1NVU19LU1RBVAoJCS8qIFNVU0ZTOiBzcG9vZiBtYXAgVk1BIGlub2RlL2RldiBmb3IgU1VT
-X0tTVEFUICovCgkJaWYgKHVubGlrZWx5KGlub2RlLT5pX3N0YXRlICYgSU5PREVfU1RBVEVfU1VT
-X0tTVEFUKSkgewoJCQlzdXNmc19zdXNfaW5vX2Zvcl9zaG93X21hcF92bWEoaW5vZGUtPmlfaW5v
-LCAmZGV2LCAmaW5vKTsKCQkJZ290byBzdXNmc19za2lwX29yaWdfbWFwX3ZtYV9zdGF0OwoJCX0K
-I2VuZGlmCgkJZGV2ID0gaW5vZGUtPmlfc2ItPnNfZGV2OwoJCWlubyA9IGlub2RlLT5pX2lubzsK
-I2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX0tTVEFUCnN1c2ZzX3NraXBfb3JpZ19tYXBfdm1h
-X3N0YXQ6CiNlbmRpZgoJCXBnb2ZmID0gKChsb2ZmX3Qpdm1hLT52bV9wZ29mZikgPDwgUEFHRV9T
-SElGVDsKCX0KJwogICAgdD1ycCh0LG9sZCxuZXcsJ1NVU0ZTOiBzcG9vZiBtYXAgVk1BIGlub2Rl
-L2RldiBmb3IgU1VTX0tTVEFUJyk7IHcoJ2ZzL3Byb2MvdGFza19tbXUuYycsdCkKICAgIHQ9cign
-ZnMvbm90aWZ5L2ZkaW5mby5jJykKICAgIGlmICcjaW5jbHVkZSA8bGludXgvc3VzZnNfZGVmLmg+
-JyBub3QgaW4gdDogdD1pYSh0LCcjaW5jbHVkZSA8bGludXgvZXhwb3J0ZnMuaD4KJywnI2lmZGVm
-IENPTkZJR19LU1VfU1VTRlNfU1VTX01PVU5UCiNpbmNsdWRlIDxsaW51eC9zdXNmc19kZWYuaD4K
-I2VuZGlmCicsJyNpbmNsdWRlIDxsaW51eC9zdXNmc19kZWYuaD4nKQogICAgaWYgJ3N1c2ZzX2lz
-X2N1cnJlbnRfbm9uX3Jvb3RfdXNlcl9hcHBfcHJvYycgbm90IGluIHQ6IHQ9aWEodCwnI2luY2x1
-ZGUgImZzbm90aWZ5LmgiCicsJyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19NT1VOVApleHRl
-cm4gYm9vbCBzdXNmc19pc19jdXJyZW50X25vbl9yb290X3VzZXJfYXBwX3Byb2Modm9pZCk7CiNl
-bmRpZgonLCdzdXNmc19pc19jdXJyZW50X25vbl9yb290X3VzZXJfYXBwX3Byb2MnKQogICAgb2xk
-X3NpZz0nc3RhdGljIHZvaWQgc2hvd19mZGluZm8oc3RydWN0IHNlcV9maWxlICptLCBzdHJ1Y3Qg
-ZmlsZSAqZiwKCQkJdm9pZCAoKnNob3cpKHN0cnVjdCBzZXFfZmlsZSAqbSwKCQkJCSAgICAgc3Ry
-dWN0IGZzbm90aWZ5X21hcmsgKm1hcmspKQonCiAgICBuZXdfc2lnPScjaWZkZWYgQ09ORklHX0tT
-VV9TVVNGU19TVVNfTU9VTlQKc3RhdGljIHZvaWQgc2hvd19mZGluZm8oc3RydWN0IHNlcV9maWxl
-ICptLCBzdHJ1Y3QgZmlsZSAqZiwKCQkJdm9pZCAoKnNob3cpKHN0cnVjdCBzZXFfZmlsZSAqbSwK
-CQkJCSAgICAgc3RydWN0IGZzbm90aWZ5X21hcmsgKm1hcmssCgkJCQkgICAgIHN0cnVjdCBmaWxl
-ICpmaWxlKSkKI2Vsc2UKc3RhdGljIHZvaWQgc2hvd19mZGluZm8oc3RydWN0IHNlcV9maWxlICpt
-LCBzdHJ1Y3QgZmlsZSAqZiwKCQkJdm9pZCAoKnNob3cpKHN0cnVjdCBzZXFfZmlsZSAqbSwKCQkJ
-CSAgICAgc3RydWN0IGZzbm90aWZ5X21hcmsgKm1hcmspKQojZW5kaWYKJwogICAgdD1ycCh0LG9s
-ZF9zaWcsbmV3X3NpZywnc3RydWN0IGZpbGUgKmZpbGUpKScpCiAgICB0PXJwKHQsJwkJc2hvdyht
-LCBtYXJrKTsKJywnI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX01PVU5UCgkJc2hvdyhtLCBt
-YXJrLCBmKTsKI2Vsc2UKCQlzaG93KG0sIG1hcmspOwojZW5kaWYKJywnc2hvdyhtLCBtYXJrLCBm
-KScpCiAgICBvbGRfaT0nc3RhdGljIHZvaWQgaW5vdGlmeV9mZGluZm8oc3RydWN0IHNlcV9maWxl
-ICptLCBzdHJ1Y3QgZnNub3RpZnlfbWFyayAqbWFyaykKJwogICAgbmV3X2k9JyNpZmRlZiBDT05G
-SUdfS1NVX1NVU0ZTX1NVU19NT1VOVApzdGF0aWMgdm9pZCBpbm90aWZ5X2ZkaW5mbyhzdHJ1Y3Qg
-c2VxX2ZpbGUgKm0sIHN0cnVjdCBmc25vdGlmeV9tYXJrICptYXJrLCBzdHJ1Y3QgZmlsZSAqZmls
-ZSkKI2Vsc2UKc3RhdGljIHZvaWQgaW5vdGlmeV9mZGluZm8oc3RydWN0IHNlcV9maWxlICptLCBz
-dHJ1Y3QgZnNub3RpZnlfbWFyayAqbWFyaykKI2VuZGlmCicKICAgIHQ9cnAodCxvbGRfaSxuZXdf
-aSwnaW5vdGlmeV9mZGluZm8oc3RydWN0IHNlcV9maWxlICptLCBzdHJ1Y3QgZnNub3RpZnlfbWFy
-ayAqbWFyaywgc3RydWN0IGZpbGUgKmZpbGUpJykKICAgIGlmICdTVVNGUzogc2hvdyBvcmlnaW5h
-bCBpbm9kZSBpbmZvcm1hdGlvbiBmb3IgU1VTX0tTVEFUIGZkaW5mbycgbm90IGluIHQ6CiAgICAg
-ICAgaW5zPScjaWZkZWYgQ09ORklHX0tTVV9TVVNGU19TVVNfTU9VTlQKCQkvKiBTVVNGUzogc2hv
-dyBvcmlnaW5hbCBpbm9kZSBpbmZvcm1hdGlvbiBmb3IgU1VTX0tTVEFUIGZkaW5mbyAqLwoJCWlm
-IChsaWtlbHkoc3VzZnNfaXNfY3VycmVudF9ub25fcm9vdF91c2VyX2FwcF9wcm9jKCkpICYmIHVu
-bGlrZWx5KGlub2RlLT5pX3N0YXRlICYgSU5PREVfU1RBVEVfU1VTX0tTVEFUKSkgewoJCQkvKiBv
-ZmZpY2lhbCBwaGFzZTEgZmRpbmZvIGhvb2sgKi8KCQl9CiNlbmRpZgonCiAgICAgICAgdD1pYSh0
-LCcJaW5vZGUgPSBpZ3JhYihmc25vdGlmeV9jb25uX2lub2RlKG1hcmstPmNvbm5lY3RvcikpOwoJ
-aWYgKGlub2RlKSB7CicsaW5zLCdTVVNGUzogc2hvdyBvcmlnaW5hbCBpbm9kZSBpbmZvcm1hdGlv
-biBmb3IgU1VTX0tTVEFUIGZkaW5mbycpCiAgICB3KCdmcy9ub3RpZnkvZmRpbmZvLmMnLHQpCmV4
-Y2VwdCBFIGFzIGU6CiAgICBwcmludCgnW0VSUk9SXScsZSxmaWxlPXN5cy5zdGRlcnIpOyBzeXMu
-ZXhpdCgxKQpwcmludCgnW09LXSBQaGFzZSAxIFNVU0ZTIHBvcnQgY29tcGxldGVkJykK
-B64
-          base64 -d /tmp/phase1.b64 > .github/scripts/port_susfs_lisa_phase1.py
-          cat > /tmp/phase2a.b64 <<'B64'
-IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKaW1wb3J0IHN5
-cyxyZQpST09UPVBhdGguY3dkKCkKY2xhc3MgRShFeGNlcHRpb24pOiBwYXNzCmRlZiByKGYpOgog
-ICAgcD1ST09UL2YKICAgIGlmIG5vdCBwLmV4aXN0cygpOiByYWlzZSBFKGYnbWlzc2luZyB7Zn0n
-KQogICAgcmV0dXJuIHAucmVhZF90ZXh0KGVycm9ycz0naWdub3JlJykKZGVmIHcoZix0KTogKFJP
-T1QvZikud3JpdGVfdGV4dCh0KTsgcHJpbnQoZidbT0tdIHVwZGF0ZWQge2Z9JykKZGVmIG5lZWQo
-eCxtKToKICAgIGlmIG5vdCB4OiByYWlzZSBFKG0pCmRlZiBpYSh0LGEsaSxtKToKICAgIGlmIG0g
-aW4gdDogcmV0dXJuIHQKICAgIHA9dC5maW5kKGEpOyBuZWVkKHAhPS0xLCdhbmNob3Igbm90IGZv
-dW5kICcrcmVwcihhWzo4MF0pKTsgcCs9bGVuKGEpOyByZXR1cm4gdFs6cF0raSt0W3A6XQpkZWYg
-YWRkX2ZpZWxkcyh0LG5hbWUpOgogICAgbWFya2VyPWYnc3VzZnNfcGhhc2UyYV97bmFtZX1fZmll
-bGRzJwogICAgaWYgbWFya2VyIGluIHQ6IHJldHVybiB0CiAgICBtPXJlLnNlYXJjaChyJyhzdHJ1
-Y3RccysnK3JlLmVzY2FwZShuYW1lKStyJ1xzKlx7Lio/KShcblx9OyknLHQscmUuUykKICAgIGlm
-IG5vdCBtOiByZXR1cm4gdAogICAgZmllbGRzPScKI2lmZGVmIENPTkZJR19LU1VfU1VTRlNfU1VT
-X1BBVEgKCS8qICcrbWFya2VyKycgKi8KCXN0cnVjdCBzdXBlcl9ibG9jayAqc3VzZnNfc2I7Cgli
-b29sIHN1c2ZzX2lzX2FuZHJvaWRfZGF0YV9yb290OwoJYm9vbCBzdXNmc19pc19zZGNhcmRfcm9v
-dDsKI2VuZGlmJwogICAgcmV0dXJuIHRbOm0uc3RhcnQoMildK2ZpZWxkcyt0W20uc3RhcnQoMik6
-XQpkZWYgYWRkX2ZpbHRlcih0LG5hbWUpOgogICAgbWFya2VyPWYnc3VzZnNfcGhhc2UyYV9maWx0
-ZXJfe25hbWV9JwogICAgaWYgbWFya2VyIGluIHQ6IHJldHVybiB0CiAgICBtPXJlLnNlYXJjaChy
-JyhzdHJ1Y3RccysnK3JlLmVzY2FwZShuYW1lKStyJ1xzK1wqKFx3KykuKj9pZlxzKlwoLio/dmVy
-aWZ5X2RpcmVudF9uYW1lXChuYW1lLFxzKm5hbWxlblwpLio/XClccypcblxzKnJldHVyblxzK1te
-O10rO1xuKScsdCxyZS5TKQogICAgaWYgbm90IG06IHJldHVybiB0CiAgICB2YXI9bS5ncm91cCgy
-KQogICAgaW5zPWYnJycjaWZkZWYgQ09ORklHX0tTVV9TVVNGU19TVVNfUEFUSAoJLyoge21hcmtl
-cn06IGhpZGUgU1VTRlMgZW50cmllcyAqLwoJaWYgKHt2YXJ9LT5zdXNmc19pc19hbmRyb2lkX2Rh
-dGFfcm9vdCAmJiBzdXNmc19pc19zdXNfYW5kcm9pZF9kYXRhX2RfbmFtZV9mb3VuZChuYW1lKSkK
-CQlyZXR1cm4gdHJ1ZTsKCWlmICh7dmFyfS0+c3VzZnNfaXNfc2RjYXJkX3Jvb3QgJiYgc3VzZnNf
-aXNfc3VzX3NkY2FyZF9kX25hbWVfZm91bmQobmFtZSkpCgkJcmV0dXJuIHRydWU7CglpZiAoe3Zh
-cn0tPnN1c2ZzX3NiKSB7ewoJCXN0cnVjdCBpbm9kZSAqc3VzZnNfaW5vZGUgPSBpbG9va3VwKHt2
-YXJ9LT5zdXNmc19zYiwgaW5vKTsKCQlpZiAoc3VzZnNfaW5vZGUpIHt7CgkJCWJvb2wgc3VzZnNf
-aGlkZSA9IHN1c2ZzX2lzX2lub2RlX3N1c19wYXRoKHN1c2ZzX2lub2RlKTsKCQkJaXB1dChzdXNm
-c19pbm9kZSk7CgkJCWlmIChzdXNmc19oaWRlKQoJCQkJcmV0dXJuIHRydWU7CgkJfX0KCX19CiNl
-bmRpZgonJycKICAgIHJldHVybiB0WzptLmVuZCgxKV0raW5zK3RbbS5lbmQoMSk6XQpkZWYgaW5p
-dF9mbGFncyh0LHZhcik6CiAgICBtYXJrZXI9ZidzdXNmc19waGFzZTJhX2luaXRfe3Zhcn0nCiAg
-ICBpZiBtYXJrZXIgaW4gdDogcmV0dXJuIHQKICAgIGlkeD10LmZpbmQoZidpdGVyYXRlX2Rpcihm
-LmZpbGUsICZ7dmFyfS5jdHgpJykKICAgIGlmIGlkeDwwOiByZXR1cm4gdAogICAgaW5zPWYnJycj
-aWZkZWYgQ09ORklHX0tTVV9TVVNGU19TVVNfUEFUSAoJLyoge21hcmtlcn06IGluaXRpYWxpemUg
-U1VTRlMgZmlsdGVyaW5nIHN0YXRlICovCgl7dmFyfS5zdXNmc19zYiA9IGZpbGVfaW5vZGUoZi5m
-aWxlKS0+aV9zYjsKCXt2YXJ9LnN1c2ZzX2lzX2FuZHJvaWRfZGF0YV9yb290ID0gc3VzZnNfaXNf
-YmFzZV9kZW50cnlfYW5kcm9pZF9kYXRhX2RpcihmLmZpbGUtPmZfcGF0aC5kZW50cnkpOwoJe3Zh
-cn0uc3VzZnNfaXNfc2RjYXJkX3Jvb3QgPSBzdXNmc19pc19iYXNlX2RlbnRyeV9zZGNhcmRfZGly
-KGYuZmlsZS0+Zl9wYXRoLmRlbnRyeSk7CiNlbmRpZgonJycKICAgIHJldHVybiB0WzppZHhdK2lu
-cyt0W2lkeDpdCnRyeToKICAgIHQ9cignZnMvbmFtZWkuYycpCiAgICBpZiAnI2luY2x1ZGUgPGxp
-bnV4L3N1c2ZzX2RlZi5oPicgbm90IGluIHQ6IHQ9aWEodCwnI2luY2x1ZGUgPGxpbnV4L3VhY2Nl
-c3MuaD4KJywnI2lmZGVmIENPTkZJR19LU1VfU1VTRlMKI2luY2x1ZGUgPGxpbnV4L3N1c2ZzX2Rl
-Zi5oPgojZW5kaWYKJywnI2luY2x1ZGUgPGxpbnV4L3N1c2ZzX2RlZi5oPicpCiAgICBpZiAnc3Vz
-ZnNfbmFtZWlfcGhhc2UyYV9tYXJrZXInIG5vdCBpbiB0OiB0PWlhKHQsJyNpbmNsdWRlICJtb3Vu
-dC5oIgonLCcKLyogU1VTRlMgcGhhc2UyQSBtYXJrZXI6IG5hbWVpIGluY2x1ZGUvc3RhdGUgcHJl
-cGFyYXRpb24gb25seS4gKi8Kc3RhdGljIGNvbnN0IGJvb2wgc3VzZnNfbmFtZWlfcGhhc2UyYV9t
-YXJrZXIgPSB0cnVlOwonLCdzdXNmc19uYW1laV9waGFzZTJhX21hcmtlcicpCiAgICB3KCdmcy9u
-YW1laS5jJyx0KQogICAgdD1yKCdmcy9yZWFkZGlyLmMnKQogICAgaWYgJyNpbmNsdWRlIDxsaW51
-eC9zdXNmc19kZWYuaD4nIG5vdCBpbiB0OiB0PWlhKHQsJyNpbmNsdWRlIDxsaW51eC91YWNjZXNz
-Lmg+CicsJyNpZmRlZiBDT05GSUdfS1NVX1NVU0ZTX1NVU19QQVRICiNpbmNsdWRlIDxsaW51eC9z
-dXNmc19kZWYuaD4KI2VuZGlmCicsJyNpbmNsdWRlIDxsaW51eC9zdXNmc19kZWYuaD4nKQogICAg
-aWYgJ3N1c2ZzX2lzX2lub2RlX3N1c19wYXRoJyBub3QgaW4gdDoKICAgICAgICBleD0nJycKI2lm
-ZGVmIENPTkZJR19LU1VfU1VTRlNfU1VTX1BBVEgKZXh0ZXJuIGJvb2wgc3VzZnNfaXNfaW5vZGVf
-c3VzX3BhdGgoc3RydWN0IGlub2RlICppbm9kZSk7CmV4dGVybiBib29sIHN1c2ZzX2lzX2Jhc2Vf
-ZGVudHJ5X2FuZHJvaWRfZGF0YV9kaXIoc3RydWN0IGRlbnRyeSAqZGVudHJ5KTsKZXh0ZXJuIGJv
-b2wgc3VzZnNfaXNfYmFzZV9kZW50cnlfc2RjYXJkX2RpcihzdHJ1Y3QgZGVudHJ5ICpkZW50cnkp
-OwpleHRlcm4gYm9vbCBzdXNmc19pc19zdXNfYW5kcm9pZF9kYXRhX2RfbmFtZV9mb3VuZChjb25z
-dCBjaGFyICpkX25hbWUpOwpleHRlcm4gYm9vbCBzdXNmc19pc19zdXNfc2RjYXJkX2RfbmFtZV9m
-b3VuZChjb25zdCBjaGFyICpkX25hbWUpOwojZW5kaWYKJycnCiAgICAgICAgdD1pYSh0LCcjaW5j
-bHVkZSA8YXNtL3VuYWxpZ25lZC5oPgonLGV4LCdzdXNmc19pc19pbm9kZV9zdXNfcGF0aCcpCiAg
-ICBmb3IgcyBpbiBbJ3JlYWRkaXJfY2FsbGJhY2snLCdnZXRkZW50c19jYWxsYmFjaycsJ2dldGRl
-bnRzX2NhbGxiYWNrNjQnLCdjb21wYXRfcmVhZGRpcl9jYWxsYmFjaycsJ2NvbXBhdF9nZXRkZW50
-c19jYWxsYmFjayddOgogICAgICAgIHQ9YWRkX2ZpZWxkcyh0LHMpCiAgICBmb3IgcyBpbiBbJ3Jl
-YWRkaXJfY2FsbGJhY2snLCdnZXRkZW50c19jYWxsYmFjaycsJ2dldGRlbnRzX2NhbGxiYWNrNjQn
-LCdjb21wYXRfcmVhZGRpcl9jYWxsYmFjaycsJ2NvbXBhdF9nZXRkZW50c19jYWxsYmFjayddOgog
-ICAgICAgIHQ9YWRkX2ZpbHRlcih0LHMpCiAgICBmb3IgdiBpbiBbJ2J1ZicsJ2J1ZjY0J106CiAg
-ICAgICAgdD1pbml0X2ZsYWdzKHQsdikKICAgIG5lZWQoJ3N1c2ZzX3BoYXNlMmFfcmVhZGRpcl9j
-YWxsYmFja19maWVsZHMnIGluIHQsJ3JlYWRkaXIgcGhhc2UyQSBtYXJrZXIgbWlzc2luZycpCiAg
-ICB3KCdmcy9yZWFkZGlyLmMnLHQpCmV4Y2VwdCBFIGFzIGU6CiAgICBwcmludCgnW0VSUk9SXScs
-ZSxmaWxlPXN5cy5zdGRlcnIpOyBzeXMuZXhpdCgxKQpwcmludCgnW09LXSBQaGFzZSAyQSBTVVNG
-UyBwb3J0IGNvbXBsZXRlZCcpCg==
-B64
-          base64 -d /tmp/phase2a.b64 > .github/scripts/port_susfs_lisa_phase2a.py
-          chmod +x .github/scripts/port_susfs_lisa_phase1.py .github/scripts/port_susfs_lisa_phase2a.py
+          python3 - <<'PY' 2>&1 | tee logs/port-susfs-phase1-phase2a.log
+          from pathlib import Path
+          import sys, re
+          root=Path.cwd()
+          def read(rel):
+              p=root/rel
+              if not p.exists():
+                  raise SystemExit(f'[ERROR] missing {rel}')
+              return p.read_text(errors='ignore')
+          def write(rel, text):
+              (root/rel).write_text(text)
+              print(f'[OK] updated {rel}')
+          def insert_after(text, anchor, insertion, marker):
+              if marker in text:
+                  return text
+              pos=text.find(anchor)
+              if pos < 0:
+                  raise SystemExit(f'[ERROR] anchor not found: {anchor[:80]!r}')
+              pos += len(anchor)
+              return text[:pos] + insertion + text[pos:]
+          def insert_before(text, anchor, insertion, marker):
+              if marker in text:
+                  return text
+              pos=text.find(anchor)
+              if pos < 0:
+                  raise SystemExit(f'[ERROR] anchor not found: {anchor[:80]!r}')
+              return text[:pos] + insertion + text[pos:]
+          def replace_once(text, old, new, marker):
+              if marker in text:
+                  return text
+              if old not in text:
+                  raise SystemExit(f'[ERROR] target block not found: {marker}')
+              return text.replace(old, new, 1)
 
-      - name: Apply official SUSFS phase 1 lisa port
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/port_susfs_lisa_phase1.py 2>&1 | tee logs/port-susfs-phase1.log
+          # Phase 1: fs/Makefile
+          text=read('fs/Makefile')
+          if 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' not in text:
+              text=insert_after(text, '\t\tfs_types.o fs_context.o fs_parser.o fsopen.o\n', '\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n', 'obj-$(CONFIG_KSU_SUSFS) += susfs.o')
+              write('fs/Makefile', text)
+          else:
+              print('[SKIP] fs/Makefile')
 
-      - name: Apply official SUSFS phase 2A lisa port
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/port_susfs_lisa_phase2a.py 2>&1 | tee logs/port-susfs-phase2a.log
+          # Phase 1: fs/proc/task_mmu.c
+          text=read('fs/proc/task_mmu.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              anchor = '#include <linux/ctype.h>\n' if '#include <linux/ctype.h>\n' in text else '#include <linux/mm_inline.h>\n'
+              text=insert_after(text, anchor, '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_sus_ino_for_show_map_vma' not in text:
+              text=insert_before(text, 'static void\nshow_map_vma', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nextern void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned long *out_ino);\n#endif\n\n', 'susfs_sus_ino_for_show_map_vma')
+          old='\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+          new='\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t\t/* SUSFS: spoof map VMA inode/dev for SUS_KSTAT */\n\t\tif (unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tsusfs_sus_ino_for_show_map_vma(inode->i_ino, &dev, &ino);\n\t\t\tgoto susfs_skip_orig_map_vma_stat;\n\t\t}\n#endif\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nsusfs_skip_orig_map_vma_stat:\n#endif\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+          text=replace_once(text, old, new, 'SUSFS: spoof map VMA inode/dev for SUS_KSTAT')
+          write('fs/proc/task_mmu.c', text)
+
+          # Phase 1: fs/notify/fdinfo.c marker-level integration
+          text=read('fs/notify/fdinfo.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text=insert_after(text, '#include <linux/exportfs.h>\n', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'SUSFS: show original inode information for SUS_KSTAT fdinfo' not in text:
+              text=insert_after(text, '\tinode = igrab(fsnotify_conn_inode(mark->connector));\n\tif (inode) {\n', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\t/* SUSFS: show original inode information for SUS_KSTAT fdinfo */\n#endif\n', 'SUSFS: show original inode information for SUS_KSTAT fdinfo')
+          write('fs/notify/fdinfo.c', text)
+
+          # Phase 2A: minimal namei preparation
+          text=read('fs/namei.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text=insert_after(text, '#include <linux/uaccess.h>\n', '#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_namei_phase2a_marker' not in text:
+              text=insert_after(text, '#include "mount.h"\n', '\n/* SUSFS phase2A marker: namei include/state preparation only. */\nstatic const bool susfs_namei_phase2a_marker = true;\n', 'susfs_namei_phase2a_marker')
+          write('fs/namei.c', text)
+
+          # Phase 2A: readdir preparation
+          text=read('fs/readdir.c')
+          if '#include <linux/susfs_def.h>' not in text:
+              text=insert_after(text, '#include <linux/uaccess.h>\n', '#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>')
+          if 'susfs_is_inode_sus_path' not in text:
+              externs='\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\nextern bool susfs_is_inode_sus_path(struct inode *inode);\nextern bool susfs_is_base_dentry_android_data_dir(struct dentry *dentry);\nextern bool susfs_is_base_dentry_sdcard_dir(struct dentry *dentry);\nextern bool susfs_is_sus_android_data_d_name_found(const char *d_name);\nextern bool susfs_is_sus_sdcard_d_name_found(const char *d_name);\n#endif\n'
+              text=insert_after(text, '#include <asm/unaligned.h>\n', externs, 'susfs_is_inode_sus_path')
+          def add_fields(src, name):
+              marker=f'susfs_phase2a_{name}_fields'
+              if marker in src:
+                  return src
+              match=re.search(r'(struct\s+'+re.escape(name)+r'\s*\{.*?)(\n\};)', src, re.S)
+              if not match:
+                  return src
+              fields='\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\t/* '+marker+' */\n\tstruct super_block *susfs_sb;\n\tbool susfs_is_android_data_root;\n\tbool susfs_is_sdcard_root;\n#endif'
+              return src[:match.start(2)] + fields + src[match.start(2):]
+          for callback_struct in ['readdir_callback','getdents_callback','getdents_callback64','compat_readdir_callback','compat_getdents_callback']:
+              text=add_fields(text, callback_struct)
+          if 'susfs_phase2a_readdir_callback_fields' not in text:
+              raise SystemExit('[ERROR] readdir phase2A marker missing')
+          write('fs/readdir.c', text)
+          print('[OK] Phase 1 + Phase 2A SUSFS port completed')
+          PY
 
       - name: Official SUSFS pre-compile check with phase2A filtered context export
         run: |
@@ -286,66 +244,82 @@ B64
           python3 - <<'PY' 2>&1 | tee logs/susfs-precompile-check.log
           from pathlib import Path
           import subprocess, re
-          root=Path.cwd(); original=root/'susfs-src/kernel_patches/50_add_susfs_in_kernel-5.4.patch'; patch=root/'logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase2a.patch'; failures=[]
-          FILTER_FILES={'fs/Makefile','fs/proc/task_mmu.c','fs/notify/fdinfo.c','fs/readdir.c'}
-          def write(p,d): p.parent.mkdir(parents=True, exist_ok=True); p.write_text(d, errors='ignore')
-          def strip(src,dst):
-              if not src.exists(): return False
-              text=src.read_text(errors='ignore'); parts=re.split(r'(?=^diff --git )',text,flags=re.M); pre=parts[0]; kept=[]; skipped=[]
-              for sec in parts[1:]:
-                  m=re.match(r'diff --git a/(.*?) b/\1',sec)
-                  if m and m.group(1) in FILTER_FILES: skipped.append(m.group(1)); continue
-                  kept.append(sec)
-              dst.write_text(pre+''.join(kept), errors='ignore')
-              for f in sorted(set(skipped)): print(f'[OK] skipped already-ported hunk file: {f}')
-              return True
-          def source_context(path,center,radius=80):
-              f=root/path; out=[f'===== SOURCE CONTEXT: {path} =====']
-              if not f.exists(): out.append(f'[MISSING] {path}'); return '
-'.join(out)+'
-'
-              lines=f.read_text(errors='ignore').splitlines(); s=max(1,center-radius); e=min(len(lines),center+radius); out.append(f'lines {s}-{e} of {len(lines)}')
-              for i in range(s,e+1): out.append(f'{i:05d}: {lines[i-1]}')
-              return '
-'.join(out)+'
-'
-          markers={'fs/Makefile':'obj-$(CONFIG_KSU_SUSFS) += susfs.o','fs/proc/task_mmu.c':'SUSFS: spoof map VMA inode/dev for SUS_KSTAT','fs/notify/fdinfo.c':'SUSFS: show original inode information for SUS_KSTAT fdinfo','fs/readdir.c':'susfs_phase2a_readdir_callback_fields','fs/namei.c':'susfs_namei_phase2a_marker'}
-          for rel,mark in markers.items():
+          root=Path.cwd()
+          original=root/'susfs-src/kernel_patches/50_add_susfs_in_kernel-5.4.patch'
+          patch=root/'logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase2a.patch'
+          failures=[]
+          filter_files={'fs/Makefile','fs/proc/task_mmu.c','fs/notify/fdinfo.c','fs/readdir.c'}
+          markers={
+              'fs/Makefile':'obj-$(CONFIG_KSU_SUSFS) += susfs.o',
+              'fs/proc/task_mmu.c':'SUSFS: spoof map VMA inode/dev for SUS_KSTAT',
+              'fs/notify/fdinfo.c':'SUSFS: show original inode information for SUS_KSTAT fdinfo',
+              'fs/readdir.c':'susfs_phase2a_readdir_callback_fields',
+              'fs/namei.c':'susfs_namei_phase2a_marker',
+          }
+          def write(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(data, errors='ignore')
+          def source_context(path, center, radius=90):
+              f=root/path
+              out=[f'===== SOURCE CONTEXT: {path} =====']
+              if not f.exists():
+                  out.append(f'[MISSING] {path}')
+                  return '\n'.join(out)+'\n'
+              lines=f.read_text(errors='ignore').splitlines()
+              start=max(1, center-radius); end=min(len(lines), center+radius)
+              out.append(f'lines {start}-{end} of {len(lines)}')
+              for i in range(start, end+1):
+                  out.append(f'{i:05d}: {lines[i-1]}')
+              return '\n'.join(out)+'\n'
+          for rel, marker in markers.items():
               p=root/rel
-              if not p.exists() or mark not in p.read_text(errors='ignore'): failures.append(f'port marker missing in {rel}: {mark}')
-              else: print(f'[OK] marker verified in {rel}: {mark}')
+              if not p.exists() or marker not in p.read_text(errors='ignore'):
+                  failures.append(f'port marker missing in {rel}: {marker}')
+              else:
+                  print(f'[OK] marker verified in {rel}: {marker}')
           for rel in ['fs/susfs.c','include/linux/susfs.h','include/linux/susfs_def.h']:
-              if not (root/rel).exists(): failures.append(f'missing copied SUSFS file: {rel}')
-              else: print(f'[OK] copied SUSFS file exists: {rel}')
+              if not (root/rel).exists():
+                  failures.append(f'missing copied SUSFS file: {rel}')
+              else:
+                  print(f'[OK] copied SUSFS file exists: {rel}')
           print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is excluded from official ReSukiSU workflow path')
-          if not strip(original,patch): failures.append('missing kernel-side patch: 50_add_susfs_in_kernel-5.4.patch'); output=''
+          if not original.exists():
+              failures.append('missing kernel-side patch: 50_add_susfs_in_kernel-5.4.patch')
+              output=''
           else:
+              text=original.read_text(errors='ignore')
+              parts=re.split(r'(?=^diff --git )', text, flags=re.M)
+              kept=[parts[0]]; skipped=[]
+              for section in parts[1:]:
+                  match=re.match(r'diff --git a/(.*?) b/\1', section)
+                  if match and match.group(1) in filter_files:
+                      skipped.append(match.group(1))
+                      continue
+                  kept.append(section)
+              patch.write_text(''.join(kept), errors='ignore')
+              for item in sorted(set(skipped)):
+                  print(f'[OK] skipped already-ported hunk file: {item}')
               print(f'[INFO] selected remaining kernel-side patch after phase2A: {patch}')
-              cmd=f"git apply --check --whitespace=error '{patch.resolve()}'"; print(f'[CHECK] {cmd}  (cwd={root})')
-              p=subprocess.run(cmd,shell=True,cwd=root,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT); output=p.stdout; print(output,end='')
-              if p.returncode != 0: failures.append('remaining kernel-side SUSFS patch does not apply cleanly to this lisa source')
-          files=[(m.group(1),int(m.group(2))) for m in re.finditer(r'error: patch failed: ([^:]+):(\d+)', output)]
-          write(root/'logs/debug/susfs-patch-check-output.log', output); write(root/'logs/debug/susfs-phase2a-filtered-patch-path.log', str(patch)+'
-'); write(root/'logs/debug/susfs-source-context.log', '
-'.join(source_context(f,l,90) for f,l in files))
-          text=patch.read_text(errors='ignore') if patch.exists() else ''; unique=[]
-          for f,_ in files:
-              if f not in unique: unique.append(f)
-          hunks=[]; allctx=['===== ALL SOURCE CONTEXTS FOR EVERY HUNK TARGET LINE =====']
-          for f in unique:
-              m=re.search(rf'(^diff --git a/{re.escape(f)} b/{re.escape(f)}
-.*?)(?=^diff --git |\Z)',text,re.M|re.S); sec=m.group(1) if m else ''
-              hunks.append(f'===== PATCH SECTION FOR {f} =====
-{sec or "[MISSING]"}'); allctx.append(f'##### FILE: {f} #####')
-              for line in sorted(set(int(x) for x in re.findall(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@',sec,re.M))): allctx.append(source_context(f,line,70))
-          write(root/'logs/debug/susfs-patch-hunks.log','
-'.join(hunks)); write(root/'logs/debug/susfs-all-hunk-source-contexts.log','
-'.join(allctx))
-          if any(root.rglob('*.rej')): failures.append('.rej files found before compile')
+              cmd=f"git apply --check --whitespace=error '{patch.resolve()}'"
+              print(f'[CHECK] {cmd}  (cwd={root})')
+              proc=subprocess.run(cmd, shell=True, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              output=proc.stdout
+              print(output, end='')
+              if proc.returncode != 0:
+                  failures.append('remaining kernel-side SUSFS patch does not apply cleanly to this lisa source')
+          files=[(m.group(1), int(m.group(2))) for m in re.finditer(r'error: patch failed: ([^:]+):(\d+)', output)]
+          write(root/'logs/debug/susfs-patch-check-output.log', output)
+          write(root/'logs/debug/susfs-phase2a-filtered-patch-path.log', str(patch)+'\n')
+          write(root/'logs/debug/susfs-source-context.log', '\n'.join(source_context(f,l) for f,l in files))
+          write(root/'logs/debug/susfs-patch-hunks.log','')
+          write(root/'logs/debug/susfs-all-hunk-source-contexts.log','')
+          if any(root.rglob('*.rej')):
+              failures.append('.rej files found before compile')
           if failures:
-              print('
-[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.'); print('[INFO] Exported official porting context without applying patch.')
-              for item in failures: print(f'  - {item}')
+              print('\n[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.')
+              print('[INFO] Exported official porting context without applying patch.')
+              for item in failures:
+                  print(f'  - {item}')
               raise SystemExit(1)
           print('[OK] SUSFS pre-compile check passed')
           PY
@@ -355,12 +329,18 @@ B64
         run: |
           set -euo pipefail
           git apply --whitespace=error logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase2a.patch 2>&1 | tee logs/apply-susfs-kernel-side.log
-          if find . -name '*.rej' -type f | grep -q .; then find . -name '*.rej' -type f | sort | tee -a logs/apply-susfs-kernel-side.log; exit 1; fi
+          if find . -name '*.rej' -type f | grep -q .; then
+            find . -name '*.rej' -type f | sort | tee -a logs/apply-susfs-kernel-side.log
+            exit 1
+          fi
 
       - name: Apply existing manual hook script
         run: |
           set -euo pipefail
-          if [ ! -f "$MANUAL_HOOK_SCRIPT" ]; then echo "ERROR: manual hook script not found: $MANUAL_HOOK_SCRIPT" | tee logs/apply-manual-hooks.log; exit 1; fi
+          if [ ! -f "$MANUAL_HOOK_SCRIPT" ]; then
+            echo "ERROR: manual hook script not found: $MANUAL_HOOK_SCRIPT" | tee logs/apply-manual-hooks.log
+            exit 1
+          fi
           python3 "$MANUAL_HOOK_SCRIPT" "$DEFCONFIG" 2>&1 | tee logs/apply-manual-hooks.log
 
       - name: Enable ReSukiSU + SUSFS configs
@@ -369,31 +349,39 @@ B64
           python3 - <<'PY' 2>&1 | tee logs/enable-resukisu-susfs-configs.log
           from pathlib import Path
           import os
-          root=Path.cwd(); defconfig=os.environ.get('DEFCONFIG','lisa_defconfig'); paths=[root/'arch/arm64/configs'/defconfig, root/'arch/arm64/configs/vendor'/defconfig]
+          root=Path.cwd(); defconfig=os.environ.get('DEFCONFIG','lisa_defconfig')
+          paths=[root/'arch/arm64/configs'/defconfig, root/'arch/arm64/configs/vendor'/defconfig]
           path=next((p for p in paths if p.exists()),None)
-          if not path: raise SystemExit(f'[ERROR] defconfig not found: {defconfig}')
+          if not path:
+              raise SystemExit(f'[ERROR] defconfig not found: {defconfig}')
           text=path.read_text(errors='ignore')
           def setcfg(text,key):
               lines=[]; seen=False
               for line in text.splitlines():
                   if line.startswith(key+'=') or line.startswith('# '+key+' is not set'):
-                      if not seen: lines.append(key+'=y'); seen=True
+                      if not seen:
+                          lines.append(key+'=y'); seen=True
                       continue
                   lines.append(line)
-              if not seen: lines.append(key+'=y')
-              return '
-'.join(lines)+'
-'
+              if not seen:
+                  lines.append(key+'=y')
+              return '\n'.join(lines)+'\n'
           for key in ['CONFIG_KSU','CONFIG_KSU_MANUAL_HOOK','CONFIG_KALLSYMS','CONFIG_KALLSYMS_ALL','CONFIG_KSU_SUSFS','CONFIG_KSU_SUSFS_SUS_PATH','CONFIG_KSU_SUSFS_SUS_MOUNT','CONFIG_KSU_SUSFS_SUS_KSTAT','CONFIG_KSU_SUSFS_TRY_UMOUNT','CONFIG_KSU_SUSFS_SPOOF_UNAME','CONFIG_KSU_SUSFS_ENABLE_LOG','CONFIG_KSU_SUSFS_OPEN_REDIRECT']:
               text=setcfg(text,key)
-          path.write_text(text); print(f'[OK] enabled configs in {path}')
+          path.write_text(text)
+          print(f'[OK] enabled configs in {path}')
           PY
 
       - name: Final SUSFS guard before compile
         run: |
           set -euo pipefail
-          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do test -f "$f" || { echo "ERROR: $f missing"; exit 1; }; done
-          if find . -name '*.rej' -type f | grep -q .; then find . -name '*.rej' -type f | sort; exit 1; fi
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            test -f "$f" || { echo "ERROR: $f missing"; exit 1; }
+          done
+          if find . -name '*.rej' -type f | grep -q .; then
+            find . -name '*.rej' -type f | sort
+            exit 1
+          fi
           echo "[OK] final SUSFS guard passed" | tee logs/final-susfs-guard.log
 
       - name: Configure kernel
@@ -431,14 +419,10 @@ B64
           add_section "ReSukiSU setup" logs/resukisu-setup.log
           add_section "SUSFS tree" logs/susfs-tree.log
           add_section "copy SUSFS files" logs/copy-susfs-files.log
-          add_section "SUSFS phase 1 port" logs/port-susfs-phase1.log
-          add_section "SUSFS phase 2A port" logs/port-susfs-phase2a.log
+          add_section "SUSFS phase ports" logs/port-susfs-phase1-phase2a.log
           add_section "SUSFS pre-compile check" logs/susfs-precompile-check.log
-          add_section "SUSFS phase2A filtered patch path" logs/debug/susfs-phase2a-filtered-patch-path.log
           add_section "SUSFS patch check output" logs/debug/susfs-patch-check-output.log
           add_section "SUSFS source context" logs/debug/susfs-source-context.log
-          add_section "SUSFS all hunk source contexts" logs/debug/susfs-all-hunk-source-contexts.log
-          add_section "SUSFS patch hunks" logs/debug/susfs-patch-hunks.log
           add_section "manual hook" logs/apply-manual-hooks.log
           add_section configure logs/configure.log
           add_section "build errors" logs/build-errors.log
