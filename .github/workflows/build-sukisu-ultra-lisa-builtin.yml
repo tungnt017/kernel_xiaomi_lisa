@@ -114,39 +114,42 @@ jobs:
           ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
           ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
 
-      - name: Apply SUSFS to kernel tree
+          - name: Copy fs/susfs.c + headers from susfs4ksu
+                  working-directory: ${{ env.KERNEL_DIR }}
+                  run: |
+                    set -euo pipefail
+                    SRC=/tmp/susfs4ksu/kernel_patches
+                    [ -f "$SRC/fs/susfs.c" ] || { echo "::error::Missing $SRC/fs/susfs.c"; exit 1; }
+                    [ -f "$SRC/include/linux/susfs.h" ] || { echo "::error::Missing susfs.h"; exit 1; }
+                    cp -v "$SRC/fs/susfs.c" fs/
+                    cp -v "$SRC/include/linux/susfs.h" include/linux/
+                    [ -f "$SRC/include/linux/susfs_def.h" ] && cp -v "$SRC/include/linux/susfs_def.h" include/linux/ || true
+                    # Add susfs.o to fs/Makefile if not already
+                    if ! grep -q "susfs.o" fs/Makefile; then
+                      echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+                    fi
+
+      - name: Apply SUSFS anchor-based backport (lisa refactored)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          SRC=/tmp/susfs4ksu/kernel_patches
-
-          [ -f "$SRC/fs/susfs.c" ]              || { echo "::error::Missing $SRC/fs/susfs.c"; exit 1; }
-          [ -f "$SRC/include/linux/susfs.h" ]   || { echo "::error::Missing $SRC/include/linux/susfs.h"; exit 1; }
-          cp -v "$SRC/fs/susfs.c" fs/
-          cp -v "$SRC/include/linux/susfs.h" include/linux/
-          [ -f "$SRC/include/linux/susfs_def.h" ] && cp -v "$SRC/include/linux/susfs_def.h" include/linux/ || true
-
-          PATCH=""
-          for cand in "$SRC/50_add_susfs_in_kernel-${SUSFS_BRANCH#kernel-}.patch" \
-                     "$SRC"/50_add_susfs_in_kernel-*.patch; do
-            [ -f "$cand" ] && PATCH="$cand" && break
-          done
-          [ -n "$PATCH" ] || { echo "::error::Khong tim thay 50_add_susfs_in_kernel*.patch"; ls -la "$SRC"; exit 1; }
-          echo "==> Apply $PATCH"
-
-          if ! patch -p1 --dry-run -i "$PATCH" >/tmp/susfs_dryrun.log 2>&1; then
-            echo "::error::Dry-run patch FAILED"
-            cat /tmp/susfs_dryrun.log
+          chmod +x .github/scripts/apply_susfs_backport_lisa.py
+          python3 .github/scripts/apply_susfs_backport_lisa.py | tee /tmp/susfs_backport.log
+          if grep -qE "\[ERROR\]|Traceback" /tmp/susfs_backport.log; then
+            echo "::error::SUSFS backport failed"
             exit 1
           fi
-          patch -p1 -i "$PATCH" | tee /tmp/susfs_apply.log
 
-          REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
-          if [ -n "$REJ" ]; then
-            echo "::error::.rej files xuat hien"
-            echo "$REJ"
-            exit 1
-          fi
+      - name: Verify SUSFS backport applied
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+          grep -q "susfs_sus_ino_for_filldir64" fs/readdir.c || { echo "::error::readdir.c missing hook"; FAIL=1; }
+          grep -q "linux/susfs_def.h" fs/namei.c || { echo "::error::namei.c missing include"; FAIL=1; }
+          grep -q "susfs_is_current_ksu_domain" fs/namespace.c || { echo "::error::namespace.c missing extern"; FAIL=1; }
+          [ "$FAIL" -ne 0 ] && exit 1
+          echo "All SUSFS backport hooks verified."
 
       - name: Verify SUSFS kernel-side integrated
         working-directory: ${{ env.KERNEL_DIR }}
