@@ -62,8 +62,6 @@ jobs:
           mkdir -p "$KERNEL_DIR/.github/scripts"
           cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py \
                 "$KERNEL_DIR/.github/scripts/"
-          cp -v workflow-repo/.github/scripts/fix_rmnet_ipa_enum_cast.py \
-                "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
@@ -272,17 +270,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Fix rmnet_ipa enum-conversion
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/scripts/fix_rmnet_ipa_enum_cast.py
-          python3 .github/scripts/fix_rmnet_ipa_enum_cast.py | tee /tmp/fix_rmnet_ipa.log
-          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_rmnet_ipa.log; then
-            echo "::error::fix_rmnet_ipa_enum_cast.py reported errors"
-            exit 1
-          fi
-
       - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -304,7 +291,6 @@ jobs:
           path: |
             /tmp/build.log
             /tmp/apply_hooks.log
-            /tmp/fix_rmnet_ipa.log
             /tmp/susfs_dryrun.log
             /tmp/susfs_apply.log
           if-no-files-found: warn
@@ -319,7 +305,4 @@ jobs:
             ${{ env.KERNEL_DIR }}/*.zip
             ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image
             ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/yupik.dtb
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/lisa-sm7325-overlay.dtbo
-          if-no-files-found: warn
-          retention-days: 14
+            ${{ env.KERNEL_DIR }}/out/arch/arm64
