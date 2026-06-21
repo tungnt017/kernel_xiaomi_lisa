@@ -280,54 +280,76 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Setup AOSP Clang r450784d (from official prebuilts repo)
+      - name: Setup AOSP Clang r450784d
         run: |
           set -euo pipefail
           TC_DIR="$HOME/tc/clang-r450784d"
           if [ -x "$TC_DIR/bin/clang" ] && [ -x "$TC_DIR/bin/ld.lld" ]; then
             echo "==> Toolchain already present"
             "$TC_DIR/bin/clang" --version
+            "$TC_DIR/bin/ld.lld" --version
             exit 0
           fi
 
           mkdir -p "$HOME/tc"
           cd /tmp
-
-          # Use sparse-checkout to only fetch the specific version dir
           rm -rf aosp-clang
-          git init --bare aosp-clang
-          cd aosp-clang
-          git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
-          git config remote.origin.partialclonefilter blob:none
-          git fetch --depth=1 origin master
 
-          cd /tmp
-          rm -rf aosp-clang-work
-          git clone --depth=1 --filter=blob:none --sparse \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            aosp-clang-work
-          cd aosp-clang-work
-          git sparse-checkout set clang-r450784d
-          git checkout
-
-          if [ ! -d clang-r450784d ]; then
-            echo "::error::clang-r450784d not found in AOSP prebuilts"
-            ls -la
-            exit 1
+          # Method 1: direct tarball from gitiles (fastest, ~600MB only this folder)
+          echo "==> Trying gitiles archive download..."
+          TARBALL_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784d.tar.gz"
+          if curl -fSL --retry 3 --retry-delay 5 -o clang.tar.gz "$TARBALL_URL"; then
+            echo "==> Downloaded $(du -h clang.tar.gz | cut -f1)"
+            mkdir -p "$TC_DIR"
+            tar -xzf clang.tar.gz -C "$TC_DIR"
+            rm -f clang.tar.gz
+          else
+            echo "==> Gitiles archive failed, falling back to sparse clone..."
+            git clone --branch master --depth=1 --filter=blob:none --sparse \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              aosp-clang
+            cd aosp-clang
+            git sparse-checkout set clang-r450784d
+            git checkout
+            if [ ! -d clang-r450784d ]; then
+              echo "::error::clang-r450784d not found on master branch"
+              echo "Available top-level entries:"
+              ls -la
+              echo "Branches:"
+              git branch -a
+              exit 1
+            fi
+            mv clang-r450784d/* "$TC_DIR/" 2>/dev/null || cp -a clang-r450784d/. "$TC_DIR/"
+            cd /tmp && rm -rf aosp-clang
           fi
 
-          mv clang-r450784d "$TC_DIR"
-          cd / && rm -rf /tmp/aosp-clang /tmp/aosp-clang-work
+          # Verify final layout
+          if [ ! -x "$TC_DIR/bin/clang" ]; then
+            FOUND=$(find "$TC_DIR" -maxdepth 4 -name clang -type f -executable 2>/dev/null | head -n 1 || true)
+            if [ -n "$FOUND" ]; then
+              REAL_DIR=$(dirname "$(dirname "$FOUND")")
+              echo "==> Clang at $FOUND, restructuring..."
+              tmpdir=$(mktemp -d)
+              mv "$REAL_DIR"/* "$tmpdir/"
+              rm -rf "$TC_DIR"
+              mv "$tmpdir" "$TC_DIR"
+            fi
+          fi
 
-          if [ ! -x "$TC_DIR/bin/clang" ] || [ ! -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "::error::Toolchain incomplete"
-            ls -la "$TC_DIR/bin" | head -n 30
+          if [ ! -x "$TC_DIR/bin/clang" ]; then
+            echo "::error::clang missing after setup"
+            find "$TC_DIR" -maxdepth 3 -type d | head -n 30
+            exit 1
+          fi
+          if [ ! -x "$TC_DIR/bin/ld.lld" ]; then
+            echo "::error::ld.lld missing after setup"
+            ls -la "$TC_DIR/bin" | head -n 50
             exit 1
           fi
 
           "$TC_DIR/bin/clang" --version
           "$TC_DIR/bin/ld.lld" --version
-          echo "==> Toolchain ready at $TC_DIR"    
+          echo "==> Toolchain ready at $TC_DIR"
 
       - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
