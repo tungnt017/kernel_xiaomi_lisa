@@ -27,7 +27,7 @@ on:
       manual_hook_script:
         description: "Existing manual hook script path"
         required: true
-        default: ".github/scripts/apply_sukisu_manual_hooks.py"
+        default: ".github/scripts/apply_resukisu_manual_hooks_1_fixed.py"
       jobs:
         description: "Parallel build jobs. Leave as $(nproc) for auto"
         required: true
