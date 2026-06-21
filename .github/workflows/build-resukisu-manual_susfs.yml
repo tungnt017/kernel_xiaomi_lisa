@@ -165,6 +165,15 @@ jobs:
                   print(f'[OK] copied optional {src} -> {dst}')
           print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is not copied, checked, applied, or used.')
           PY
+      
+      - name: Apply official SUSFS phase 1 lisa port
+        run: |
+          set -euo pipefail
+          if [ ! -f .github/scripts/port_susfs_lisa_phase1.py ]; then
+            echo "ERROR: .github/scripts/port_susfs_lisa_phase1.py missing" | tee logs/port-susfs-phase1.log
+            exit 1
+          fi
+          python3 .github/scripts/port_susfs_lisa_phase1.py 2>&1 | tee logs/port-susfs-phase1.log
 
       - name: Official SUSFS pre-compile check with context export
         run: |
