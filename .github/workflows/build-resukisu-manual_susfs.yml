@@ -1,4 +1,4 @@
-name: ReSukiSU Manual SUSFS Phase2B Full Debug
+name: ReSukiSU Manual SUSFS Phase2B SysRead Full Debug
 'on':
   workflow_dispatch:
     inputs:
@@ -168,7 +168,7 @@ jobs:
         text=read('fs/namespace.c')
         if '#include <linux/susfs_def.h>' not in text:
             text=after(text,'#include <linux/shmem_fs.h>\n','#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n','#include <linux/susfs_def.h>')
-        helper="\n\n#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\nextern void susfs_try_umount_all(uid_t uid);\nvoid susfs_run_try_umount_for_current_mnt_ns(void)\n{\n\tsusfs_try_umount_all(current_uid().val);\n}\n#endif\n\n#ifdef CONFIG_KSU_SUSFS\nbool susfs_is_mnt_devname_ksu(struct path *path)\n{\n\tstruct mount *mnt;\n\tif (!path || !path->mnt)\n\t\treturn false;\n\tmnt = real_mount(path->mnt);\n\treturn mnt && mnt->mnt_devname && !strcmp(mnt->mnt_devname, \"KSU\");\n}\n#endif\n\nstatic const bool susfs_phase2b_compile_probe_marker_namespace = true;\n"
+        helper = "\n\n#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\nextern void susfs_try_umount_all(uid_t uid);\nvoid susfs_run_try_umount_for_current_mnt_ns(void)\n{\n\tsusfs_try_umount_all(current_uid().val);\n}\n#endif\n\n#ifdef CONFIG_KSU_SUSFS\nbool susfs_is_mnt_devname_ksu(struct path *path)\n{\n\tstruct mount *mnt;\n\tif (!path || !path->mnt)\n\t\treturn false;\n\tmnt = real_mount(path->mnt);\n\treturn mnt && mnt->mnt_devname && !strcmp(mnt->mnt_devname, \"KSU\");\n}\n#endif\n\nstatic const bool susfs_phase2b_compile_probe_marker_namespace = true;\n"
         if 'susfs_phase2b_compile_probe_marker_namespace' not in text:
             text=text.rstrip()+helper+'\n'
         write('fs/namespace.c',text)
@@ -228,65 +228,35 @@ jobs:
             print('[SKIP] ksu_handle_setresuid already present in kernel/sys.c')
 
         PY
-
     - name: Patch missing ReSukiSU sys_read hook
       run: |
         set -euo pipefail
         python3 - <<'PY' 2>&1 | tee logs/patch-sys-read-hook.log
         from pathlib import Path
-
-        p = Path("fs/read_write.c")
-        if not p.exists():
-            raise SystemExit("[ERROR] missing fs/read_write.c")
-
-        text = p.read_text(errors="ignore")
-
-        proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
-        __attribute__((hot))
-        extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-        #endif
-
-
-
-        call = """#ifdef CONFIG_KSU_MANUAL_HOOK
-        \tksu_handle_sys_read(fd, &buf, &count);
-        #endif
-
-        if "ksu_handle_sys_read" not in text:
-            marker = "SYSCALL_DEFINE3(read"
-            pos = text.find(marker)
-            if pos < 0:
-                raise SystemExit("[ERROR] SYSCALL_DEFINE3(read...) not found in fs/read_write.c")
-
-            text = text[:pos] + proto + text[pos:]
-
-            pos = text.find(marker)
-            body = text.find("{", pos)
-            if body < 0:
-                raise SystemExit("[ERROR] read syscall function body not found")
-
-            anchors = [
-                "\tstruct fd f = fdget_pos(fd);",
-                "\tstruct fd f = fdget(fd);",
-                "\tssize_t ret = -EBADF;",
-            ]
-
-            insert_at = -1
-            for anchor in anchors:
-                insert_at = text.find(anchor, body)
-                if insert_at >= 0:
-                    break
-
-            if insert_at < 0:
-                raise SystemExit("[ERROR] safe insertion anchor not found in sys_read")
-
-            text = text[:insert_at] + call + text[insert_at:]
+        p=Path('fs/read_write.c')
+        if not p.exists(): raise SystemExit('[ERROR] missing fs/read_write.c')
+        text=p.read_text(errors='ignore')
+        proto = '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n'
+        call = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n'
+        if 'ksu_handle_sys_read' not in text:
+            marker='SYSCALL_DEFINE3(read'
+            pos=text.find(marker)
+            if pos<0: raise SystemExit('[ERROR] SYSCALL_DEFINE3(read...) not found in fs/read_write.c')
+            text=text[:pos]+proto+text[pos:]
+            pos=text.find(marker); body=text.find('{',pos)
+            anchors=['\tstruct fd f = fdget_pos(fd);','\tstruct fd f = fdget(fd);','\tssize_t ret = -EBADF;']
+            insert_at=-1
+            for a in anchors:
+                insert_at=text.find(a,body)
+                if insert_at>=0: break
+            if insert_at<0: raise SystemExit('[ERROR] safe insertion anchor not found in sys_read')
+            text=text[:insert_at]+call+text[insert_at:]
             p.write_text(text)
-            print("[OK] patched fs/read_write.c with ksu_handle_sys_read hook")
+            print('[OK] patched fs/read_write.c with ksu_handle_sys_read hook')
         else:
-            print("[SKIP] ksu_handle_sys_read already present in fs/read_write.c")
+            print('[SKIP] ksu_handle_sys_read already present in fs/read_write.c')
+
         PY
-        
     - name: Enable ReSukiSU + SUSFS configs
       run: |
         set -euo pipefail
@@ -342,7 +312,7 @@ jobs:
         if not log.exists(): out.write_text('[MISSING] logs/build.log\n'); raise SystemExit(0)
         lines=log.read_text(errors='ignore').splitlines(); hits=[i for i,l in enumerate(lines) if pat.search(l)]
         ranges=[]
-        for idx in hits[:80]:
+        for idx in hits[:100]:
             s=max(0,idx-100); e=min(len(lines),idx+101)
             if ranges and s<=ranges[-1][1]: ranges[-1]=(ranges[-1][0], max(ranges[-1][1], e))
             else: ranges.append((s,e))
@@ -358,8 +328,8 @@ jobs:
         set +e
         SUMMARY="logs/debug-summary.log"; : > "$SUMMARY"
         add(){ title="$1"; file="$2"; { echo; echo "================================================================"; echo "===== $title"; echo "===== file: $file"; echo "================================================================"; [ -f "$file" ] && cat "$file" || echo "[MISSING] $file"; } >> "$SUMMARY"; }
-        { echo "ReSukiSU SUSFS Phase2B full debug summary"; echo "Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; } >> "$SUMMARY"
-        for pair in "environment logs/environment.log" "ReSukiSU_setup logs/resukisu-setup.log" "SUSFS_tree logs/susfs-tree.log" "copy_SUSFS logs/copy-susfs-files.log" "manual_ports logs/port-susfs-compile-probe.log" "verify_ports logs/verify-susfs-manual-ports.log" "manual_hooks logs/apply-manual-hooks.log" "setresuid_hook logs/patch-setresuid-hook.log" "sys_read hook logs/patch-sys-read-hook.log" "configure logs/configure.log" "kernel_config logs/kernel-config-ksu-susfs.log" "build_errors logs/build-errors.log" "build_error_context logs/build-error-context.log" "build_head logs/build-head.log" "build_tail logs/build-tail.log"; do
+        { echo "ReSukiSU SUSFS Phase2B sys_read debug summary"; echo "Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; } >> "$SUMMARY"
+        for pair in "environment logs/environment.log" "ReSukiSU_setup logs/resukisu-setup.log" "SUSFS_tree logs/susfs-tree.log" "copy_SUSFS logs/copy-susfs-files.log" "manual_ports logs/port-susfs-compile-probe.log" "verify_ports logs/verify-susfs-manual-ports.log" "manual_hooks logs/apply-manual-hooks.log" "setresuid_hook logs/patch-setresuid-hook.log" "sys_read_hook logs/patch-sys-read-hook.log" "configure logs/configure.log" "kernel_config logs/kernel-config-ksu-susfs.log" "build_errors logs/build-errors.log" "build_error_context logs/build-error-context.log" "build_head logs/build-head.log" "build_tail logs/build-tail.log"; do
           title="${pair%% *}"; file="${pair#* }"; add "$title" "$file"
         done
         { echo; echo "===== reject files ====="; find . -name '*.rej' -type f | sort; } >> "$SUMMARY"
@@ -373,7 +343,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: full-debug-logs-resukisu-phase2b-${{ github.run_number }}
+        name: full-debug-logs-resukisu-phase2b-sysread-${{ github.run_number }}
         path: |
           logs/**
           out/.config
@@ -382,6 +352,6 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-artifacts-resukisu-phase2b-${{ github.run_number }}
+        name: kernel-artifacts-resukisu-phase2b-sysread-${{ github.run_number }}
         path: artifacts/**
         if-no-files-found: warn
