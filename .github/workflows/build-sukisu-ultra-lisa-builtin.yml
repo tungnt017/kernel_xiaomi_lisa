@@ -280,6 +280,55 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Setup AOSP Clang r450784d (from official prebuilts repo)
+        run: |
+          set -euo pipefail
+          TC_DIR="$HOME/tc/clang-r450784d"
+          if [ -x "$TC_DIR/bin/clang" ] && [ -x "$TC_DIR/bin/ld.lld" ]; then
+            echo "==> Toolchain already present"
+            "$TC_DIR/bin/clang" --version
+            exit 0
+          fi
+
+          mkdir -p "$HOME/tc"
+          cd /tmp
+
+          # Use sparse-checkout to only fetch the specific version dir
+          rm -rf aosp-clang
+          git init --bare aosp-clang
+          cd aosp-clang
+          git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          git config remote.origin.partialclonefilter blob:none
+          git fetch --depth=1 origin master
+
+          cd /tmp
+          rm -rf aosp-clang-work
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            aosp-clang-work
+          cd aosp-clang-work
+          git sparse-checkout set clang-r450784d
+          git checkout
+
+          if [ ! -d clang-r450784d ]; then
+            echo "::error::clang-r450784d not found in AOSP prebuilts"
+            ls -la
+            exit 1
+          fi
+
+          mv clang-r450784d "$TC_DIR"
+          cd / && rm -rf /tmp/aosp-clang /tmp/aosp-clang-work
+
+          if [ ! -x "$TC_DIR/bin/clang" ] || [ ! -x "$TC_DIR/bin/ld.lld" ]; then
+            echo "::error::Toolchain incomplete"
+            ls -la "$TC_DIR/bin" | head -n 30
+            exit 1
+          fi
+
+          "$TC_DIR/bin/clang" --version
+          "$TC_DIR/bin/ld.lld" --version
+          echo "==> Toolchain ready at $TC_DIR"    
+
       - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
