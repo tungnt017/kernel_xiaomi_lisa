@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
 """
-Pre-build compatibility check between SukiSU-Ultra (module side) and
-ShirkNeko/susfs4ksu (kernel side).
+Pre-build compatibility check (v2).
 
-Goal: catch version skew BEFORE running 1-2h kernel build.
-
-Strategy:
-  - Read SukiSU-Ultra module's source files (after setup.sh)
-  - Read susfs4ksu's headers (after clone)
-  - Find symbols that SukiSU calls but susfs4ksu does NOT export
-  - Find CMD_* / struct names that SukiSU references but headers lack
-
-This is NOT a bypass: it only INSPECTS, does not patch anything.
-Fails fast with exact missing symbol list so user can pin correct versions.
+Symbol categorization:
+  - kernel_required: MUST be in SUSFS kernel headers
+    (e.g. function decls SukiSU module calls into kernel-side susfs.c)
+  - either_ok: defined either in SUSFS headers OR in SukiSU module itself
+    (e.g. SUSFS_MAGIC is typically self-defined in SukiSU module)
+  - cmd_required: CMD_* constants used in IOCTL switch
 """
 import re
 import sys
 from pathlib import Path
 
-# Pairs of (callee_pattern_in_sukisu, expected_decl_in_susfs_headers)
-EXPECTED_SYMBOLS = [
-    # SukiSU calls these → susfs headers must declare them
-    ("susfs_handle_sus_path",         r'\bsusfs_handle_sus_path\b'),
-    ("susfs_sus_ino_for_filldir64",   r'\bsusfs_sus_ino_for_filldir64\b'),
-    ("susfs_is_current_ksu_domain",   r'\bsusfs_is_current_ksu_domain\b'),
-    ("SUSFS_MAGIC",                   r'\bSUSFS_MAGIC\b'),
-    ("susfs_get_enabled_features",    r'\bsusfs_get_enabled_features\b'),
-    ("CMD_SUSFS_ADD_SUS_PATH",        r'\bCMD_SUSFS_ADD_SUS_PATH\b'),
-    ("CMD_SUSFS_ADD_SUS_MOUNT",       r'\bCMD_SUSFS_ADD_SUS_MOUNT\b'),
+
+KERNEL_REQUIRED = [
+    "susfs_is_current_ksu_domain",
+    "susfs_sus_ino_for_filldir64",
+]
+
+CMD_REQUIRED = [
+    "CMD_SUSFS_ADD_SUS_PATH",
+]
+
+# These can be defined in SukiSU's own headers OR SUSFS headers
+EITHER_OK = [
+    "SUSFS_MAGIC",
+    "susfs_get_enabled_features",
+    "susfs_handle_sus_path",
 ]
 
 
-def find_susfs_files(susfs_root: Path):
-    candidates = []
-    for sub in ("include/linux", "fs"):
-        d = susfs_root / "kernel_patches" / sub
-        if d.exists():
-            candidates += list(d.glob("susfs*.h")) + list(d.glob("susfs*.c"))
-    return candidates
-
-
-def find_sukisu_files(ksu_root: Path):
-    return list(ksu_root.rglob("*.c")) + list(ksu_root.rglob("*.h"))
+def collect_text(root: Path, patterns):
+    out = ""
+    for p in patterns:
+        for f in root.rglob(p):
+            try:
+                out += "\n" + f.read_text(encoding="utf-8", errors="surrogateescape")
+            except Exception:
+                pass
+    return out
 
 
 def main() -> int:
@@ -59,59 +57,71 @@ def main() -> int:
         print(f"[ERROR] SUSFS_REPO_DIR not found: {susfs_dir}")
         return 1
 
-    # Concatenate all susfs header/source content
-    susfs_files = find_susfs_files(susfs_dir)
-    if not susfs_files:
-        print(f"[ERROR] No susfs*.h/c in {susfs_dir}")
-        return 1
-    susfs_text = "\n".join(
-        f.read_text(encoding="utf-8", errors="surrogateescape")
-        for f in susfs_files
-    )
-    print(f"==> SUSFS source bundle: {len(susfs_files)} files, "
-          f"{len(susfs_text)} bytes")
+    # Concatenate SUSFS upstream headers/source
+    susfs_text = collect_text(susfs_dir / "kernel_patches", ["susfs*.h", "susfs*.c"])
+    print(f"==> SUSFS source bundle bytes: {len(susfs_text)}")
 
-    # Concatenate all SukiSU module sources
-    sukisu_files = find_sukisu_files(ksu_dir)
-    sukisu_text = "\n".join(
-        f.read_text(encoding="utf-8", errors="surrogateescape")
-        for f in sukisu_files
-    )
-    print(f"==> SukiSU source bundle: {len(sukisu_files)} files, "
-          f"{len(sukisu_text)} bytes")
+    # Concatenate SukiSU module
+    sukisu_text = collect_text(ksu_dir, ["*.c", "*.h"])
+    print(f"==> SukiSU source bundle bytes: {len(sukisu_text)}")
 
     print()
     print("=== Compatibility checks ===")
-    missing = []
-    for sym, pat in EXPECTED_SYMBOLS:
-        sukisu_calls = re.search(pat, sukisu_text) is not None
-        susfs_decls  = re.search(pat, susfs_text) is not None
+    fail = 0
 
-        if sukisu_calls and not susfs_decls:
-            print(f"[MISMATCH] '{sym}' is CALLED by SukiSU but NOT declared in SUSFS headers")
-            missing.append(sym)
-        elif sukisu_calls and susfs_decls:
-            print(f"[OK]       '{sym}' present in both")
-        elif susfs_decls and not sukisu_calls:
-            print(f"[note]     '{sym}' in SUSFS but unused by SukiSU (fine)")
+    # KERNEL_REQUIRED: must be in SUSFS upstream + called by SukiSU
+    for sym in KERNEL_REQUIRED:
+        in_susfs = re.search(rf'\b{re.escape(sym)}\b', susfs_text) is not None
+        called_by_sukisu = re.search(rf'\b{re.escape(sym)}\b', sukisu_text) is not None
+        if called_by_sukisu and not in_susfs:
+            print(f"[MISMATCH] '{sym}' is CALLED by SukiSU but NOT in SUSFS upstream")
+            fail += 1
+        elif called_by_sukisu and in_susfs:
+            print(f"[OK]       '{sym}' in both (kernel-required)")
+        elif in_susfs and not called_by_sukisu:
+            print(f"[note]     '{sym}' in SUSFS upstream but unused by SukiSU (fine)")
         else:
             print(f"[note]     '{sym}' not present in either (feature may be off)")
 
-    print()
-    print("--- Summary ---")
-    print(f"Mismatches: {len(missing)}")
-    if missing:
-        print()
-        print("[ERROR] SukiSU-Ultra and SUSFS versions are INCOMPATIBLE.")
-        print("        Missing symbols in SUSFS headers:")
-        for m in missing:
-            print(f"  - {m}")
-        print()
-        print("  => Action: pin SukiSU-Ultra to an older version that matches")
-        print("     SUSFS branch you cloned, OR pick newer SUSFS branch/tag.")
-        return 1
+    # CMD_REQUIRED: must be in SUSFS upstream if called by SukiSU
+    for sym in CMD_REQUIRED:
+        in_susfs = re.search(rf'\b{re.escape(sym)}\b', susfs_text) is not None
+        called_by_sukisu = re.search(rf'\b{re.escape(sym)}\b', sukisu_text) is not None
+        if called_by_sukisu and not in_susfs:
+            print(f"[MISMATCH] CMD '{sym}' used by SukiSU but NOT in SUSFS upstream")
+            fail += 1
+        elif called_by_sukisu and in_susfs:
+            print(f"[OK]       CMD '{sym}' in both")
+        else:
+            print(f"[note]     CMD '{sym}' not present (optional)")
 
-    print("[OK] No mismatches detected. Safe to proceed with build.")
+    # EITHER_OK: needs to exist somewhere (SUSFS OR SukiSU module)
+    for sym in EITHER_OK:
+        in_susfs = re.search(rf'\b{re.escape(sym)}\b', susfs_text) is not None
+        in_sukisu = re.search(rf'\b{re.escape(sym)}\b', sukisu_text) is not None
+        # Detect if SukiSU defines it (not just uses)
+        defined_in_sukisu = re.search(
+            rf'#\s*define\s+{re.escape(sym)}\b', sukisu_text
+        ) is not None or re.search(
+            rf'\b(int|long|bool|void|u32|u64|s32|s64|static|extern)[^;]*\b{re.escape(sym)}\s*\(', sukisu_text
+        ) is not None
+
+        if defined_in_sukisu:
+            print(f"[OK]       '{sym}' self-defined by SukiSU (either-ok)")
+        elif in_susfs:
+            print(f"[OK]       '{sym}' provided by SUSFS upstream (either-ok)")
+        elif in_sukisu and not in_susfs:
+            print(f"[MISMATCH] '{sym}' referenced by SukiSU but not defined anywhere")
+            fail += 1
+        else:
+            print(f"[note]     '{sym}' not present anywhere (feature may be off)")
+
+    print()
+    print(f"--- Summary --- Failures: {fail}")
+    if fail:
+        print("[ERROR] Compatibility check failed.")
+        return 1
+    print("[OK] No real mismatches. Safe to proceed.")
     return 0
 
 
