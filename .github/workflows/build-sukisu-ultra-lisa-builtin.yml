@@ -38,15 +38,12 @@ env:
 
 jobs:
   build:
-    name: Build (${{ github.event.inputs.sukisu_mode || 'builtin' }})
+    name: Build kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
     steps:
-      # ────────────────────────────────────────────────
-      # 0. Checkout
-      # ────────────────────────────────────────────────
-      - name: Checkout workflow repo (scripts)
+      - name: Checkout workflow repo scripts
         uses: actions/checkout@v4
         with:
           path: workflow-repo
@@ -68,9 +65,6 @@ jobs:
           cp -v workflow-repo/.github/scripts/fix_rmnet_ipa_enum_cast.py \
                 "$KERNEL_DIR/.github/scripts/"
 
-      # ────────────────────────────────────────────────
-      # 1. Minimal build deps
-      # ────────────────────────────────────────────────
       - name: Install minimal build deps
         run: |
           sudo apt-get update
@@ -79,10 +73,7 @@ jobs:
             libssl-dev libelf-dev zip unzip python3 python3-pip \
             cpio rsync kmod patch python2
 
-      # ────────────────────────────────────────────────
-      # 2. SukiSU-Ultra builtin (module-side SUSFS caller)
-      # ────────────────────────────────────────────────
-      - name: Integrate SukiSU-Ultra (builtin)
+      - name: Integrate SukiSU-Ultra builtin
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -99,7 +90,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify SukiSU module-side has SUSFS callers (fail-fast)
+      - name: Verify SukiSU module-side has SUSFS callers
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -114,10 +105,7 @@ jobs:
           fi
           echo "OK - SukiSU module-side caller xac nhan."
 
-      # ────────────────────────────────────────────────
-      # 2b. SUSFS kernel-side (ShirkNeko/susfs4ksu)
-      # ────────────────────────────────────────────────
-      - name: Clone ShirkNeko/susfs4ksu (${{ env.SUSFS_BRANCH }})
+      - name: Clone ShirkNeko susfs4ksu
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -128,7 +116,7 @@ jobs:
           ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
           ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
 
-      - name: Apply SUSFS to kernel tree (official, fail-fast)
+      - name: Apply SUSFS to kernel tree
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -149,7 +137,7 @@ jobs:
           echo "==> Apply $PATCH"
 
           if ! patch -p1 --dry-run -i "$PATCH" >/tmp/susfs_dryrun.log 2>&1; then
-            echo "::error::Dry-run patch FAILED — KHONG bypass"
+            echo "::error::Dry-run patch FAILED"
             cat /tmp/susfs_dryrun.log
             exit 1
           fi
@@ -162,7 +150,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify SUSFS kernel-side integrated (fail-fast)
+      - name: Verify SUSFS kernel-side integrated
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -181,12 +169,11 @@ jobs:
             echo "::error::Kernel-side SUSFS reference qua thap ($REF < 30)"
             FAIL=1
           fi
-          [ "$FAIL" -ne 0 ] && exit 1
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
           echo "ALL SUSFS kernel-side checks PASSED."
 
-      # ────────────────────────────────────────────────
-      # 3. Enable SUSFS options in defconfig
-      # ────────────────────────────────────────────────
       - name: Enable SUSFS configs in defconfig
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -214,7 +201,8 @@ jobs:
             CONFIG_KSU_SUSFS_ENABLE_LOG
             CONFIG_KSU_MANUAL_HOOK
           )
-          ADDED=0; SKIP=0
+          ADDED=0
+          SKIP=0
           for cfg in "${WANTED[@]}"; do
             sym="${cfg#CONFIG_}"
             if grep -RqE "^[[:space:]]*config[[:space:]]+${sym}\b" "$KSU_DIR"; then
@@ -222,17 +210,17 @@ jobs:
               echo "${cfg}=y" >> "$DC"
               ADDED=$((ADDED+1))
             else
-              echo "::notice::Skip $cfg (Kconfig khong dinh nghia)"
+              echo "::notice::Skip $cfg"
               SKIP=$((SKIP+1))
             fi
           done
           echo "Added=$ADDED Skipped=$SKIP"
-          [ "$ADDED" -ge 5 ] || { echo "::error::Qua it config enable ($ADDED < 5)"; exit 1; }
+          if [ "$ADDED" -lt 5 ]; then
+            echo "::error::Qua it config enable ($ADDED < 5)"
+            exit 1
+          fi
           tail -n 40 "$DC"
 
-      # ────────────────────────────────────────────────
-      # 4. Manual hooks (non-GKI 5.4)
-      # ────────────────────────────────────────────────
       - name: Apply manual hooks
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -245,7 +233,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify manual hooks were applied (fail-fast)
+      - name: Verify manual hooks were applied
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -255,7 +243,8 @@ jobs:
             "fs/open.c:ksu_handle_faccessat" \
             "fs/stat.c:ksu_handle_stat" \
             "kernel/reboot.c:ksu_handle_sys_reboot"; do
-            f="${pair%%:*}"; sym="${pair##*:}"
+            f="${pair%%:*}"
+            sym="${pair##*:}"
             if grep -q "$sym" "$f"; then
               echo "OK  $f  has $sym"
             else
@@ -265,11 +254,16 @@ jobs:
           done
           MH=$(grep -RnE "CONFIG_KSU_MANUAL_HOOK" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | wc -l || echo 0)
           echo "CONFIG_KSU_MANUAL_HOOK markers: $MH"
-          [ "$MH" -ge 4 ] || { echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"; FAIL=1; }
-          [ "$FAIL" -ne 0 ] && exit 1
+          if [ "$MH" -lt 4 ]; then
+            echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
           echo "ALL manual hooks verified."
 
-      - name: Upload manual hook backup (always)
+      - name: Upload manual hook backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -278,10 +272,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ────────────────────────────────────────────────
-      # 4b. Official source fix (explicit enum cast)
-      # ────────────────────────────────────────────────
-      - name: Fix rmnet_ipa enum-conversion (-Werror)
+      - name: Fix rmnet_ipa enum-conversion
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -292,22 +283,20 @@ jobs:
             exit 1
           fi
 
-      # ────────────────────────────────────────────────
-      # 5. Build kernel via ./build.sh
-      # ────────────────────────────────────────────────
-      - name: Build kernel via ./build.sh
+      - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          [ -f "./build.sh" ] || { echo "::error::Khong tim thay ./build.sh"; ls -la; exit 1; }
+          if [ ! -f "./build.sh" ]; then
+            echo "::error::Khong tim thay ./build.sh"
+            ls -la
+            exit 1
+          fi
           chmod +x ./build.sh
           echo "==> Running ./build.sh ..."
           ./build.sh 2>&1 | tee /tmp/build.log
 
-      # ────────────────────────────────────────────────
-      # 6. Logs + artifacts
-      # ────────────────────────────────────────────────
-      - name: Upload build logs (always)
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -321,4 +310,16 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Up
+      - name: Upload kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: |
+            ${{ env.KERNEL_DIR }}/*.zip
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/yupik.dtb
+            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/vendor/qcom/lisa-sm7325-overlay.dtbo
+          if-no-files-found: warn
+          retention-days: 14
