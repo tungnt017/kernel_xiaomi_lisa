@@ -37,7 +37,7 @@ on:
       required_symbols:
         description: "Symbols that MUST be present (comma-separated)"
         required: true
-        default: "SUSFS_MAGIC,susfs_get_enabled_features"
+        default: "susfs_get_enabled_features"
 
 permissions:
   contents: read
