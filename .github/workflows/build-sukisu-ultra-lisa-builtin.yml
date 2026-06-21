@@ -124,7 +124,6 @@ jobs:
           if [ -f "$SRC/include/linux/susfs_def.h" ]; then
             cp -v "$SRC/include/linux/susfs_def.h" include/linux/
           fi
-          # Ensure fs/Makefile builds susfs.o
           if ! grep -qE 'susfs\.o' fs/Makefile; then
             echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
             echo "==> Added susfs.o to fs/Makefile"
@@ -158,7 +157,10 @@ jobs:
             echo "::error::fs/readdir.c missing filldir hook"
             FAIL=1
           fi
-          MARKS=$(grep -cE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c || echo 0)
+          MARKS=0
+          if grep -qE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c; then
+            MARKS=$(grep -cE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c)
+          fi
           echo "Filldir hook markers in readdir.c: $MARKS"
           if [ "$MARKS" -lt 2 ]; then
             echo "::error::Quá ít filldir hooks ($MARKS < 2)"
