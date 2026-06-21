@@ -1,4 +1,4 @@
-name: Daily ReSukiSU Manual SUSFS Official
+name: ReSukiSU Manual SUSFS Official
 
 on:
   workflow_dispatch:
@@ -24,9 +24,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    # Daily at 02:30 UTC / 09:30 GMT+7
-    - cron: "30 2 * * *"
 
 permissions:
   contents: read
@@ -165,17 +162,90 @@ jobs:
                   print(f'[OK] copied optional {src} -> {dst}')
           print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is not copied, checked, applied, or used.')
           PY
-      
+
+      - name: Create official SUSFS phase 1 port script
+        run: |
+          set -euo pipefail
+          mkdir -p .github/scripts
+          cat > .github/scripts/port_susfs_lisa_phase1.py <<'PY'
+          #!/usr/bin/env python3
+          from pathlib import Path
+          import sys
+          ROOT = Path.cwd()
+          class PortError(RuntimeError): pass
+          def read(rel):
+              p = ROOT / rel
+              if not p.exists(): raise PortError(f"missing required file: {rel}")
+              return p.read_text(errors="ignore")
+          def write(rel, text):
+              (ROOT / rel).write_text(text); print(f"[OK] updated {rel}")
+          def require(cond, msg):
+              if not cond: raise PortError(msg)
+          def insert_after_once(text, anchor, insertion, marker):
+              if marker in text: return text, False
+              idx = text.find(anchor); require(idx != -1, f"anchor not found: {anchor[:120]!r}")
+              idx += len(anchor); return text[:idx] + insertion + text[idx:], True
+          def insert_before_once(text, anchor, insertion, marker):
+              if marker in text: return text, False
+              idx = text.find(anchor); require(idx != -1, f"anchor not found: {anchor[:120]!r}")
+              return text[:idx] + insertion + text[idx:], True
+          def replace_once(text, old, new, marker):
+              if marker in text: return text, False
+              require(old in text, f"target block not found for marker {marker}")
+              return text.replace(old, new, 1), True
+          def patch_fs_makefile():
+              rel='fs/Makefile'; text=read(rel); marker='obj-$(CONFIG_KSU_SUSFS) += susfs.o'
+              if marker in text: print(f'[SKIP] {rel}: SUSFS object already present'); return
+              anchor='\t\tfs_types.o fs_context.o fs_parser.o fsopen.o\n'
+              text,_=insert_after_once(text, anchor, '\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n', marker); write(rel,text)
+          def patch_task_mmu():
+              rel='fs/proc/task_mmu.c'; text=read(rel)
+              if '#include <linux/susfs_def.h>' not in text:
+                  for anchor in ['#include <linux/ctype.h>\n', '#include <linux/mm_inline.h>\n']:
+                      if anchor in text:
+                          text,_=insert_after_once(text, anchor, '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', '#include <linux/susfs_def.h>'); break
+                  else: raise PortError(f'{rel}: no include anchor found')
+              if 'susfs_sus_ino_for_show_map_vma' not in text:
+                  proto='#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nextern void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned long *out_ino);\n#endif\n\n'
+                  text,_=insert_before_once(text,'static void\nshow_map_vma',proto,'susfs_sus_ino_for_show_map_vma')
+              marker='SUSFS: spoof map VMA inode/dev for SUS_KSTAT'
+              if marker not in text:
+                  old='\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+                  new='\tif (file) {\n\t\tstruct inode *inode = file_inode(vma->vm_file);\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t\t/* SUSFS: spoof map VMA inode/dev for SUS_KSTAT */\n\t\tif (unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tsusfs_sus_ino_for_show_map_vma(inode->i_ino, &dev, &ino);\n\t\t\tgoto susfs_skip_orig_map_vma_stat;\n\t\t}\n#endif\n\t\tdev = inode->i_sb->s_dev;\n\t\tino = inode->i_ino;\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nsusfs_skip_orig_map_vma_stat:\n#endif\n\t\tpgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;\n\t}\n'
+                  text,_=replace_once(text,old,new,marker)
+              write(rel,text)
+          def patch_fdinfo():
+              rel='fs/notify/fdinfo.c'; text=read(rel)
+              if '#include <linux/susfs_def.h>' not in text:
+                  text,_=insert_after_once(text,'#include <linux/exportfs.h>\n','#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif\n','#include <linux/susfs_def.h>')
+              if 'susfs_is_current_non_root_user_app_proc' not in text:
+                  text,_=insert_after_once(text,'#include "fsnotify.h"\n','#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_non_root_user_app_proc(void);\n#endif\n','susfs_is_current_non_root_user_app_proc')
+              old_sig='static void show_fdinfo(struct seq_file *m, struct file *f,\n\t\t\tvoid (*show)(struct seq_file *m,\n\t\t\t\t     struct fsnotify_mark *mark))\n'
+              new_sig='#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void show_fdinfo(struct seq_file *m, struct file *f,\n\t\t\tvoid (*show)(struct seq_file *m,\n\t\t\t\t     struct fsnotify_mark *mark,\n\t\t\t\t     struct file *file))\n#else\nstatic void show_fdinfo(struct seq_file *m, struct file *f,\n\t\t\tvoid (*show)(struct seq_file *m,\n\t\t\t\t     struct fsnotify_mark *mark))\n#endif\n'
+              text,_=replace_once(text,old_sig,new_sig,'struct file *file))')
+              text,_=replace_once(text,'\t\tshow(m, mark);\n','#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tshow(m, mark, f);\n#else\n\t\tshow(m, mark);\n#endif\n','show(m, mark, f)')
+              old_i='static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n'
+              new_i='#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n'
+              text,_=replace_once(text,old_i,new_i,'inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)')
+              marker='SUSFS: show original inode information for SUS_KSTAT fdinfo'
+              if marker not in text:
+                  anchor='\tinode = igrab(fsnotify_conn_inode(mark->connector));\n\tif (inode) {\n'
+                  ins='#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\t/* SUSFS: show original inode information for SUS_KSTAT fdinfo */\n\t\tif (likely(susfs_is_current_non_root_user_app_proc()) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tif (!pathname)\n\t\t\t\tgoto susfs_orig_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (IS_ERR(dpath))\n\t\t\t\tgoto susfs_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto susfs_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   inotify_mark_user_mask(mark));\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nsusfs_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nsusfs_orig_seq_printf:\n#endif\n'
+                  text,_=insert_after_once(text,anchor,ins,marker)
+              write(rel,text)
+          try:
+              patch_fs_makefile(); patch_task_mmu(); patch_fdinfo()
+          except PortError as e:
+              print(f'[ERROR] {e}', file=sys.stderr); sys.exit(1)
+          print('[OK] Phase 1 SUSFS port completed')
+          PY
+
       - name: Apply official SUSFS phase 1 lisa port
         run: |
           set -euo pipefail
-          if [ ! -f .github/scripts/port_susfs_lisa_phase1.py ]; then
-            echo "ERROR: .github/scripts/port_susfs_lisa_phase1.py missing" | tee logs/port-susfs-phase1.log
-            exit 1
-          fi
           python3 .github/scripts/port_susfs_lisa_phase1.py 2>&1 | tee logs/port-susfs-phase1.log
 
-      - name: Official SUSFS pre-compile check with context export
+      - name: Official SUSFS pre-compile check with phase1 filtered context export
         run: |
           set +e
           mkdir -p logs/debug
@@ -184,97 +254,88 @@ jobs:
           import subprocess, re
           root = Path.cwd()
           sus = root / 'susfs-src' / 'kernel_patches'
-          patch = sus / '50_add_susfs_in_kernel-5.4.patch'
+          original_patch = sus / '50_add_susfs_in_kernel-5.4.patch'
+          patch = root / 'logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase1.patch'
           failures = []
-
-          def write(path, data):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(data, errors='ignore')
-
+          PHASE1_FILES = {'fs/Makefile','fs/proc/task_mmu.c','fs/notify/fdinfo.c'}
+          def write(path, data): path.parent.mkdir(parents=True, exist_ok=True); path.write_text(data, errors='ignore')
           def source_context(path, center, radius=70):
-              f = root / path
-              out = [f'===== SOURCE CONTEXT: {path} =====']
-              if not f.exists():
-                  out.append(f'[MISSING] {path}')
-                  return '\n'.join(out) + '\n'
-              lines = f.read_text(errors='ignore').splitlines()
-              start = max(1, center - radius)
-              end = min(len(lines), center + radius)
+              f=root/path; out=[f'===== SOURCE CONTEXT: {path} =====']
+              if not f.exists(): out.append(f'[MISSING] {path}'); return '\n'.join(out)+'\n'
+              lines=f.read_text(errors='ignore').splitlines(); start=max(1,center-radius); end=min(len(lines),center+radius)
               out.append(f'lines {start}-{end} of {len(lines)}')
-              for i in range(start, end + 1):
-                  out.append(f'{i:05d}: {lines[i-1]}')
-              return '\n'.join(out) + '\n'
-
+              for i in range(start,end+1): out.append(f'{i:05d}: {lines[i-1]}')
+              return '\n'.join(out)+'\n'
+          def verify_phase1_markers():
+              checks={'fs/Makefile':'obj-$(CONFIG_KSU_SUSFS) += susfs.o','fs/proc/task_mmu.c':'SUSFS: spoof map VMA inode/dev for SUS_KSTAT','fs/notify/fdinfo.c':'SUSFS: show original inode information for SUS_KSTAT fdinfo'}
+              for rel, marker in checks.items():
+                  p=root/rel
+                  if not p.exists(): failures.append(f'phase1 verification missing file: {rel}')
+                  elif marker not in p.read_text(errors='ignore'): failures.append(f'phase1 marker missing in {rel}: {marker}')
+                  else: print(f'[OK] phase1 marker verified in {rel}: {marker}')
+          def strip_phase1_files_from_patch(src, dst):
+              if not src.exists(): return False
+              text=src.read_text(errors='ignore'); sections=re.split(r'(?=^diff --git )', text, flags=re.M)
+              preamble=sections[0]; kept=[]; skipped=[]
+              for sec in sections[1:]:
+                  m=re.match(r'diff --git a/(.*?) b/\1',sec)
+                  if m and m.group(1) in PHASE1_FILES: skipped.append(m.group(1)); continue
+                  kept.append(sec)
+              dst.write_text(preamble+''.join(kept), errors='ignore')
+              for item in sorted(set(skipped)): print(f'[OK] skipped already-ported phase1 hunk file: {item}')
+              return True
           def patch_sections(files):
-              text = patch.read_text(errors='ignore') if patch.exists() else ''
-              result = {}
+              text=patch.read_text(errors='ignore') if patch.exists() else ''; result={}
               for f in files:
-                  m = re.search(rf'(^diff --git a/{re.escape(f)} b/{re.escape(f)}\n.*?)(?=^diff --git |\Z)', text, re.M | re.S)
-                  result[f] = m.group(1) if m else ''
+                  m=re.search(rf'(^diff --git a/{re.escape(f)} b/{re.escape(f)}\n.*?)(?=^diff --git |\Z)', text, re.M|re.S)
+                  result[f]=m.group(1) if m else ''
               return result
-
-          for rel in ['fs/susfs.c', 'include/linux/susfs.h', 'include/linux/susfs_def.h']:
-              if not (root / rel).exists():
-                  failures.append(f'missing copied SUSFS file: {rel}')
-              else:
-                  print(f'[OK] copied SUSFS file exists: {rel}')
-
+          for rel in ['fs/susfs.c','include/linux/susfs.h','include/linux/susfs_def.h']:
+              if not (root/rel).exists(): failures.append(f'missing copied SUSFS file: {rel}')
+              else: print(f'[OK] copied SUSFS file exists: {rel}')
           print('[OK] KernelSU/10_enable_susfs_for_ksu.patch is excluded from official ReSukiSU workflow path')
-          if not patch.exists():
-              failures.append('missing kernel-side patch: 50_add_susfs_in_kernel-5.4.patch')
-              output = ''
+          verify_phase1_markers()
+          if not strip_phase1_files_from_patch(original_patch, patch):
+              failures.append('missing kernel-side patch: 50_add_susfs_in_kernel-5.4.patch'); output=''
           else:
-              print(f'[INFO] selected kernel-side patch: {patch}')
-              cmd = f"git apply --check --whitespace=error '{patch.resolve()}'"
+              print(f'[INFO] selected remaining kernel-side patch after phase1: {patch}')
+              cmd=f"git apply --check --whitespace=error '{patch.resolve()}'"
               print(f'[CHECK] {cmd}  (cwd={root})')
-              p = subprocess.run(cmd, shell=True, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-              output = p.stdout
-              print(output, end='')
-              if p.returncode != 0:
-                  failures.append('kernel-side SUSFS patch does not apply cleanly to this lisa source')
-
-          files_from_errors = [(m.group(1), int(m.group(2))) for m in re.finditer(r'error: patch failed: ([^:]+):(\d+)', output)]
-          if not files_from_errors:
-              files_from_errors = [
-                  ('fs/Makefile', 14), ('fs/namei.c', 40), ('fs/namespace.c', 26),
-                  ('fs/notify/fdinfo.c', 13), ('fs/proc/task_mmu.c', 348), ('fs/readdir.c', 23),
-              ]
-          unique_files = []
-          for f, _ in files_from_errors:
-              if f not in unique_files:
-                  unique_files.append(f)
-
-          write(root / 'logs/debug/susfs-patch-check-output.log', output)
-          write(root / 'logs/debug/susfs-source-context.log', '\n'.join(source_context(f, line, 90) for f, line in files_from_errors))
-          sections = patch_sections(unique_files)
-          write(root / 'logs/debug/susfs-patch-hunks.log', '\n'.join([f'===== PATCH SECTION FOR {f} =====\n{sections.get(f) or "[MISSING]"}' for f in unique_files]))
-          allctx = ['===== ALL SOURCE CONTEXTS FOR EVERY HUNK TARGET LINE =====']
+              p=subprocess.run(cmd,shell=True,cwd=root,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+              output=p.stdout; print(output,end='')
+              if p.returncode != 0: failures.append('remaining kernel-side SUSFS patch does not apply cleanly to this lisa source')
+          files_from_errors=[(m.group(1),int(m.group(2))) for m in re.finditer(r'error: patch failed: ([^:]+):(\d+)', output)]
+          unique_files=[]
+          for f,_ in files_from_errors:
+              if f not in unique_files: unique_files.append(f)
+          write(root/'logs/debug/susfs-patch-check-output.log',output)
+          write(root/'logs/debug/susfs-phase1-filtered-patch-path.log',str(patch)+'\n')
+          write(root/'logs/debug/susfs-source-context.log','\n'.join(source_context(f,line,90) for f,line in files_from_errors))
+          sections=patch_sections(unique_files)
+          write(root/'logs/debug/susfs-patch-hunks.log','\n'.join([f'===== PATCH SECTION FOR {f} =====\n{sections.get(f) or "[MISSING]"}' for f in unique_files]))
+          allctx=['===== ALL SOURCE CONTEXTS FOR EVERY HUNK TARGET LINE =====']
           for f in unique_files:
               allctx.append(f'##### FILE: {f} #####')
-              for line in sorted(set(int(x) for x in re.findall(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', sections.get(f, ''), re.M))):
-                  allctx.append(source_context(f, line, 70))
-          write(root / 'logs/debug/susfs-all-hunk-source-contexts.log', '\n'.join(allctx))
-
-          rejs = sorted(root.rglob('*.rej'))
+              for line in sorted(set(int(x) for x in re.findall(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', sections.get(f,''), re.M))):
+                  allctx.append(source_context(f,line,70))
+          write(root/'logs/debug/susfs-all-hunk-source-contexts.log','\n'.join(allctx))
+          rejs=sorted(root.rglob('*.rej'))
           if rejs:
               failures.append('.rej files found before compile')
-              for r in rejs:
-                  print(f'[REJ] {r.relative_to(root)}')
-
+              for r in rejs: print(f'[REJ] {r.relative_to(root)}')
           if failures:
               print('\n[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.')
               print('[INFO] Exported official porting context without applying patch.')
-              for item in failures:
-                  print(f'  - {item}')
+              for item in failures: print(f'  - {item}')
               raise SystemExit(1)
           print('[OK] SUSFS pre-compile check passed')
           PY
           exit ${PIPESTATUS[0]}
 
-      - name: Apply SUSFS kernel-side patch after clean check
+      - name: Apply remaining SUSFS kernel-side patch after clean check
         run: |
           set -euo pipefail
-          git apply --whitespace=error susfs-src/kernel_patches/50_add_susfs_in_kernel-5.4.patch 2>&1 | tee logs/apply-susfs-kernel-side.log
+          git apply --whitespace=error logs/debug/50_add_susfs_in_kernel-5.4.remaining-after-phase1.patch 2>&1 | tee logs/apply-susfs-kernel-side.log
           if find . -name '*.rej' -type f | grep -q .; then
             echo "ERROR: .rej files exist after clean apply" | tee -a logs/apply-susfs-kernel-side.log
             find . -name '*.rej' -type f | sort | tee -a logs/apply-susfs-kernel-side.log
@@ -300,16 +361,8 @@ jobs:
               file="${pair%%:*}"; pattern="${pair#*:}"
               if grep -q "$pattern" "$file"; then echo "[OK] $file contains $pattern"; else echo "[ERROR] $file missing $pattern"; failed=1; fi
             done
-            if grep -R "ksu_handle_execveat((int \*)AT_FDCWD" fs/exec.c >/dev/null 2>&1; then
-              echo "[ERROR] unsafe exec hook cast found"; failed=1
-            else
-              echo "[OK] no unsafe AT_FDCWD pointer cast found"
-            fi
-            if grep -E "\[WARN\]|\[MISS\]|skip: no manual hook" logs/apply-manual-hooks.log >/dev/null 2>&1; then
-              echo "[ERROR] manual hook script emitted WARN/MISS"; failed=1
-            else
-              echo "[OK] manual hook log has no WARN/MISS"
-            fi
+            if grep -R "ksu_handle_execveat((int \*)AT_FDCWD" fs/exec.c >/dev/null 2>&1; then echo "[ERROR] unsafe exec hook cast found"; failed=1; else echo "[OK] no unsafe AT_FDCWD pointer cast found"; fi
+            if grep -E "\[WARN\]|\[MISS\]|skip: no manual hook" logs/apply-manual-hooks.log >/dev/null 2>&1; then echo "[ERROR] manual hook script emitted WARN/MISS"; failed=1; else echo "[OK] manual hook log has no WARN/MISS"; fi
           } | tee logs/manual-hook-validation.log
           exit "$failed"
 
@@ -319,27 +372,23 @@ jobs:
           python3 - <<'PY' 2>&1 | tee logs/enable-resukisu-susfs-configs.log
           from pathlib import Path
           import os
-          root = Path.cwd()
-          defconfig = os.environ.get('DEFCONFIG', 'lisa_defconfig')
-          paths = [root/'arch/arm64/configs'/defconfig, root/'arch/arm64/configs/vendor'/defconfig]
-          path = next((p for p in paths if p.exists()), None)
-          if not path:
-              raise SystemExit(f'[ERROR] defconfig not found: {defconfig}')
-          text = path.read_text(errors='ignore')
-          def setcfg(text, key):
+          root=Path.cwd(); defconfig=os.environ.get('DEFCONFIG','lisa_defconfig')
+          paths=[root/'arch/arm64/configs'/defconfig, root/'arch/arm64/configs/vendor'/defconfig]
+          path=next((p for p in paths if p.exists()),None)
+          if not path: raise SystemExit(f'[ERROR] defconfig not found: {defconfig}')
+          text=path.read_text(errors='ignore')
+          def setcfg(text,key):
               lines=[]; seen=False
               for line in text.splitlines():
                   if line.startswith(key+'=') or line.startswith('# '+key+' is not set'):
-                      if not seen:
-                          lines.append(key+'=y'); seen=True
+                      if not seen: lines.append(key+'=y'); seen=True
                       continue
                   lines.append(line)
               if not seen: lines.append(key+'=y')
               return '\n'.join(lines)+'\n'
           for key in ['CONFIG_KSU','CONFIG_KSU_MANUAL_HOOK','CONFIG_KALLSYMS','CONFIG_KALLSYMS_ALL','CONFIG_KSU_SUSFS','CONFIG_KSU_SUSFS_SUS_PATH','CONFIG_KSU_SUSFS_SUS_MOUNT','CONFIG_KSU_SUSFS_SUS_KSTAT','CONFIG_KSU_SUSFS_TRY_UMOUNT','CONFIG_KSU_SUSFS_SPOOF_UNAME','CONFIG_KSU_SUSFS_ENABLE_LOG','CONFIG_KSU_SUSFS_OPEN_REDIRECT']:
               text=setcfg(text,key)
-          path.write_text(text)
-          print(f'[OK] enabled configs in {path}')
+          path.write_text(text); print(f'[OK] enabled configs in {path}')
           PY
 
       - name: Final SUSFS guard before compile
@@ -390,19 +439,14 @@ jobs:
           set +e
           SUMMARY="logs/debug-summary.log"; : > "$SUMMARY"
           add_section(){ title="$1"; file="$2"; { echo; echo "================================================================"; echo "===== $title"; echo "===== file: $file"; echo "================================================================"; [ -f "$file" ] && cat "$file" || echo "[MISSING] $file"; } >> "$SUMMARY"; }
-          {
-            echo "ReSukiSU manual SUSFS official debug summary"
-            echo "Generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "GitHub run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo "DEFCONFIG=${DEFCONFIG}"
-            echo "SUSFS_REF=${SUSFS_REF}"
-            echo "KSU_DIR=${KSU_DIR:-}"
-          } >> "$SUMMARY"
+          { echo "ReSukiSU manual SUSFS official debug summary"; echo "Generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "GitHub run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"; echo "DEFCONFIG=${DEFCONFIG}"; echo "SUSFS_REF=${SUSFS_REF}"; echo "KSU_DIR=${KSU_DIR:-}"; } >> "$SUMMARY"
           add_section environment logs/environment.log
           add_section "ReSukiSU setup" logs/resukisu-setup.log
           add_section "SUSFS tree" logs/susfs-tree.log
           add_section "copy SUSFS files" logs/copy-susfs-files.log
+          add_section "SUSFS phase 1 port" logs/port-susfs-phase1.log
           add_section "SUSFS pre-compile check" logs/susfs-precompile-check.log
+          add_section "SUSFS phase1 filtered patch path" logs/debug/susfs-phase1-filtered-patch-path.log
           add_section "SUSFS patch check output" logs/debug/susfs-patch-check-output.log
           add_section "SUSFS source context" logs/debug/susfs-source-context.log
           add_section "SUSFS all hunk source contexts" logs/debug/susfs-all-hunk-source-contexts.log
