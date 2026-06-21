@@ -242,16 +242,15 @@ jobs:
           text = p.read_text(errors="ignore")
 
           proto = """#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-#endif
+          __attribute__((hot))
+          extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+          #endif
 
-"""
+
 
           call = """#ifdef CONFIG_KSU_MANUAL_HOOK
-\tksu_handle_sys_read(fd, &buf, &count);
-#endif
-"""
+          \tksu_handle_sys_read(fd, &buf, &count);
+          #endif
 
           if "ksu_handle_sys_read" not in text:
               marker = "SYSCALL_DEFINE3(read"
