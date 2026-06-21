@@ -171,11 +171,13 @@ jobs:
             git -C susfs-src rev-parse HEAD || true
             git -C susfs-src log -1 --oneline || true
             echo
-            echo "===== SUSFS tree ====="
-            find susfs-src/kernel_patches -maxdepth 4 -type f | sort || true
+            echo "===== SUSFS kernel-side files only ====="
+            find susfs-src/kernel_patches -maxdepth 4 -type f \
+              | grep -v 'kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch' \
+              | sort || true
           } | tee logs/susfs-tree.log
 
-      - name: Copy SUSFS implementation files
+      - name: Copy SUSFS kernel implementation files only
         run: |
           set -euo pipefail
 
@@ -185,10 +187,16 @@ jobs:
 
           ROOT = Path.cwd()
           SUS = ROOT / "susfs-src" / "kernel_patches"
+
           required = [
               "fs/susfs.c",
               "include/linux/susfs.h",
               "include/linux/susfs_def.h",
+          ]
+
+          optional = [
+              "fs/sus_su.c",
+              "include/linux/sus_su.h",
           ]
 
           for rel in required:
@@ -200,17 +208,19 @@ jobs:
               shutil.copy2(src, dst)
               print(f"[OK] copied {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}", flush=True)
 
-          # Optional files are copied for source completeness only. The workflow does not enable SUS_SU by default.
-          for rel in ["fs/sus_su.c", "include/linux/sus_su.h"]:
+          # Optional source completeness only; workflow does not enable CONFIG_KSU_SUSFS_SUS_SU by default.
+          for rel in optional:
               src = SUS / rel
               dst = ROOT / rel
               if src.exists():
                   dst.parent.mkdir(parents=True, exist_ok=True)
                   shutil.copy2(src, dst)
                   print(f"[OK] copied optional {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}", flush=True)
+
+          print("[OK] KernelSU/10_enable_susfs_for_ksu.patch is not copied, checked, applied, or used.", flush=True)
           PY
 
-      - name: Official SUSFS pre-compile check with context export
+      - name: Official SUSFS pre-compile check with full context export
         run: |
           set +e
           mkdir -p logs/debug
@@ -219,7 +229,6 @@ jobs:
           from pathlib import Path
           import subprocess
           import re
-          import sys
 
           ROOT = Path.cwd()
           SUS = ROOT / "susfs-src" / "kernel_patches"
@@ -258,19 +267,51 @@ jobs:
                   out.append(f"{idx:05d}: {lines[idx-1]}")
               return "\n".join(out) + "\n"
 
-          def export_patch_file_hunks(patch_file, files):
+          def get_patch_sections(patch_file, files):
               text = patch_file.read_text(errors="ignore") if patch_file.exists() else ""
+              sections = {}
+              for f in files:
+                  pattern = re.compile(rf"(^diff --git a/{re.escape(f)} b/{re.escape(f)}\n.*?)(?=^diff --git |\Z)", re.M | re.S)
+                  m = pattern.search(text)
+                  sections[f] = m.group(1) if m else ""
+              return sections
+
+          def export_patch_file_hunks(patch_file, files):
+              sections = get_patch_sections(patch_file, files)
               out = []
               out.append(f"===== PATCH HUNKS FROM: {patch_file.relative_to(ROOT) if patch_file.exists() else patch_file} =====")
               for f in files:
                   out.append(f"\n===== PATCH SECTION FOR {f} =====")
-                  pattern = re.compile(rf"(^diff --git a/{re.escape(f)} b/{re.escape(f)}\n.*?)(?=^diff --git |\Z)", re.M | re.S)
-                  m = pattern.search(text)
-                  if m:
-                      section = m.group(1)
-                      out.append(section)
-                  else:
-                      out.append(f"[MISSING PATCH SECTION] {f}")
+                  out.append(sections.get(f) or f"[MISSING PATCH SECTION] {f}")
+              return "\n".join(out) + "\n"
+
+          def extract_hunk_target_lines(section):
+              lines = []
+              for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", section, re.M):
+                  try:
+                      lines.append(int(m.group(1)))
+                  except ValueError:
+                      pass
+              return lines
+
+          def export_all_hunk_source_contexts(patch_file, files, radius=70):
+              sections = get_patch_sections(patch_file, files)
+              out = []
+              out.append("===== ALL SOURCE CONTEXTS FOR EVERY HUNK TARGET LINE =====")
+              for f in files:
+                  out.append(f"\n################################################################")
+                  out.append(f"##### FILE: {f}")
+                  out.append(f"################################################################")
+                  hunk_lines = extract_hunk_target_lines(sections.get(f, ""))
+                  if not hunk_lines:
+                      out.append(f"[NO HUNK LINES FOUND] {f}")
+                      continue
+                  seen = set()
+                  for line in hunk_lines:
+                      if line in seen:
+                          continue
+                      seen.add(line)
+                      out.append(export_source_context(f, line, radius))
               return "\n".join(out) + "\n"
 
           # Required copied files.
@@ -281,9 +322,7 @@ jobs:
               else:
                   log(f"[OK] copied SUSFS file exists: {rel}")
 
-          forbidden = SUS / "KernelSU" / "10_enable_susfs_for_ksu.patch"
-          if forbidden.exists():
-              log(f"[INFO] KSU-side patch exists but is intentionally not used: {forbidden.relative_to(ROOT)}")
+          log("[OK] KernelSU/10_enable_susfs_for_ksu.patch is excluded from official ReSukiSU workflow path")
 
           patches = []
           patches += sorted(SUS.glob("50_add_susfs_in_kernel-5.4*.patch"))
@@ -305,7 +344,6 @@ jobs:
               else:
                   log("[OK] kernel-side SUSFS patch preflight clean")
 
-          # Export context regardless, so manual official porting can be done without partial apply.
           files_from_errors = []
           for match in re.finditer(r"error: patch failed: ([^:]+):(\d+)", patch_stdout):
               files_from_errors.append((match.group(1), int(match.group(2))))
@@ -331,6 +369,7 @@ jobs:
 
           if patch:
               write_text(ROOT / "logs" / "debug" / "susfs-patch-hunks.log", export_patch_file_hunks(patch, unique_files))
+              write_text(ROOT / "logs" / "debug" / "susfs-all-hunk-source-contexts.log", export_all_hunk_source_contexts(patch, unique_files, 70))
               write_text(ROOT / "logs" / "debug" / "susfs-patch-check-output.log", patch_stdout)
 
           rejs = sorted(ROOT.rglob("*.rej"))
@@ -344,6 +383,7 @@ jobs:
               log("[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.")
               log("[INFO] Exported official porting context without applying patch:")
               log("  - logs/debug/susfs-source-context.log")
+              log("  - logs/debug/susfs-all-hunk-source-contexts.log")
               log("  - logs/debug/susfs-patch-hunks.log")
               log("  - logs/debug/susfs-patch-check-output.log")
               for item in failures:
@@ -641,6 +681,7 @@ jobs:
           add_section "SUSFS pre-compile check" "logs/susfs-precompile-check.log"
           add_section "SUSFS patch check output" "logs/debug/susfs-patch-check-output.log"
           add_section "SUSFS source context" "logs/debug/susfs-source-context.log"
+          add_section "SUSFS all hunk source contexts" "logs/debug/susfs-all-hunk-source-contexts.log"
           add_section "SUSFS patch hunks" "logs/debug/susfs-patch-hunks.log"
           add_section "apply SUSFS kernel-side" "logs/apply-susfs-kernel-side.log"
           add_section "manual hook" "logs/apply-manual-hooks.log"
