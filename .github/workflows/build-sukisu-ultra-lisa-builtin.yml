@@ -21,9 +21,13 @@ on:
       sukisu_ref:
         description: "SukiSU-Ultra git ref (tag/branch/commit)"
         required: true
-        default: "v4.0.5"
+        default: "v3.2.0"
+      susfs_repo:
+        description: "SUSFS repo URL"
+        required: true
+        default: "https://gitlab.com/simonpunk/susfs4ksu.git"
       susfs_branch:
-        description: "ShirkNeko/susfs4ksu branch"
+        description: "SUSFS branch"
         required: true
         default: "kernel-5.4"
 
@@ -37,8 +41,9 @@ env:
   SUBARCH:      arm64
   DEFCONFIG:    ${{ github.event.inputs.defconfig     || 'lisa_defconfig' }}
   SUKISU_MODE:  ${{ github.event.inputs.sukisu_mode   || 'builtin' }}
-  SUKISU_REF:   ${{ github.event.inputs.sukisu_ref    || 'v4.0.5' }}
+  SUKISU_REF:   ${{ github.event.inputs.sukisu_ref    || 'v3.2.0' }}
   KBRANCH:      ${{ github.event.inputs.kernel_branch || 'thirteen' }}
+  SUSFS_REPO:   ${{ github.event.inputs.susfs_repo    || 'https://gitlab.com/simonpunk/susfs4ksu.git' }}
   SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch  || 'kernel-5.4' }}
 
 jobs:
@@ -103,25 +108,27 @@ jobs:
           fi
           echo "OK - SukiSU module-side caller xac nhan."
 
-      - name: Clone ShirkNeko susfs4ksu
+      - name: Clone SUSFS upstream
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           rm -rf /tmp/susfs4ksu
-          git clone --depth=1 -b "$SUSFS_BRANCH" https://github.com/ShirkNeko/susfs4ksu.git /tmp/susfs4ksu
+          echo "==> Cloning $SUSFS_REPO branch $SUSFS_BRANCH"
+          git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu
           ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
           ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
+          echo "==> SUSFS version info in headers:"
+          grep -nE "SUSFS_VERSION|SUSFS_MAGIC" /tmp/susfs4ksu/kernel_patches/include/linux/*.h 2>/dev/null | head -10 || true
 
       - name: Pre-build compat check (SukiSU vs SUSFS)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           chmod +x .github/scripts/verify_sukisu_susfs_compat.py
-          python3 .github/scripts/verify_sukisu_susfs_compat.py \
-            "$KSU_DIR" /tmp/susfs4ksu | tee /tmp/compat_check.log
+          python3 .github/scripts/verify_sukisu_susfs_compat.py "$KSU_DIR" /tmp/susfs4ksu | tee /tmp/compat_check.log
           if grep -qE "\[ERROR\]|\[MISMATCH\]" /tmp/compat_check.log; then
             echo "::error::SukiSU-Ultra and SUSFS version mismatch detected"
-            echo "         => Pin a compatible SUKISU_REF or change SUSFS_BRANCH"
+            echo "         => Pin a compatible SUKISU_REF or change SUSFS branch/repo"
             exit 1
           fi
 
@@ -310,7 +317,7 @@ jobs:
           set -euo pipefail
           TC_DIR="$HOME/tc/clang-r450784d"
           if [ -x "$TC_DIR/bin/clang" ] && [ -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "==> Toolchain already present (from cache)"
+            echo "==> Toolchain already present (cache hit)"
             "$TC_DIR/bin/clang" --version
             exit 0
           fi
