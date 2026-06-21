@@ -1,4 +1,4 @@
-name: Build ReSukiSU Lisa Manual Hook + SUSFS Official Check
+name: Daily ReSukiSU Lisa Manual Hook + SUSFS Official
 
 on:
   workflow_dispatch:
@@ -38,6 +38,10 @@ on:
         type: boolean
         default: false
 
+  schedule:
+    # Daily build/check at 02:30 UTC. Vietnam time = 09:30 GMT+7.
+    - cron: "30 2 * * *"
+
 permissions:
   contents: read
 
@@ -45,21 +49,32 @@ env:
   ARCH: arm64
   SUBARCH: arm64
   OUT_DIR: out
-  DEFCONFIG: ${{ github.event.inputs.defconfig }}
-  RESUKISU_REF: ${{ github.event.inputs.resukisu_ref }}
-  SUSFS_REPO: ${{ github.event.inputs.susfs_repo }}
-  SUSFS_REF: ${{ github.event.inputs.susfs_ref }}
-  MANUAL_HOOK_SCRIPT: ${{ github.event.inputs.manual_hook_script }}
+  DEFCONFIG: lisa_defconfig
+  RESUKISU_REF: ""
+  SUSFS_REPO: https://github.com/ShirkNeko/susfs4ksu.git
+  SUSFS_REF: kernel-5.4
+  MANUAL_HOOK_SCRIPT: .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
   CROSS_COMPILE: aarch64-linux-gnu-
   CLANG_TRIPLE: aarch64-linux-gnu-
 
 jobs:
   build:
-    name: ReSukiSU Lisa Manual Hook + SUSFS official check
+    name: Daily official ReSukiSU Lisa + SUSFS
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
     steps:
+      - name: Normalize workflow inputs
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DEFCONFIG=${{ github.event.inputs.defconfig }}" >> "$GITHUB_ENV"
+            echo "RESUKISU_REF=${{ github.event.inputs.resukisu_ref }}" >> "$GITHUB_ENV"
+            echo "SUSFS_REPO=${{ github.event.inputs.susfs_repo }}" >> "$GITHUB_ENV"
+            echo "SUSFS_REF=${{ github.event.inputs.susfs_ref }}" >> "$GITHUB_ENV"
+            echo "MANUAL_HOOK_SCRIPT=${{ github.event.inputs.manual_hook_script }}" >> "$GITHUB_ENV"
+          fi
+
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
@@ -82,6 +97,7 @@ jobs:
           {
             echo "DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "GITHUB_RUN=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "EVENT_NAME=${GITHUB_EVENT_NAME}"
             echo "DEFCONFIG=${DEFCONFIG}"
             echo "RESUKISU_REF=${RESUKISU_REF}"
             echo "SUSFS_REPO=${SUSFS_REPO}"
@@ -184,7 +200,7 @@ jobs:
               shutil.copy2(src, dst)
               print(f"[OK] copied {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}", flush=True)
 
-          # Optional SUS_SU files: copy only if present, but workflow does not enable SUS_SU by default.
+          # Optional files are copied for source completeness only. The workflow does not enable SUS_SU by default.
           for rel in ["fs/sus_su.c", "include/linux/sus_su.h"]:
               src = SUS / rel
               dst = ROOT / rel
@@ -194,20 +210,28 @@ jobs:
                   print(f"[OK] copied optional {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}", flush=True)
           PY
 
-      - name: Official SUSFS pre-compile check
+      - name: Official SUSFS pre-compile check with context export
         run: |
-          set -euo pipefail
+          set +e
+          mkdir -p logs/debug
 
           python3 - <<'PY' 2>&1 | tee logs/susfs-precompile-check.log
           from pathlib import Path
           import subprocess
+          import re
+          import sys
 
           ROOT = Path.cwd()
           SUS = ROOT / "susfs-src" / "kernel_patches"
           failures = []
+          patch_stdout = ""
 
           def log(msg):
               print(msg, flush=True)
+
+          def write_text(path, text):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(text, errors="ignore")
 
           def run_capture(cmd, cwd=ROOT):
               log(f"[CHECK] {cmd}  (cwd={cwd})")
@@ -216,7 +240,40 @@ jobs:
               print(p.stdout, end="")
               return p.returncode, p.stdout
 
-          # 1. Required SUSFS files must exist in kernel tree before checking patch.
+          def export_source_context(file_path, center_line=None, radius=80):
+              p = ROOT / file_path
+              out = []
+              out.append(f"===== SOURCE CONTEXT: {file_path} =====")
+              if not p.exists():
+                  out.append(f"[MISSING] {file_path}")
+                  return "\n".join(out) + "\n"
+              lines = p.read_text(errors="ignore").splitlines()
+              if center_line is None:
+                  start, end = 1, min(len(lines), 160)
+              else:
+                  start = max(1, center_line - radius)
+                  end = min(len(lines), center_line + radius)
+              out.append(f"lines {start}-{end} of {len(lines)}")
+              for idx in range(start, end + 1):
+                  out.append(f"{idx:05d}: {lines[idx-1]}")
+              return "\n".join(out) + "\n"
+
+          def export_patch_file_hunks(patch_file, files):
+              text = patch_file.read_text(errors="ignore") if patch_file.exists() else ""
+              out = []
+              out.append(f"===== PATCH HUNKS FROM: {patch_file.relative_to(ROOT) if patch_file.exists() else patch_file} =====")
+              for f in files:
+                  out.append(f"\n===== PATCH SECTION FOR {f} =====")
+                  pattern = re.compile(rf"(^diff --git a/{re.escape(f)} b/{re.escape(f)}\n.*?)(?=^diff --git |\Z)", re.M | re.S)
+                  m = pattern.search(text)
+                  if m:
+                      section = m.group(1)
+                      out.append(section)
+                  else:
+                      out.append(f"[MISSING PATCH SECTION] {f}")
+              return "\n".join(out) + "\n"
+
+          # Required copied files.
           for rel in ["fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"]:
               p = ROOT / rel
               if not p.exists():
@@ -224,13 +281,10 @@ jobs:
               else:
                   log(f"[OK] copied SUSFS file exists: {rel}")
 
-          # 2. ReSukiSU/ReSukiSU-side patch from ShirkNeko is intentionally NOT applied.
-          # This workflow only uses kernel-side SUSFS patch + ReSukiSU caller side.
           forbidden = SUS / "KernelSU" / "10_enable_susfs_for_ksu.patch"
           if forbidden.exists():
               log(f"[INFO] KSU-side patch exists but is intentionally not used: {forbidden.relative_to(ROOT)}")
 
-          # 3. Kernel-side patch must apply cleanly. No --reject, no patch -p1 fallback.
           patches = []
           patches += sorted(SUS.glob("50_add_susfs_in_kernel-5.4*.patch"))
           patches += sorted(SUS.glob("*susfs*kernel*5.4*.patch"))
@@ -239,18 +293,46 @@ jobs:
               if p not in unique:
                   unique.append(p)
 
+          patch = None
           if not unique:
               failures.append("no kernel 5.4 SUSFS patch found under susfs-src/kernel_patches")
           else:
               patch = unique[0]
               log(f"[INFO] selected kernel-side patch: {patch.relative_to(ROOT)}")
-              rc, _ = run_capture(f"git apply --check --whitespace=error '{patch.resolve()}'", ROOT)
+              rc, patch_stdout = run_capture(f"git apply --check --whitespace=error '{patch.resolve()}'", ROOT)
               if rc != 0:
                   failures.append("kernel-side SUSFS patch does not apply cleanly to this lisa source")
               else:
                   log("[OK] kernel-side SUSFS patch preflight clean")
 
-          # 4. No reject files before compile.
+          # Export context regardless, so manual official porting can be done without partial apply.
+          files_from_errors = []
+          for match in re.finditer(r"error: patch failed: ([^:]+):(\d+)", patch_stdout):
+              files_from_errors.append((match.group(1), int(match.group(2))))
+          if not files_from_errors:
+              files_from_errors = [
+                  ("fs/Makefile", 14),
+                  ("fs/namei.c", 40),
+                  ("fs/namespace.c", 26),
+                  ("fs/notify/fdinfo.c", 13),
+                  ("fs/proc/task_mmu.c", 348),
+                  ("fs/readdir.c", 23),
+              ]
+
+          unique_files = []
+          for f, _ in files_from_errors:
+              if f not in unique_files:
+                  unique_files.append(f)
+
+          source_context = []
+          for f, line in files_from_errors:
+              source_context.append(export_source_context(f, line, 90))
+          write_text(ROOT / "logs" / "debug" / "susfs-source-context.log", "\n".join(source_context))
+
+          if patch:
+              write_text(ROOT / "logs" / "debug" / "susfs-patch-hunks.log", export_patch_file_hunks(patch, unique_files))
+              write_text(ROOT / "logs" / "debug" / "susfs-patch-check-output.log", patch_stdout)
+
           rejs = sorted(ROOT.rglob("*.rej"))
           if rejs:
               failures.append(".rej files found before compile")
@@ -260,12 +342,19 @@ jobs:
           if failures:
               log("")
               log("[OFFICIAL FAIL-FAST] SUSFS pre-compile check failed. Build will stop before wasting compile time.")
+              log("[INFO] Exported official porting context without applying patch:")
+              log("  - logs/debug/susfs-source-context.log")
+              log("  - logs/debug/susfs-patch-hunks.log")
+              log("  - logs/debug/susfs-patch-check-output.log")
               for item in failures:
                   log(f"  - {item}")
               raise SystemExit(1)
 
           log("[OK] SUSFS pre-compile check passed")
           PY
+
+          status=${PIPESTATUS[0]}
+          exit "$status"
 
       - name: Apply SUSFS kernel-side patch after clean check
         run: |
@@ -302,7 +391,7 @@ jobs:
           PY
 
       - name: Apply existing manual hook script
-        if: github.event.inputs.run_manual_hooks == 'true'
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.run_manual_hooks == 'true' }}
         run: |
           set -euo pipefail
 
@@ -314,7 +403,7 @@ jobs:
           python3 "${MANUAL_HOOK_SCRIPT}" "${DEFCONFIG}" 2>&1 | tee logs/apply-manual-hooks.log
 
       - name: Official validate manual hooks
-        if: github.event.inputs.run_manual_hooks == 'true'
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.run_manual_hooks == 'true' }}
         run: |
           set -euo pipefail
 
@@ -407,7 +496,6 @@ jobs:
           ]:
               text = set_config(text, key, "y")
 
-          # Official default: do not force experimental SUS_SU/SUS_MAP unless source support is verified.
           path.write_text(text)
           print(f"[OK] enabled ReSukiSU manual hook + SUSFS configs in {path.relative_to(ROOT)}")
           PY
@@ -447,7 +535,7 @@ jobs:
           mkdir -p logs/debug
           {
             echo "===== KSU_DIR ====="
-            echo "${KSU_DIR}"
+            echo "${KSU_DIR:-}"
             echo
             echo "===== SUSFS files ====="
             ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
@@ -534,14 +622,14 @@ jobs:
           }
 
           {
-            echo "ReSukiSU official debug summary for Copilot upload"
+            echo "ReSukiSU daily official debug summary for Copilot upload"
             echo "Generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "GitHub run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "DEFCONFIG=${DEFCONFIG}"
             echo "RESUKISU_REF=${RESUKISU_REF}"
             echo "SUSFS_REPO=${SUSFS_REPO}"
             echo "SUSFS_REF=${SUSFS_REF}"
-            echo "KSU_DIR=${KSU_DIR}"
+            echo "KSU_DIR=${KSU_DIR:-}"
             echo "MANUAL_HOOK_SCRIPT=${MANUAL_HOOK_SCRIPT}"
           } >> "$SUMMARY"
 
@@ -551,6 +639,9 @@ jobs:
           add_section "SUSFS clone/tree" "logs/susfs-tree.log"
           add_section "copy SUSFS files" "logs/copy-susfs-files.log"
           add_section "SUSFS pre-compile check" "logs/susfs-precompile-check.log"
+          add_section "SUSFS patch check output" "logs/debug/susfs-patch-check-output.log"
+          add_section "SUSFS source context" "logs/debug/susfs-source-context.log"
+          add_section "SUSFS patch hunks" "logs/debug/susfs-patch-hunks.log"
           add_section "apply SUSFS kernel-side" "logs/apply-susfs-kernel-side.log"
           add_section "manual hook" "logs/apply-manual-hooks.log"
           add_section "manual hook validation" "logs/manual-hook-validation.log"
@@ -593,7 +684,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: copilot-debug-3files-resukisu-${{ github.run_number }}
+          name: copilot-debug-3files-resukisu-daily-${{ github.run_number }}
           path: |
             logs/debug-summary.log
             logs/build-errors.log
@@ -604,7 +695,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-artifacts-resukisu-${{ github.run_number }}
+          name: kernel-artifacts-resukisu-daily-${{ github.run_number }}
           path: artifacts/**
           if-no-files-found: warn
 
@@ -612,6 +703,6 @@ jobs:
         if: failure() && github.event.inputs.upload_full_out == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: out-debug-resukisu-${{ github.run_number }}
+          name: out-debug-resukisu-daily-${{ github.run_number }}
           path: out/**
           if-no-files-found: warn
