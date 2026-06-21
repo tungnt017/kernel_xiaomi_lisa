@@ -18,6 +18,10 @@ on:
         type: choice
         options:
           - builtin
+      sukisu_ref:
+        description: "SukiSU-Ultra git ref (tag/branch/commit)"
+        required: true
+        default: "v4.0.5"
       susfs_branch:
         description: "ShirkNeko/susfs4ksu branch"
         required: true
@@ -33,6 +37,7 @@ env:
   SUBARCH:      arm64
   DEFCONFIG:    ${{ github.event.inputs.defconfig     || 'lisa_defconfig' }}
   SUKISU_MODE:  ${{ github.event.inputs.sukisu_mode   || 'builtin' }}
+  SUKISU_REF:   ${{ github.event.inputs.sukisu_ref    || 'v4.0.5' }}
   KBRANCH:      ${{ github.event.inputs.kernel_branch || 'thirteen' }}
   SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch  || 'kernel-5.4' }}
 
@@ -62,18 +67,19 @@ jobs:
           mkdir -p "$KERNEL_DIR/.github/scripts"
           cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$KERNEL_DIR/.github/scripts/"
           cp -v workflow-repo/.github/scripts/apply_susfs_backport_lisa.py "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/verify_sukisu_susfs_compat.py "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bc bison build-essential ccache curl flex git libssl-dev libelf-dev zip unzip python3 python3-pip cpio rsync kmod patch python2
 
-      - name: Integrate SukiSU-Ultra builtin
+      - name: Integrate SukiSU-Ultra builtin (pinned)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          echo "==> setup.sh '$SUKISU_MODE'"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$SUKISU_MODE"
+          echo "==> setup.sh '$SUKISU_MODE' from SukiSU-Ultra@$SUKISU_REF"
+          curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKISU_REF}/kernel/setup.sh" | bash -s "$SUKISU_MODE"
           if [ -d "KernelSU" ]; then
             echo "KSU_DIR=KernelSU" >> "$GITHUB_ENV"
           elif [ -d "drivers/kernelsu" ]; then
@@ -106,6 +112,19 @@ jobs:
           ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
           ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
 
+      - name: Pre-build compat check (SukiSU vs SUSFS)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/verify_sukisu_susfs_compat.py
+          python3 .github/scripts/verify_sukisu_susfs_compat.py \
+            "$KSU_DIR" /tmp/susfs4ksu | tee /tmp/compat_check.log
+          if grep -qE "\[ERROR\]|\[MISMATCH\]" /tmp/compat_check.log; then
+            echo "::error::SukiSU-Ultra and SUSFS version mismatch detected"
+            echo "         => Pin a compatible SUKISU_REF or change SUSFS_BRANCH"
+            exit 1
+          fi
+
       - name: Copy SUSFS source files into kernel tree
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -129,7 +148,7 @@ jobs:
             echo "==> Added susfs.o to fs/Makefile"
           fi
 
-      - name: Apply SUSFS anchor-based backport (lisa)
+      - name: Apply SUSFS anchor-based backport (lisa, C90-safe)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -163,7 +182,7 @@ jobs:
           fi
           echo "Filldir hook markers in readdir.c: $MARKS"
           if [ "$MARKS" -lt 2 ]; then
-            echo "::error::Quá ít filldir hooks ($MARKS < 2)"
+            echo "::error::Qua it filldir hooks ($MARKS < 2)"
             FAIL=1
           fi
           if [ "$FAIL" -ne 0 ]; then
@@ -251,7 +270,7 @@ jobs:
           MH=$(grep -RnE "CONFIG_KSU_MANUAL_HOOK" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | wc -l || echo 0)
           echo "CONFIG_KSU_MANUAL_HOOK markers: $MH"
           if [ "$MH" -lt 4 ]; then
-            echo "::error::Quá ít CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
+            echo "::error::Qua it CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
             FAIL=1
           fi
           if [ "$FAIL" -ne 0 ]; then
@@ -280,41 +299,41 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Cache AOSP Clang toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/tc/clang-r450784d
+          key: aosp-clang-r450784d-android13-v1
+
       - name: Setup AOSP Clang r450784d
         run: |
           set -euo pipefail
           TC_DIR="$HOME/tc/clang-r450784d"
           if [ -x "$TC_DIR/bin/clang" ] && [ -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "==> Toolchain already present"
+            echo "==> Toolchain already present (from cache)"
             "$TC_DIR/bin/clang" --version
-            "$TC_DIR/bin/ld.lld" --version
             exit 0
           fi
-
           mkdir -p "$HOME/tc"
           cd /tmp
           rm -rf aosp-clang
-
           BRANCH="android13-release"
           REPO="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
-
-          # Method 1: gitiles tarball (fast)
-          echo "==> Trying gitiles tarball for clang-r450784d on $BRANCH ..."
           TARBALL_URL="${REPO}/+archive/refs/heads/${BRANCH}/clang-r450784d.tar.gz"
+          echo "==> Trying gitiles tarball on $BRANCH ..."
           if curl -fSL --retry 3 --retry-delay 5 -o clang.tar.gz "$TARBALL_URL"; then
             echo "==> Downloaded $(du -h clang.tar.gz | cut -f1)"
             mkdir -p "$TC_DIR"
             tar -xzf clang.tar.gz -C "$TC_DIR"
             rm -f clang.tar.gz
           else
-            echo "==> Gitiles tarball failed, falling back to sparse clone on $BRANCH ..."
+            echo "==> Tarball failed, falling back to sparse clone on $BRANCH ..."
             git clone --branch "$BRANCH" --depth=1 --filter=blob:none --sparse "$REPO" aosp-clang
             cd aosp-clang
             git sparse-checkout set clang-r450784d
             git checkout
             if [ ! -d clang-r450784d ]; then
               echo "::error::clang-r450784d not found on branch $BRANCH"
-              echo "Top-level entries:"
               ls -la
               exit 1
             fi
@@ -322,34 +341,24 @@ jobs:
             cp -a clang-r450784d/. "$TC_DIR/"
             cd /tmp && rm -rf aosp-clang
           fi
-
           if [ ! -x "$TC_DIR/bin/clang" ] || [ ! -x "$TC_DIR/bin/ld.lld" ]; then
             FOUND=$(find "$TC_DIR" -maxdepth 4 -name clang -type f -executable 2>/dev/null | head -n 1 || true)
             if [ -n "$FOUND" ]; then
               REAL_DIR=$(dirname "$(dirname "$FOUND")")
-              echo "==> Found clang at $FOUND, restructuring to $TC_DIR ..."
               tmpdir=$(mktemp -d)
               cp -a "$REAL_DIR"/. "$tmpdir/"
               rm -rf "$TC_DIR"
               mv "$tmpdir" "$TC_DIR"
             fi
           fi
-
-          if [ ! -x "$TC_DIR/bin/clang" ]; then
-            echo "::error::clang missing after setup"
-            find "$TC_DIR" -maxdepth 3 -type d | head -n 30
+          if [ ! -x "$TC_DIR/bin/clang" ] || [ ! -x "$TC_DIR/bin/ld.lld" ]; then
+            echo "::error::Toolchain incomplete after setup"
+            ls -la "$TC_DIR/bin" 2>/dev/null | head -n 30 || true
             exit 1
           fi
-          if [ ! -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "::error::ld.lld missing after setup"
-            ls -la "$TC_DIR/bin" | head -n 50
-            exit 1
-          fi
-
           "$TC_DIR/bin/clang" --version
           "$TC_DIR/bin/ld.lld" --version
           echo "==> Toolchain ready at $TC_DIR"
-
 
       - name: Build kernel via build.sh
         working-directory: ${{ env.KERNEL_DIR }}
@@ -373,6 +382,7 @@ jobs:
             /tmp/build.log
             /tmp/apply_hooks.log
             /tmp/susfs_backport.log
+            /tmp/compat_check.log
           if-no-files-found: warn
           retention-days: 14
 
