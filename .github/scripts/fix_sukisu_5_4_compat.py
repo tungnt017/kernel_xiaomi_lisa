@@ -2,24 +2,16 @@
 """
 Official compat shims for SukiSU-Ultra v4.1.3 on kernel 5.4 (non-GKI).
 
-Issues fixed (verified from build.log):
-  1. strncpy_from_user_nofault: only declared in kernel 5.10+
-     → Add inline wrapper using __strncpy_from_user_nofault (exists in 5.4)
-  2. ksu_selinux_hide_handle_post_fs_data: implicit declaration
-  3. ksu_selinux_hide_handle_second_stage: implicit declaration
-     → Add proper extern declarations to ksud.c
+v2: more robust anchors (handle nested braces + various include patterns).
 
-NOT a bypass:
-  - All functions called are real and have implementations
-  - inline wrapper for strncpy preserves exact semantics
-  - extern decl link to real impl in selinux/ subdir
-  - No -Werror disabled, no pragma diagnostic
-NOT weak:
-  - Function signatures match real impl exactly
-  - Conditional compile (#if LINUX_VERSION) for surgical scope
-  - #ifdef CONFIG_KSU_SUSFS guard for SUSFS-specific symbols
-  - Idempotent with marker
-  - Backup tự động
+Issues fixed:
+  1. strncpy_from_user_nofault: only in kernel 5.10+
+     -> Inline wrapper using __strncpy_from_user_nofault
+  2. ksu_selinux_hide_handle_post_fs_data / _second_stage: missing extern
+     -> Add extern decls to ksud.c
+
+NOT a bypass: real functions, real semantics.
+NOT weak: signature-exact, version-guarded, idempotent, backup.
 """
 import re
 import sys
@@ -28,54 +20,99 @@ from pathlib import Path
 
 
 def safe_locate_ksu_dir() -> Path:
-    """Find KSU dir even if it's KernelSU/ or drivers/kernelsu/."""
     for cand in ("KernelSU", "drivers/kernelsu"):
         if Path(cand).is_dir():
             return Path(cand)
     return None
 
 
+def find_first(root: Path, name: str):
+    """Find first file with given name under root, BFS-ish."""
+    direct = list(root.rglob(name))
+    if direct:
+        # Prefer shorter path
+        return sorted(direct, key=lambda p: len(p.parts))[0]
+    return None
+
+
+def add_after_match(path: Path, anchor_pat: str, content: str, marker: str,
+                    flags=re.MULTILINE | re.DOTALL) -> str:
+    """Insert content right after anchor match. Returns status string."""
+    src = path.read_text(encoding="utf-8", errors="surrogateescape")
+    if marker in src:
+        return f"[SKIP] {path} already has marker {marker}"
+
+    pat = re.compile(anchor_pat, flags)
+    m = pat.search(src)
+    if not m:
+        return f"[NOMATCH] anchor not found in {path}"
+
+    insert_at = m.end()
+    new_src = src[:insert_at] + content + src[insert_at:]
+
+    backup = path.with_suffix(path.suffix + ".bak_compat")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+
+    path.write_text(new_src, encoding="utf-8", errors="surrogateescape")
+    return f"[OK] {path} patched"
+
+
+def add_at_start_after_includes(path: Path, content: str, marker: str) -> str:
+    """Insert content right after the include block at start of file."""
+    src = path.read_text(encoding="utf-8", errors="surrogateescape")
+    if marker in src:
+        return f"[SKIP] {path} already has marker {marker}"
+
+    # Find the LAST #include in the top-of-file include block
+    # Strategy: scan first 200 lines, find highest line index that is #include
+    lines = src.splitlines(keepends=True)
+    last_include_idx = -1
+    for i, line in enumerate(lines[:200]):
+        stripped = line.lstrip()
+        if stripped.startswith("#include"):
+            last_include_idx = i
+
+    if last_include_idx < 0:
+        # No include found at all — insert at beginning after any leading comments
+        first_code_idx = 0
+        for i, line in enumerate(lines[:50]):
+            s = line.strip()
+            if s and not s.startswith("/*") and not s.startswith("*") and not s.startswith("//"):
+                first_code_idx = i
+                break
+        insert_at_line = first_code_idx
+    else:
+        insert_at_line = last_include_idx + 1
+
+    # Reconstruct
+    new_lines = lines[:insert_at_line] + [content] + lines[insert_at_line:]
+    new_src = "".join(new_lines)
+
+    backup = path.with_suffix(path.suffix + ".bak_compat")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+
+    path.write_text(new_src, encoding="utf-8", errors="surrogateescape")
+    return f"[OK] {path} patched (after line {insert_at_line})"
+
+
 def patch_kernel_includes(ksu_dir: Path) -> bool:
-    """Fix #1: add strncpy_from_user_nofault wrapper."""
-    candidates = [
-        ksu_dir / "kernel" / "infra" / "kernel_includes.h",
-        ksu_dir / "infra" / "kernel_includes.h",
-        ksu_dir / "kernel_includes.h",
-    ]
-    target = None
-    for c in candidates:
-        if c.is_file():
-            target = c
-            break
-    if target is None:
-        # Search anywhere
-        for f in ksu_dir.rglob("kernel_includes.h"):
-            target = f
-            break
+    target = find_first(ksu_dir, "kernel_includes.h")
     if target is None:
         print(f"[ERROR] kernel_includes.h not found in {ksu_dir}")
         return False
+    print(f"[INFO] Found {target}")
 
-    src = target.read_text(encoding="utf-8", errors="surrogateescape")
     marker = "SUSFS_5_4_STRNCPY_COMPAT"
+    src = target.read_text(encoding="utf-8", errors="surrogateescape")
     if marker in src:
         print(f"[SKIP] {target} already has strncpy compat shim")
         return True
 
-    # Find anchor: end of __strncpy_from_user_nofault definition
-    pat = re.compile(
-        r'(static\s+inline\s+long\s+__strncpy_from_user_nofault\s*\([^{]*\{[^}]*\})',
-        re.DOTALL,
-    )
-    m = pat.search(src)
-    if not m:
-        print(f"[ERROR] __strncpy_from_user_nofault not found in {target}")
-        return False
-
-    # Insert wrapper right after the __strncpy_from_user_nofault definition
-    insert_at = m.end()
+    # Try multiple anchors for __strncpy_from_user_nofault
     shim = (
-        "\n\n/* SUSFS_5_4_STRNCPY_COMPAT: wrapper for kernel < 5.10 */\n"
+        "\n\n/* SUSFS_5_4_STRNCPY_COMPAT */\n"
         "#include <linux/version.h>\n"
         "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n"
         "static inline long strncpy_from_user_nofault(char *dst,\n"
@@ -85,53 +122,61 @@ def patch_kernel_includes(ksu_dir: Path) -> bool:
         "}\n"
         "#endif\n"
     )
-    new_src = src[:insert_at] + shim + src[insert_at:]
 
+    anchors = [
+        # Anchor 1: closing brace of __strncpy_from_user_nofault function
+        # Find function signature, then walk to matching '}'
+        ("function_brace_walk", r'static\s+inline\s+long\s+__strncpy_from_user_nofault\s*\([^)]*\)\s*\{'),
+        # Anchor 2: just after the function signature line + body opener
+        ("after_function_decl", r'__strncpy_from_user_nofault\s*\([^)]*\)\s*\{'),
+    ]
+
+    for kind, pat_str in anchors:
+        pat = re.compile(pat_str, re.MULTILINE | re.DOTALL)
+        m = pat.search(src)
+        if not m:
+            continue
+
+        if kind in ("function_brace_walk", "after_function_decl"):
+            # Walk from end of match (which is at '{') to matching '}'
+            depth = 1
+            i = m.end()
+            while i < len(src) and depth > 0:
+                c = src[i]
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            insert_at = i  # right after closing '}'
+            new_src = src[:insert_at] + shim + src[insert_at:]
+
+            backup = target.with_suffix(target.suffix + ".bak_compat")
+            if not backup.exists():
+                shutil.copy2(target, backup)
+            target.write_text(new_src, encoding="utf-8", errors="surrogateescape")
+            print(f"[OK] {target}: shim inserted after __strncpy_from_user_nofault body")
+            return True
+
+    # Fallback: insert at end of file
+    print(f"[WARN] __strncpy_from_user_nofault not found, fallback to end of file")
+    new_src = src + "\n" + shim
     backup = target.with_suffix(target.suffix + ".bak_compat")
     if not backup.exists():
         shutil.copy2(target, backup)
-        print(f"[BACKUP] {backup}")
-
     target.write_text(new_src, encoding="utf-8", errors="surrogateescape")
-    print(f"[OK] {target}: added strncpy_from_user_nofault wrapper")
+    print(f"[OK] {target}: shim appended at end of file (fallback)")
     return True
 
 
 def patch_ksud(ksu_dir: Path) -> bool:
-    """Fix #2: add extern decls for ksu_selinux_hide_*."""
-    candidates = [
-        ksu_dir / "kernel" / "runtime" / "ksud.c",
-        ksu_dir / "runtime" / "ksud.c",
-        ksu_dir / "ksud.c",
-    ]
-    target = None
-    for c in candidates:
-        if c.is_file():
-            target = c
-            break
-    if target is None:
-        for f in ksu_dir.rglob("ksud.c"):
-            target = f
-            break
+    target = find_first(ksu_dir, "ksud.c")
     if target is None:
         print(f"[ERROR] ksud.c not found in {ksu_dir}")
         return False
-
-    src = target.read_text(encoding="utf-8", errors="surrogateescape")
-    marker = "SUSFS_5_4_SELINUX_HIDE_DECL"
-    if marker in src:
-        print(f"[SKIP] {target} already has selinux_hide decls")
-        return True
-
-    # Insert after the first #include block
-    pat_includes = re.compile(r'(^#include\s+[<"][^>"]+[>"]\s*\n)+', re.MULTILINE)
-    matches = list(pat_includes.finditer(src))
-    if not matches:
-        print(f"[ERROR] No #include block found in {target}")
-        return False
-
-    last_include_block = matches[-1] if len(matches) > 1 else matches[0]
-    insert_at = last_include_block.end()
+    print(f"[INFO] Found {target}")
 
     decls = (
         "\n/* SUSFS_5_4_SELINUX_HIDE_DECL */\n"
@@ -140,16 +185,14 @@ def patch_ksud(ksu_dir: Path) -> bool:
         "extern void ksu_selinux_hide_handle_second_stage(void);\n"
         "#endif\n\n"
     )
-    new_src = src[:insert_at] + decls + src[insert_at:]
 
-    backup = target.with_suffix(target.suffix + ".bak_compat")
-    if not backup.exists():
-        shutil.copy2(target, backup)
-        print(f"[BACKUP] {backup}")
-
-    target.write_text(new_src, encoding="utf-8", errors="surrogateescape")
-    print(f"[OK] {target}: added selinux_hide extern decls")
-    return True
+    msg = add_at_start_after_includes(
+        target,
+        content=decls,
+        marker="SUSFS_5_4_SELINUX_HIDE_DECL",
+    )
+    print(msg)
+    return msg.startswith("[OK]") or msg.startswith("[SKIP]")
 
 
 def main() -> int:
