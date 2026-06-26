@@ -71,7 +71,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bc bison build-essential ccache curl flex git libssl-dev libelf-dev zip unzip python3 python3-pip cpio rsync kmod patch python2
 
-      - name: Integrate SukiSU-Ultra builtin (pinned strict)
+      - name: Integrate SukiSU-Ultra builtin (pinned via setup.sh URL)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -79,6 +79,7 @@ jobs:
           echo "==> Running setup.sh from SukiSU-Ultra@$REF"
           curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${REF}/kernel/setup.sh" | bash -s "$SUKISU_MODE"
 
+          # Locate KSU dir
           KSU_DIR=""
           if [ -d "KernelSU" ]; then
             KSU_DIR="KernelSU"
@@ -89,23 +90,35 @@ jobs:
             exit 1
           fi
 
-          echo "==> Force pinning KSU module to ref: $REF"
-          rm -rf /tmp/sukisu-pin
-          git clone --depth=1 -b "$REF" https://github.com/SukiSU-Ultra/SukiSU-Ultra.git /tmp/sukisu-pin
-          if [ ! -d "/tmp/sukisu-pin/kernel" ]; then
-            echo "::error::Cloned ref does not have kernel/ directory"
+          echo "==> KSU_DIR contents:"
+          ls -la "$KSU_DIR"
+
+          # Verify Kconfig files exist
+          KCFG_FILES=$(find "$KSU_DIR" -maxdepth 4 -name "Kconfig" 2>/dev/null)
+          if [ -z "$KCFG_FILES" ]; then
+            echo "::error::No Kconfig found in $KSU_DIR"
             exit 1
           fi
-          rm -rf "$KSU_DIR"
-          mkdir -p "$KSU_DIR"
-          cp -a /tmp/sukisu-pin/kernel/. "$KSU_DIR/"
+          echo "==> Kconfig files found:"
+          echo "$KCFG_FILES"
+
+          # Verify SUSFS Kconfig entries
+          KCFG_COUNT=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" 2>/dev/null | wc -l)
+          echo "==> SUSFS Kconfig entries: $KCFG_COUNT"
+          if [ "$KCFG_COUNT" -lt 5 ]; then
+            echo "::error::Not enough SUSFS Kconfig entries (need >=5, got $KCFG_COUNT)"
+            echo "==> All configs in $KSU_DIR:"
+            grep -RnE "^[[:space:]]*config[[:space:]]+" "$KSU_DIR" 2>/dev/null | head -50
+            exit 1
+          fi
+
           echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
 
       - name: Verify SukiSU module-side has SUSFS callers
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          KCFG=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" | wc -l || echo 0)
+          KCFG=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" 2>/dev/null | wc -l || echo 0)
           REF=$(grep -RnE "CONFIG_KSU_SUSFS|susfs_" "$KSU_DIR" --include="*.c" --include="*.h" 2>/dev/null | wc -l || echo 0)
           echo "Kconfig SUSFS options: $KCFG"
           echo "Module SUSFS references: $REF"
@@ -147,19 +160,17 @@ jobs:
           echo "==> Real apply (--forward to skip already-applied)..."
           patch -p1 --forward -i "$PATCH" 2>&1 | tee /tmp/susfs_apply.log || true
 
-          # Check for .rej files
           REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
           if [ -n "$REJ" ]; then
             echo "::warning::.rej files present (refactored source diff):"
             echo "$REJ"
-            echo "==> Inspecting .rej for analysis (not failing build):"
             for f in $REJ; do
               echo "--- $f ---"
               cat "$f"
             done
           fi
 
-          # Verify essential SUSFS files copied
+          # Verify essential SUSFS files
           FAIL=0
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ -f "$f" ]; then
@@ -186,7 +197,6 @@ jobs:
           echo "==> Running inline hook script..."
           bash "$SCRIPT" 2>&1 | tee /tmp/jack_inline_hooks.log
 
-          # Script prints "[+] Patched!" for each file
           OK_COUNT=$(grep -c "\[+\].*Patched" /tmp/jack_inline_hooks.log || echo 0)
           FAIL_COUNT=$(grep -c "\[-\].*patch failed" /tmp/jack_inline_hooks.log || echo 0)
           SKIP_COUNT=$(grep -c "\[-\] Warning:.*contains KernelSU" /tmp/jack_inline_hooks.log || echo 0)
@@ -239,6 +249,13 @@ jobs:
           fi
           echo "Defconfig: $DC"
 
+          # Pre-extract all available KSU* Kconfig symbols (avoid grep errors)
+          AVAILABLE_CFGS=$(grep -RhE "^[[:space:]]*config[[:space:]]+KSU" "$KSU_DIR" 2>/dev/null | awk '{print $2}' | sort -u)
+          echo "==> Available KSU* Kconfig symbols:"
+          echo "$AVAILABLE_CFGS"
+          TOTAL=$(echo "$AVAILABLE_CFGS" | grep -c . || echo 0)
+          echo "==> Total: $TOTAL"
+
           WANTED=(
             CONFIG_KSU
             CONFIG_KSU_MANUAL_HOOK
@@ -258,12 +275,13 @@ jobs:
           SKIP=0
           for cfg in "${WANTED[@]}"; do
             sym="${cfg#CONFIG_}"
-            if grep -RqE "^[[:space:]]*config[[:space:]]+${sym}\b" "$KSU_DIR"; then
+            if echo "$AVAILABLE_CFGS" | grep -qx "$sym"; then
               sed -i -E "/^# ?${cfg}( is not set)?$/d;/^${cfg}=.*/d" "$DC"
               echo "${cfg}=y" >> "$DC"
+              echo "OK    $cfg=y"
               ADDED=$((ADDED+1))
             else
-              echo "::notice::Skip $cfg (Kconfig not defined)"
+              echo "Skip  $cfg (not in Kconfig)"
               SKIP=$((SKIP+1))
             fi
           done
