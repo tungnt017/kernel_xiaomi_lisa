@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v12
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v13
 
 on:
   workflow_dispatch:
@@ -70,9 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$KERNEL_DIR/.github/scripts"
-          cp -v workflow-repo/.github/scripts/fix_show_smap_return.py "$KERNEL_DIR/.github/scripts/"
-          cp -v workflow-repo/.github/scripts/fix_sukisu_5_4_compat.py "$KERNEL_DIR/.github/scripts/"
-          cp -v workflow-repo/.github/scripts/fix_stat_struct_mount.py "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_show_smap_return.py    "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_sukisu_5_4_compat.py   "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_stat_struct_mount.py   "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_selinux_hide_build.py  "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
@@ -241,7 +242,7 @@ jobs:
           set -euo pipefail
           chmod +x .github/scripts/fix_show_smap_return.py
           python3 .github/scripts/fix_show_smap_return.py | tee /tmp/fix_smap.log
-          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_smap.log; then
+          if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_smap.log; then
             echo "::error::show_smap fix reported errors"
             exit 1
           fi
@@ -252,7 +253,7 @@ jobs:
           set -euo pipefail
           chmod +x .github/scripts/fix_sukisu_5_4_compat.py
           python3 .github/scripts/fix_sukisu_5_4_compat.py | tee /tmp/fix_sukisu_compat.log
-          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_sukisu_compat.log; then
+          if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_sukisu_compat.log; then
             echo "::error::SukiSU 5.4 compat fix reported errors"
             exit 1
           fi
@@ -263,8 +264,21 @@ jobs:
           set -euo pipefail
           chmod +x .github/scripts/fix_stat_struct_mount.py
           python3 .github/scripts/fix_stat_struct_mount.py | tee /tmp/fix_stat_mount.log
-          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_stat_mount.log; then
+          if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_stat_mount.log; then
             echo "::error::stat.c struct mount fix reported errors"
+            exit 1
+          fi
+
+      - name: Fix selinux_hide build wiring
+        working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          SUKISU_REF: ${{ env.SUKISU_REF }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/fix_selinux_hide_build.py
+          python3 .github/scripts/fix_selinux_hide_build.py | tee /tmp/fix_selinux_hide.log
+          if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_selinux_hide.log; then
+            echo "::error::selinux_hide build fix reported errors"
             exit 1
           fi
 
@@ -304,10 +318,25 @@ jobs:
             echo "OK  struct mount fwd decl in fs/stat.c"
           fi
 
-          # Confirm misplaced shim cleaned from kernel_includes.h
+          KBUILD_FIX=$(find "$KSU_DIR" \( -name "Kbuild" -o -name "Makefile" \) -exec grep -l "SUSFS_5_4_SELINUX_HIDE_BUILD" {} \; 2>/dev/null | head -1)
+          if [ -z "$KBUILD_FIX" ]; then
+            echo "::error::selinux_hide build wiring marker missing"
+            FAIL=1
+          else
+            echo "OK  selinux_hide build wiring in $KBUILD_FIX"
+          fi
+
+          SELHIDE_C=$(find "$KSU_DIR" -name "selinux_hide.c" 2>/dev/null | head -1)
+          if [ -z "$SELHIDE_C" ]; then
+            echo "::error::selinux_hide.c source missing"
+            FAIL=1
+          else
+            echo "OK  selinux_hide.c at $SELHIDE_C ($(wc -l < "$SELHIDE_C") lines)"
+          fi
+
           BAD=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
           if [ -n "$BAD" ]; then
-            echo "::warning::misplaced shim still in $BAD (script cleanup may have failed)"
+            echo "::warning::misplaced shim still in $BAD"
           fi
 
           if [ "$FAIL" -ne 0 ]; then
@@ -454,6 +483,7 @@ jobs:
             /tmp/fix_smap.log
             /tmp/fix_sukisu_compat.log
             /tmp/fix_stat_mount.log
+            /tmp/fix_selinux_hide.log
           if-no-files-found: warn
           retention-days: 14
 
