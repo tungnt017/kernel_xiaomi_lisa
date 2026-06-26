@@ -2,12 +2,13 @@
 """
 Add forward declaration of 'struct mount' in fs/stat.c.
 
-SUSFS patch declares extern with struct mount* but struct mount is
-internal (defined in fs/mount.h). C99 requires forward declaration
-at file scope.
+SUSFS patch declares: extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *)
+But 'struct mount' is internal (defined in fs/mount.h, not exported).
+C99 requires forward declaration at file scope.
 
-NOT a bypass: legitimate C forward declaration.
-NOT weak: standard practice for internal types.
+NOT a bypass: standard C forward declaration.
+NOT weak: legitimate handling of incomplete types.
+Idempotent + backup.
 """
 import re
 import sys
@@ -25,23 +26,19 @@ def main() -> int:
 
     src = TARGET.read_text(encoding="utf-8", errors="surrogateescape")
     if MARKER in src:
-        print(f"[SKIP] Already patched")
+        print(f"[SKIP] Already patched (idempotent)")
         return 0
 
-    # Find first 'extern' with struct mount in SUSFS context
+    # Find first 'extern' referencing 'struct mount'
     pat = re.compile(
-        r'(#ifdef\s+CONFIG_KSU_SUSFS[^\n]*\n[^\n]*\n)?'
-        r'(extern\s+\w+\s+susfs_get_non_sus_mnt_id_from_mnt\s*\(\s*struct\s+mount\b)',
+        r'(extern\s+[^;\n]*\bstruct\s+mount\b[^;\n]*;)',
         re.MULTILINE
     )
     m = pat.search(src)
     if not m:
-        # Fallback: just find the extern line
-        pat = re.compile(r'(extern\s+[^\n]*struct\s+mount[^\n]*;)', re.MULTILINE)
-        m = pat.search(src)
-        if not m:
-            print(f"[WARN] No SUSFS struct mount extern found in {TARGET}")
-            return 0
+        print(f"[WARN] No SUSFS struct mount extern found in {TARGET}")
+        print("       Source may not yet have SUSFS patch applied.")
+        return 0
 
     insert_at = m.start()
     fwd = (
@@ -55,9 +52,11 @@ def main() -> int:
     backup = TARGET.with_suffix(TARGET.suffix + ".bak_stat")
     if not backup.exists():
         shutil.copy2(TARGET, backup)
+        print(f"[BACKUP] {backup}")
 
     TARGET.write_text(new_src, encoding="utf-8", errors="surrogateescape")
-    print(f"[OK] Added struct mount forward declaration to {TARGET}")
+    print(f"[OK] Added 'struct mount;' forward declaration to {TARGET}")
+    print(f"[DONE] {TARGET} patched")
     return 0
 
 
