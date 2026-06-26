@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v12
 
 on:
   workflow_dispatch:
@@ -72,6 +72,7 @@ jobs:
           mkdir -p "$KERNEL_DIR/.github/scripts"
           cp -v workflow-repo/.github/scripts/fix_show_smap_return.py "$KERNEL_DIR/.github/scripts/"
           cp -v workflow-repo/.github/scripts/fix_sukisu_5_4_compat.py "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_stat_struct_mount.py "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
@@ -110,7 +111,7 @@ jobs:
           KCFG_COUNT=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" 2>/dev/null | wc -l)
           echo "==> SUSFS Kconfig entries: $KCFG_COUNT"
           if [ "$KCFG_COUNT" -lt 5 ]; then
-            echo "::error::Not enough SUSFS Kconfig entries (need >=5, got $KCFG_COUNT)"
+            echo "::error::Not enough SUSFS Kconfig entries"
             grep -RnE "^[[:space:]]*config[[:space:]]+" "$KSU_DIR" 2>/dev/null | head -50
             exit 1
           fi
@@ -126,7 +127,7 @@ jobs:
           echo "Kconfig SUSFS options: $KCFG"
           echo "Module SUSFS references: $REF"
           if [ "$KCFG" -lt 5 ] || [ "$REF" -lt 50 ]; then
-            echo "::error::SukiSU module-side SUSFS thieu (KCFG=$KCFG, REF=$REF)"
+            echo "::error::SukiSU module-side SUSFS thieu"
             exit 1
           fi
           echo "OK - SukiSU module-side caller xac nhan."
@@ -160,7 +161,7 @@ jobs:
             tail -30 /tmp/susfs_dryrun.log
           fi
 
-          echo "==> Real apply (--forward to skip already-applied)..."
+          echo "==> Real apply (--forward)..."
           patch -p1 --forward -i "$PATCH" 2>&1 | tee /tmp/susfs_apply.log || true
 
           REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
@@ -256,7 +257,18 @@ jobs:
             exit 1
           fi
 
-      - name: Verify compat fixes applied
+      - name: Apply struct mount forward decl in fs/stat.c
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/fix_stat_struct_mount.py
+          python3 .github/scripts/fix_stat_struct_mount.py | tee /tmp/fix_stat_mount.log
+          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_stat_mount.log; then
+            echo "::error::stat.c struct mount fix reported errors"
+            exit 1
+          fi
+
+      - name: Verify all compat fixes applied
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
@@ -269,9 +281,9 @@ jobs:
             echo "OK  show_smap fix applied"
           fi
 
-          STRNCPY=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
+          STRNCPY=$(find "$KSU_DIR" -name "kernel_compat.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
           if [ -z "$STRNCPY" ]; then
-            echo "::error::strncpy compat shim missing"
+            echo "::error::strncpy compat shim missing in kernel_compat.h"
             FAIL=1
           else
             echo "OK  strncpy compat shim in $STRNCPY"
@@ -283,6 +295,19 @@ jobs:
             FAIL=1
           else
             echo "OK  selinux_hide decls in $KSUD"
+          fi
+
+          if ! grep -q "SUSFS_STRUCT_MOUNT_FWD_DECL" fs/stat.c; then
+            echo "::error::struct mount fwd decl missing in fs/stat.c"
+            FAIL=1
+          else
+            echo "OK  struct mount fwd decl in fs/stat.c"
+          fi
+
+          # Confirm misplaced shim cleaned from kernel_includes.h
+          BAD=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
+          if [ -n "$BAD" ]; then
+            echo "::warning::misplaced shim still in $BAD (script cleanup may have failed)"
           fi
 
           if [ "$FAIL" -ne 0 ]; then
@@ -344,7 +369,7 @@ jobs:
           done
           echo "Added=$ADDED Skipped=$SKIP"
           if [ "$ADDED" -lt 5 ]; then
-            echo "::error::Qua it config enable ($ADDED < 5)"
+            echo "::error::Qua it config enable"
             exit 1
           fi
           tail -n 40 "$DC"
@@ -428,6 +453,7 @@ jobs:
             /tmp/jack_inline_hooks.log
             /tmp/fix_smap.log
             /tmp/fix_sukisu_compat.log
+            /tmp/fix_stat_mount.log
           if-no-files-found: warn
           retention-days: 14
 
