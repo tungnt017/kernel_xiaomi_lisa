@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v14
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v15
 
 on:
   workflow_dispatch:
@@ -74,6 +74,7 @@ jobs:
           cp -v workflow-repo/.github/scripts/fix_sukisu_5_4_compat.py   "$KERNEL_DIR/.github/scripts/"
           cp -v workflow-repo/.github/scripts/fix_stat_struct_mount.py   "$KERNEL_DIR/.github/scripts/"
           cp -v workflow-repo/.github/scripts/fix_selinux_hide_build.py  "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_devpts_hook.py         "$KERNEL_DIR/.github/scripts/"
 
       - name: Install minimal build deps
         run: |
@@ -269,6 +270,17 @@ jobs:
             exit 1
           fi
 
+      - name: Apply devpts hook (official KSU manual hook)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/fix_devpts_hook.py
+          python3 .github/scripts/fix_devpts_hook.py | tee /tmp/fix_devpts.log
+          if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_devpts.log; then
+            echo "::error::devpts hook fix reported errors"
+            exit 1
+          fi
+
       - name: Fix selinux_hide (version-aware compat v3)
         working-directory: ${{ env.KERNEL_DIR }}
         env:
@@ -318,7 +330,13 @@ jobs:
             echo "OK  struct mount fwd decl in fs/stat.c"
           fi
 
-          # selinux_hide version-aware check
+          if ! grep -q "ksu_handle_devpts" fs/devpts/inode.c; then
+            echo "::error::devpts hook missing in fs/devpts/inode.c"
+            FAIL=1
+          else
+            echo "OK  devpts hook in fs/devpts/inode.c"
+          fi
+
           KSUD_FILE=$(find "$KSU_DIR" -name "ksud.c" | head -1)
           if [ -z "$KSUD_FILE" ]; then
             echo "::error::ksud.c not found"
@@ -330,7 +348,6 @@ jobs:
             echo "Kernel version detected: $MAJOR.$MINOR"
 
             if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 6 ]; }; then
-              # Kernel < 6.6: expect guard markers, NO build wiring
               if ! grep -q "SUSFS_5_4_SELINUX_HIDE_GUARD" "$KSUD_FILE"; then
                 echo "::error::Expected guard markers in $KSUD_FILE for kernel < 6.6"
                 FAIL=1
@@ -346,7 +363,6 @@ jobs:
                 echo "OK  No selinux_hide.o build wiring (correct for kernel < 6.6)"
               fi
             else
-              # Kernel >= 6.6: expect build wiring
               KBUILD_FIX=$(find "$KSU_DIR" \( -name "Kbuild" -o -name "Makefile" \) -exec grep -l "SUSFS_5_4_SELINUX_HIDE_BUILD" {} \; 2>/dev/null | head -1)
               if [ -z "$KBUILD_FIX" ]; then
                 echo "::error::Expected build wiring for kernel >= 6.6"
@@ -506,6 +522,7 @@ jobs:
             /tmp/fix_smap.log
             /tmp/fix_sukisu_compat.log
             /tmp/fix_stat_mount.log
+            /tmp/fix_devpts.log
             /tmp/fix_selinux_hide.log
           if-no-files-found: warn
           retention-days: 14
