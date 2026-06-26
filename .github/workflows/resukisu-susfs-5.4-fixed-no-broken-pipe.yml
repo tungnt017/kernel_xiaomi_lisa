@@ -1,5 +1,5 @@
 
-name: ReSukiSU SUSFS 5.4 - Strict Full Build No Stub
+name: ReSukiSU SUSFS 5.4 - Strict Full Build Setresuid Return Hook
 
 on:
   workflow_dispatch:
@@ -44,7 +44,6 @@ jobs:
   strict-full-build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       JACK_REPO: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git"
       JACK_BRANCH: "mainline"
@@ -88,9 +87,7 @@ jobs:
           echo "RUN_BUILD=${{ github.event.inputs.run_build }}" >> "$GITHUB_ENV"
           echo "AUTO_FIX_DEFCONFIG=${{ github.event.inputs.auto_fix_defconfig }}" >> "$GITHUB_ENV"
           rm -rf "$DEBUG_DIR" && mkdir -p "$DEBUG_DIR"
-          : > "$DEBUG_SUMMARY"
-          : > "$DEBUG_DIFF"
-          : > "$DEBUG_BUILD_LOG"
+          : > "$DEBUG_SUMMARY"; : > "$DEBUG_DIFF"; : > "$DEBUG_BUILD_LOG"
           {
             echo "=== Inputs ==="
             echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
@@ -122,11 +119,7 @@ jobs:
           [ "$VERSION" = "5" ] && [ "$PATCHLEVEL" = "4" ] || { echo "[ERROR] Need kernel 5.4, got ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; exit 1; }
           DEFCONFIG="$INPUT_DEFCONFIG"
           if [ -z "$DEFCONFIG" ]; then
-            if [ -f arch/arm64/configs/lisa_defconfig ]; then
-              DEFCONFIG="arch/arm64/configs/lisa_defconfig"
-            else
-              DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p')
-            fi
+            if [ -f arch/arm64/configs/lisa_defconfig ]; then DEFCONFIG="arch/arm64/configs/lisa_defconfig"; else DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p'); fi
           fi
           test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
@@ -157,19 +150,17 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then
-            python3 "$MANUAL_HOOK_SCRIPT"
-          else
-            echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"
-          fi
+          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then python3 "$MANUAL_HOOK_SCRIPT"; else echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"; fi
 
-      - name: Strict real patch for ksu_handle_setresuid - no weak no stub no no-op
+      - name: Strict real setresuid hook - no weak no stub no no-op
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
+          import re
+
           p = Path('kernel/sys.c')
           if not p.exists():
               raise SystemExit('[ERROR] kernel/sys.c not found')
@@ -177,12 +168,14 @@ jobs:
           marker = 'SYSCALL_DEFINE3(setresuid'
           if marker not in s:
               raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(setresuid in kernel/sys.c')
+
           changed = False
+          extern_decl = '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n'
           if 'extern int ksu_handle_setresuid' not in s:
-              extern = '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n'
               idx = s.find(marker)
-              s = s[:idx] + extern + s[idx:]
+              s = s[:idx] + extern_decl + s[idx:]
               changed = True
+
           start = s.find(marker)
           brace = s.find('{', start)
           if brace < 0:
@@ -199,22 +192,32 @@ jobs:
                       break
           if end is None:
               raise SystemExit('[ERROR] Cannot parse setresuid body end')
+
           body = s[brace:end]
           call = 'ksu_handle_setresuid(ruid, euid, suid);'
+          hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
+
           if call not in body:
-              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
+              # Best case: full implementation commits credentials in this function.
               if 'return commit_creds(new);' in body:
-                  body = body.replace('return commit_creds(new);', hook + 'return commit_creds(new);', 1)
+                  body2 = body.replace('return commit_creds(new);', hook + 'return commit_creds(new);', 1)
               elif 'commit_creds(new);' in body:
-                  body = body.replace('commit_creds(new);', hook + 'commit_creds(new);', 1)
+                  body2 = body.replace('commit_creds(new);', hook + 'commit_creds(new);', 1)
               else:
-                  raise SystemExit('[ERROR] commit_creds(new) not found in setresuid; refusing weak/stub/no-op workaround')
-              s = s[:brace] + body + s[end:]
+                  # Vendor kernels may wrap setresuid into a helper, e.g. return __sys_setresuid(...).
+                  # Insert before the final return in SYSCALL_DEFINE3(setresuid). This is a real call to
+                  # ReSukiSU's implementation, not weak/stub/no-op, and avoids fake bypasses.
+                  returns = list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
+                  if not returns:
+                      raise SystemExit('[ERROR] No return statement found in setresuid; refusing weak/stub/no-op workaround')
+                  r = returns[-1]
+                  body2 = body[:r.start()] + '\t' + hook + body[r.start():]
+              s = s[:brace] + body2 + s[end:]
               changed = True
+
           p.write_text(s)
-          print('[OK] Real setresuid hook present' + (' and patched' if changed else ''))
+          print('[OK] Real ksu_handle_setresuid call is present' + (' and patched' if changed else ''))
           PY
-          # Strict: do not allow weak/stub/no-op fake ksu_handle functions in patched kernel-side files.
           if grep -RInE '(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)' fs kernel mm security drivers 2>/dev/null; then
             echo "[ERROR] Weak ksu_handle shim detected. Refusing build."
             exit 1
@@ -225,7 +228,7 @@ jobs:
           fi
           { echo "=== setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Verify required real hooks before SUSFS
+      - name: Verify required hooks before SUSFS
         shell: bash
         run: |
           set -euo pipefail
@@ -236,22 +239,15 @@ jobs:
           check fs/stat.c ksu_handle_stat
           check fs/open.c ksu_handle_faccessat
           check kernel/sys.c ksu_handle_setresuid
-          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c 2>/dev/null | sed -n '1,320p' || true; echo; } >> "$DEBUG_SUMMARY"
+          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c 2>/dev/null | sed -n '1,340p' || true; echo; } >> "$DEBUG_SUMMARY"
           [ "$fail" -eq 0 ] || exit 1
 
-      - name: Apply SUSFS patch strictly - no already-applied bypass
+      - name: Apply SUSFS patch strictly
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if git apply --check "$PATCH_LOCAL"; then
-            git apply "$PATCH_LOCAL"
-          elif patch -p1 --dry-run < "$PATCH_LOCAL"; then
-            patch -p1 < "$PATCH_LOCAL"
-          else
-            echo "[ERROR] SUSFS patch failed. Not bypassing."
-            exit 1
-          fi
+          if git apply --check "$PATCH_LOCAL"; then git apply "$PATCH_LOCAL"; elif patch -p1 --dry-run < "$PATCH_LOCAL"; then patch -p1 < "$PATCH_LOCAL"; else echo "[ERROR] SUSFS patch failed. Not bypassing."; exit 1; fi
           rej=$(find . -name "*.rej" -print)
           [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
           find . -name "*.orig" -print -delete || true
@@ -261,13 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          ensure_y() {
-            cfg="$1"
-            if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then return 0; fi
-            [ "$AUTO_FIX_DEFCONFIG" = "true" ] || { echo "[ERROR] Missing $cfg=y"; exit 1; }
-            sed -i "/^# ${cfg} is not set$/d;/^${cfg}=/d" "$DEFCONFIG"
-            printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"
-          }
+          ensure_y() { cfg="$1"; if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then return 0; fi; [ "$AUTO_FIX_DEFCONFIG" = "true" ] || { echo "[ERROR] Missing $cfg=y"; exit 1; }; sed -i "/^# ${cfg} is not set$/d;/^${cfg}=/d" "$DEFCONFIG"; printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"; }
           unset_cfg() { cfg="$1"; sed -i "/^${cfg}=y$/d;/^${cfg}=/d" "$DEFCONFIG"; grep -qE "^# ${cfg} is not set$" "$DEFCONFIG" || printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"; }
           ensure_y CONFIG_KSU
           ensure_y CONFIG_KSU_MANUAL_HOOK
