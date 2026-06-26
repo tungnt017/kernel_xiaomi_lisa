@@ -1,0 +1,435 @@
+name: ReSukiSU SUSFS 5.4 - Git Apply Verify Then Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_dir:
+        description: "Kernel source directory in this repository"
+        required: false
+        default: "."
+      defconfig:
+        description: "Optional defconfig path. Example: arch/arm64/configs/vendor/your_defconfig"
+        required: false
+        default: ""
+      manual_hook_script:
+        description: "Manual hook script path. Leave default if your script exists there"
+        required: false
+        default: ".github/scripts/apply_resukisu_manual_hooks_1_fixed.py"
+      run_resukisu_setup:
+        description: "Run ReSukiSU setup.sh before hooks? true/false"
+        required: false
+        default: "false"
+      build_command:
+        description: "Build command. Empty = verify only, no build"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  verify-patch-build:
+    name: Clone Jack patch, git-apply/patch verify, then build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      JACK_REPO: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git"
+      JACK_BRANCH: "mainline"
+      JACK_PATCH_REL: "Patches/Patch/susfs_patch_to_5.4.patch"
+      PATCH_LOCAL: "/tmp/susfs_patch_to_5.4.patch"
+
+    steps:
+      - name: Checkout kernel repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install verification/build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libssl-dev make patch python3 rsync unzip xz-utils ca-certificates
+
+      - name: Export inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "KERNEL_DIR=${{ github.event.inputs.kernel_dir }}" >> "$GITHUB_ENV"
+          echo "DEFCONFIG=${{ github.event.inputs.defconfig }}" >> "$GITHUB_ENV"
+          echo "MANUAL_HOOK_SCRIPT=${{ github.event.inputs.manual_hook_script }}" >> "$GITHUB_ENV"
+          echo "RUN_RESUKISU_SETUP=${{ github.event.inputs.run_resukisu_setup }}" >> "$GITHUB_ENV"
+
+      - name: Verify kernel tree layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          echo "[INFO] Kernel root: $(pwd)"
+
+          test -f Makefile || { echo "[ERROR] Makefile not found. Wrong kernel_dir?"; exit 1; }
+          test -d fs || { echo "[ERROR] fs/ not found."; exit 1; }
+          test -d include || { echo "[ERROR] include/ not found."; exit 1; }
+          test -d arch || { echo "[ERROR] arch/ not found."; exit 1; }
+
+          echo "[OK] Kernel tree layout valid."
+
+      - name: Verify kernel version is 5.4 target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          VERSION=$(awk '/^VERSION =/{print $3}' Makefile)
+          PATCHLEVEL=$(awk '/^PATCHLEVEL =/{print $3}' Makefile)
+          SUBLEVEL=$(awk '/^SUBLEVEL =/{print $3}' Makefile)
+          echo "[INFO] Kernel version: ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+
+          if [ "$VERSION" != "5" ] || [ "$PATCHLEVEL" != "4" ]; then
+            echo "[ERROR] This workflow uses susfs_patch_to_5.4.patch but kernel is ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}."
+            echo "[ERROR] Stop early to avoid wasting build time."
+            exit 1
+          fi
+          echo "[OK] Kernel version matches 5.4."
+
+      - name: Clone JackA1ltman NonGKI patches and copy SUSFS 5.4 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/NonGKI_Kernel_Build_2nd
+          git clone --depth=1 --branch "$JACK_BRANCH" "$JACK_REPO" /tmp/NonGKI_Kernel_Build_2nd
+
+          SRC="/tmp/NonGKI_Kernel_Build_2nd/$JACK_PATCH_REL"
+          test -f "$SRC" || { echo "[ERROR] Patch not found: $SRC"; exit 1; }
+          cp -f "$SRC" "$PATCH_LOCAL"
+
+          echo "[OK] Copied patch to $PATCH_LOCAL"
+          echo "[INFO] Patch sha256:"
+          sha256sum "$PATCH_LOCAL"
+          echo "[INFO] Patch diff files:"
+          grep -n '^diff --git' "$PATCH_LOCAL" | head -160
+
+      - name: Verify patch contains SUSFS core changes/files
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+
+          require_in_patch() {
+            local pattern="$1"
+            local desc="$2"
+            if grep -qE "$pattern" "$PATCH_LOCAL"; then
+              echo "[OK] Patch contains: $desc"
+              grep -nE "$pattern" "$PATCH_LOCAL" | head -10
+            else
+              echo "[ERROR] Patch missing: $desc"
+              fail=1
+            fi
+          }
+
+          require_in_patch 'diff --git a/fs/Makefile b/fs/Makefile' 'fs/Makefile modification'
+          require_in_patch 'CONFIG_KSU_SUSFS' 'CONFIG_KSU_SUSFS references'
+          require_in_patch 'diff --git a/fs/namei\.c b/fs/namei\.c' 'fs/namei.c modification'
+          require_in_patch 'susfs_def\.h|susfs\.h|fs/susfs\.c' 'SUSFS source/header references'
+
+          if [ "$fail" -ne 0 ]; then
+            echo "[ERROR] Patch content verification failed."
+            exit 1
+          fi
+
+      - name: Optional - run ReSukiSU setup.sh
+        if: ${{ github.event.inputs.run_resukisu_setup == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+      - name: Verify ReSukiSU or KernelSU source exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          if [ -d KernelSU ] || [ -d ReSukiSU ] || grep -Rqs "config KSU" . 2>/dev/null; then
+            echo "[OK] ReSukiSU/KernelSU source or Kconfig symbols detected."
+          else
+            echo "[ERROR] ReSukiSU/KernelSU not detected."
+            echo "[HINT] Re-run with run_resukisu_setup=true or add ReSukiSU source before this workflow."
+            exit 1
+          fi
+
+      - name: Apply manual hook script if present
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          if [ -n "$MANUAL_HOOK_SCRIPT" ] && [ -f "$MANUAL_HOOK_SCRIPT" ]; then
+            echo "[INFO] Running manual hook script: $MANUAL_HOOK_SCRIPT"
+            python3 "$MANUAL_HOOK_SCRIPT"
+          else
+            echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"
+            echo "[WARN] Will verify existing manual hooks next."
+          fi
+
+      - name: Verify required ReSukiSU manual hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          fail=0
+
+          check_required() {
+            local file="$1"
+            local pattern="$2"
+            if [ ! -f "$file" ]; then
+              echo "[ERROR] Missing file: $file"
+              fail=1
+              return
+            fi
+            if grep -q "$pattern" "$file"; then
+              echo "[OK] $file has $pattern"
+              grep -n "$pattern" "$file" | head -20
+            else
+              echo "[ERROR] $file missing required hook: $pattern"
+              fail=1
+            fi
+          }
+
+          check_optional() {
+            local file="$1"
+            local pattern="$2"
+            if [ -f "$file" ] && grep -q "$pattern" "$file"; then
+              echo "[OK] optional $file has $pattern"
+              grep -n "$pattern" "$file" | head -20
+            else
+              echo "[WARN] optional hook not found: $file -> $pattern"
+            fi
+          }
+
+          check_required fs/exec.c "ksu_handle_execveat"
+          check_required fs/stat.c "ksu_handle_stat"
+          check_required fs/open.c "ksu_handle_faccessat"
+          check_optional fs/read_write.c "ksu_handle_vfs_read"
+          check_optional fs/stat.c "ksu_handle_newfstat_ret"
+          check_optional fs/stat.c "ksu_handle_fstat64_ret"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "[ERROR] Required manual hooks missing. Stop before SUSFS patch/build."
+            exit 1
+          fi
+
+      - name: Detect suspicious duplicate hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          fail=0
+
+          for item in \
+            "fs/exec.c:ksu_handle_execveat:8" \
+            "fs/stat.c:ksu_handle_stat:10" \
+            "fs/open.c:ksu_handle_faccessat:8" \
+            "fs/read_write.c:ksu_handle_vfs_read:8"; do
+            file="${item%%:*}"
+            rest="${item#*:}"
+            pattern="${rest%%:*}"
+            max="${rest##*:}"
+            [ -f "$file" ] || continue
+            count=$(grep -c "$pattern" "$file" || true)
+            echo "[INFO] $file $pattern count=$count max=$max"
+            if [ "$count" -gt "$max" ]; then
+              echo "[ERROR] Suspicious duplicate hook count: $file $pattern"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Verify defconfig KSU/SUSFS options if defconfig provided
+        if: ${{ github.event.inputs.defconfig != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
+          fail=0
+
+          require_config() {
+            local cfg="$1"
+            if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then
+              echo "[OK] $cfg=y"
+            else
+              echo "[ERROR] Missing $cfg=y in $DEFCONFIG"
+              fail=1
+            fi
+          }
+
+          require_config CONFIG_KSU
+          require_config CONFIG_KSU_MANUAL_HOOK
+          require_config CONFIG_KSU_SUSFS
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Dry-run SUSFS patch - prefer git apply, fallback patch -p1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          echo "[INFO] Try git apply --check first..."
+          if git apply --check "$PATCH_LOCAL"; then
+            echo "SUSFS_PATCH_METHOD=git_apply" >> "$GITHUB_ENV"
+            echo "SUSFS_PATCH_STATE=need_apply" >> "$GITHUB_ENV"
+            echo "[OK] git apply --check passed."
+          else
+            echo "[WARN] git apply --check failed. Try patch -p1 --dry-run..."
+            if patch -p1 --dry-run < "$PATCH_LOCAL"; then
+              echo "SUSFS_PATCH_METHOD=patch_p1" >> "$GITHUB_ENV"
+              echo "SUSFS_PATCH_STATE=need_apply" >> "$GITHUB_ENV"
+              echo "[OK] patch -p1 --dry-run passed."
+            else
+              echo "[WARN] Both git apply and patch -p1 dry-run failed."
+              echo "[INFO] Checking if SUSFS already applied..."
+              if grep -q "CONFIG_KSU_SUSFS" fs/Makefile 2>/dev/null && \
+                 { test -f fs/susfs.c || grep -Rqs "susfs" fs include 2>/dev/null; }; then
+                echo "SUSFS_PATCH_STATE=already_applied" >> "$GITHUB_ENV"
+                echo "SUSFS_PATCH_METHOD=none" >> "$GITHUB_ENV"
+                echo "[OK] SUSFS markers found, treating as already applied."
+              else
+                echo "[ERROR] SUSFS patch cannot be applied and is not already applied."
+                echo "[INFO] Possible causes: vendor source differs, previous partial patch, wrong patch version."
+                exit 1
+              fi
+            fi
+          fi
+
+      - name: Apply SUSFS 5.4 patch
+        if: env.SUSFS_PATCH_STATE == 'need_apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          if [ "$SUSFS_PATCH_METHOD" = "git_apply" ]; then
+            echo "[INFO] Applying SUSFS patch with git apply..."
+            git apply "$PATCH_LOCAL"
+          elif [ "$SUSFS_PATCH_METHOD" = "patch_p1" ]; then
+            echo "[INFO] Applying SUSFS patch with patch -p1..."
+            patch -p1 < "$PATCH_LOCAL"
+          else
+            echo "[ERROR] Unknown SUSFS_PATCH_METHOD=$SUSFS_PATCH_METHOD"
+            exit 1
+          fi
+
+          echo "[OK] SUSFS patch applied using $SUSFS_PATCH_METHOD."
+
+      - name: Verify no reject/orig files after patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          found=$(find . \( -name "*.rej" -o -name "*.orig" \) -print)
+          if [ -n "$found" ]; then
+            echo "[ERROR] Patch reject/orig files found:"
+            echo "$found"
+            exit 1
+          fi
+          echo "[OK] No .rej or .orig files."
+
+      - name: Verify SUSFS files and markers after patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          fail=0
+
+          if grep -q "CONFIG_KSU_SUSFS" fs/Makefile; then
+            echo "[OK] fs/Makefile contains CONFIG_KSU_SUSFS"
+            grep -n "CONFIG_KSU_SUSFS" fs/Makefile
+          else
+            echo "[ERROR] fs/Makefile missing CONFIG_KSU_SUSFS"
+            fail=1
+          fi
+
+          if [ -f fs/susfs.c ]; then
+            echo "[OK] fs/susfs.c exists"
+          else
+            echo "[ERROR] fs/susfs.c missing"
+            fail=1
+          fi
+
+          if ls include/linux/susfs* >/dev/null 2>&1; then
+            echo "[OK] SUSFS headers exist:"
+            ls -l include/linux/susfs*
+          else
+            echo "[ERROR] include/linux/susfs* headers missing"
+            fail=1
+          fi
+
+          if grep -Rqs "susfs" fs include/linux kernel security 2>/dev/null; then
+            echo "[OK] SUSFS references found. First matches:"
+            grep -Rsn "susfs" fs include/linux kernel security 2>/dev/null | head -160
+          else
+            echo "[ERROR] No SUSFS references found in expected paths."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Verify Kconfig symbols after patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          echo "[INFO] KSU/SUSFS Kconfig references:"
+          grep -RsnE "config KSU|KSU_SUSFS|KSU_MANUAL_HOOK" . 2>/dev/null | head -200 || true
+
+          grep -Rqs "KSU_SUSFS" . 2>/dev/null || {
+            echo "[ERROR] KSU_SUSFS not found anywhere after patch."
+            exit 1
+          }
+          echo "[OK] Kconfig/SUSFS symbol verification passed."
+
+      - name: Final pre-build diff and sanity summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          echo "[INFO] git diff --stat:"
+          git diff --stat || true
+
+          echo "[INFO] Key hook lines:"
+          grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c 2>/dev/null | head -200 || true
+
+          echo "[INFO] Key SUSFS files:"
+          find fs include/linux -maxdepth 3 -iname "*susfs*" -print | sort || true
+
+          echo "[OK] All verification finished. Build can start."
+
+      - name: Build kernel
+        if: ${{ github.event.inputs.build_command != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          echo "[INFO] Build command: ${{ github.event.inputs.build_command }}"
+          bash -lc "${{ github.event.inputs.build_command }}"
+
+      - name: Verification-only completed
+        if: ${{ github.event.inputs.build_command == '' }}
+        shell: bash
+        run: |
+          echo "[OK] build_command empty: verification-only completed."
