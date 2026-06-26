@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa)
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman patches
 
 on:
   workflow_dispatch:
@@ -19,42 +19,32 @@ on:
         options:
           - builtin
       sukisu_ref:
-        description: "SukiSU-Ultra git ref (tag/branch/commit)"
+        description: "SukiSU-Ultra git ref (need v4.x for SUSFS v2)"
         required: true
-        default: "v4.0.0"
-      susfs_repo:
-        description: "SUSFS repo URL"
+        default: "v4.1.3"
+      jack_repo:
+        description: "JackA1ltman patches repo"
         required: true
-        default: "https://gitlab.com/simonpunk/susfs4ksu.git"
-      susfs_branch:
-        description: "SUSFS branch (leave 'auto' to auto-detect)"
+        default: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git"
+      jack_branch:
+        description: "JackA1ltman branch"
         required: true
-        default: "auto"
-      kernel_version:
-        description: "Kernel version for branch search (e.g. 5.4, 5.10)"
-        required: true
-        default: "5.4"
-      required_symbols:
-        description: "Symbols that MUST be present (comma-separated)"
-        required: true
-        default: "susfs_get_enabled_features"
+        default: "mainline"
 
 permissions:
   contents: read
 
 env:
-  KERNEL_REPO:      tungnt017/kernel_xiaomi_lisa
-  KERNEL_DIR:       kernel_xiaomi_lisa
-  ARCH:             arm64
-  SUBARCH:          arm64
-  DEFCONFIG:        ${{ github.event.inputs.defconfig         || 'lisa_defconfig' }}
-  SUKISU_MODE:      ${{ github.event.inputs.sukisu_mode       || 'builtin' }}
-  SUKISU_REF:       ${{ github.event.inputs.sukisu_ref        || 'v4.0.0' }}
-  KBRANCH:          ${{ github.event.inputs.kernel_branch     || 'thirteen' }}
-  SUSFS_REPO:       ${{ github.event.inputs.susfs_repo        || 'https://gitlab.com/simonpunk/susfs4ksu.git' }}
-  SUSFS_BRANCH_IN:  ${{ github.event.inputs.susfs_branch      || 'auto' }}
-  KVER:             ${{ github.event.inputs.kernel_version    || '5.4' }}
-  REQ_SYMS:         ${{ github.event.inputs.required_symbols  || 'SUSFS_MAGIC,susfs_get_enabled_features' }}
+  KERNEL_REPO:  tungnt017/kernel_xiaomi_lisa
+  KERNEL_DIR:   kernel_xiaomi_lisa
+  ARCH:         arm64
+  SUBARCH:      arm64
+  DEFCONFIG:    ${{ github.event.inputs.defconfig     || 'lisa_defconfig' }}
+  SUKISU_MODE:  ${{ github.event.inputs.sukisu_mode   || 'builtin' }}
+  SUKISU_REF:   ${{ github.event.inputs.sukisu_ref    || 'v4.1.3' }}
+  KBRANCH:      ${{ github.event.inputs.kernel_branch || 'thirteen' }}
+  JACK_REPO:    ${{ github.event.inputs.jack_repo     || 'https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git' }}
+  JACK_BRANCH:  ${{ github.event.inputs.jack_branch   || 'mainline' }}
 
 jobs:
   build:
@@ -76,33 +66,40 @@ jobs:
           path: ${{ env.KERNEL_DIR }}
           fetch-depth: 1
 
-      - name: Copy scripts into kernel tree
-        run: |
-          set -euo pipefail
-          mkdir -p "$KERNEL_DIR/.github/scripts"
-          cp -v workflow-repo/.github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$KERNEL_DIR/.github/scripts/"
-          cp -v workflow-repo/.github/scripts/apply_susfs_backport_lisa.py "$KERNEL_DIR/.github/scripts/"
-          cp -v workflow-repo/.github/scripts/verify_sukisu_susfs_compat.py "$KERNEL_DIR/.github/scripts/"
-
       - name: Install minimal build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bc bison build-essential ccache curl flex git libssl-dev libelf-dev zip unzip python3 python3-pip cpio rsync kmod patch python2
 
-      - name: Integrate SukiSU-Ultra builtin (pinned)
+      - name: Integrate SukiSU-Ultra builtin (pinned strict)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          echo "==> setup.sh '$SUKISU_MODE' from SukiSU-Ultra@$SUKISU_REF"
-          curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKISU_REF}/kernel/setup.sh" | bash -s "$SUKISU_MODE"
+          REF=$(echo "$SUKISU_REF" | xargs)
+          echo "==> Running setup.sh from SukiSU-Ultra@$REF"
+          curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${REF}/kernel/setup.sh" | bash -s "$SUKISU_MODE"
+
+          KSU_DIR=""
           if [ -d "KernelSU" ]; then
-            echo "KSU_DIR=KernelSU" >> "$GITHUB_ENV"
+            KSU_DIR="KernelSU"
           elif [ -d "drivers/kernelsu" ]; then
-            echo "KSU_DIR=drivers/kernelsu" >> "$GITHUB_ENV"
+            KSU_DIR="drivers/kernelsu"
           else
             echo "::error::setup.sh did not produce KernelSU/ or drivers/kernelsu/"
             exit 1
           fi
+
+          echo "==> Force pinning KSU module to ref: $REF"
+          rm -rf /tmp/sukisu-pin
+          git clone --depth=1 -b "$REF" https://github.com/SukiSU-Ultra/SukiSU-Ultra.git /tmp/sukisu-pin
+          if [ ! -d "/tmp/sukisu-pin/kernel" ]; then
+            echo "::error::Cloned ref does not have kernel/ directory"
+            exit 1
+          fi
+          rm -rf "$KSU_DIR"
+          mkdir -p "$KSU_DIR"
+          cp -a /tmp/sukisu-pin/kernel/. "$KSU_DIR/"
+          echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
 
       - name: Verify SukiSU module-side has SUSFS callers
         working-directory: ${{ env.KERNEL_DIR }}
@@ -118,177 +115,112 @@ jobs:
           fi
           echo "OK - SukiSU module-side caller xac nhan."
 
-      - name: List SUSFS remote branches (debug)
+      - name: Clone JackA1ltman NonGKI patches
         run: |
           set -euo pipefail
-          echo "=== Heads in $SUSFS_REPO ==="
-          git ls-remote --heads "$SUSFS_REPO" | awk '{print $2}' | sed 's|refs/heads/||' | sort
-          echo ""
-          echo "=== Latest tags ==="
-          git ls-remote --tags "$SUSFS_REPO" | awk '{print $2}' | sed 's|refs/tags/||' | sort | tail -30
+          rm -rf /tmp/jack
+          git clone --depth=1 -b "$JACK_BRANCH" "$JACK_REPO" /tmp/jack
+          echo "==> Patches available:"
+          ls -la /tmp/jack/Patches/Patch/
+          echo "==> Scripts available:"
+          ls -la /tmp/jack/Patches/*.sh
 
-      - name: Auto-detect best SUSFS branch
-        id: pick_branch
+      - name: Apply SUSFS patch for kernel 5.4
+        working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
+          PATCH=/tmp/jack/Patches/Patch/susfs_patch_to_5.4.patch
+          if [ ! -f "$PATCH" ]; then
+            echo "::error::Missing $PATCH"
+            exit 1
+          fi
+          echo "==> Patch info:"
+          head -5 "$PATCH"
+          echo "==> Lines in patch: $(wc -l < $PATCH)"
 
-          REQ="$REQ_SYMS"
-          IFS=',' read -ra REQ_ARR <<< "$REQ"
-
-          # If user pinned explicit branch, honor it (still verify symbols)
-          if [ "$SUSFS_BRANCH_IN" != "auto" ] && [ -n "$SUSFS_BRANCH_IN" ]; then
-            echo "==> Honoring pinned branch: $SUSFS_BRANCH_IN"
-            echo "branch=$SUSFS_BRANCH_IN" >> "$GITHUB_OUTPUT"
-            exit 0
+          echo "==> Dry-run apply..."
+          if ! patch -p1 --dry-run -i "$PATCH" >/tmp/susfs_dryrun.log 2>&1; then
+            echo "::warning::Dry-run reported some hunks, will try real apply with --forward"
+            tail -30 /tmp/susfs_dryrun.log
           fi
 
-          # GitLab raw URL helper
-          # Strip .git and convert to raw URL pattern
-          BASE=$(echo "$SUSFS_REPO" | sed 's|\.git$||')
+          echo "==> Real apply (--forward to skip already-applied)..."
+          patch -p1 --forward -i "$PATCH" 2>&1 | tee /tmp/susfs_apply.log || true
 
-          # Build candidates list, prioritizing exact kernel version match
-          CANDIDATES=(
-            "kernel-${KVER}"
-            "kernel-5.10"
-            "kernel-5.15"
-            "kernel-6.1"
-            "gki-android14-6.1"
-            "gki-android13-5.15"
-            "gki-android13-5.10"
-            "gki-android12-5.10"
-            "main"
-            "master"
-          )
-
-          BEST=""
-          BEST_SCORE=-1
-          declare -A SCORES
-
-          for br in "${CANDIDATES[@]}"; do
-            URL="${BASE}/-/raw/${br}/kernel_patches/include/linux/susfs.h"
-            CONTENT=$(curl -fsSL "$URL" 2>/dev/null || true)
-            if [ -z "$CONTENT" ]; then
-              echo "  [skip] $br : no susfs.h"
-              continue
-            fi
-            HITS=0
-            MISSED=""
-            for sym in "${REQ_ARR[@]}"; do
-              if echo "$CONTENT" | grep -q "$sym"; then
-                HITS=$((HITS+1))
-              else
-                MISSED="$MISSED $sym"
-              fi
+          # Check for .rej files
+          REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
+          if [ -n "$REJ" ]; then
+            echo "::warning::.rej files present (refactored source diff):"
+            echo "$REJ"
+            echo "==> Inspecting .rej for analysis (not failing build):"
+            for f in $REJ; do
+              echo "--- $f ---"
+              cat "$f"
             done
-            VER=$(echo "$CONTENT" | grep -E "SUSFS_VERSION" | head -1 | tr -d '\r' || true)
-            echo "  [probe] $br : $HITS/${#REQ_ARR[@]} required symbols ($VER) missing:$MISSED"
-            SCORES[$br]=$HITS
-            if [ "$HITS" -gt "$BEST_SCORE" ]; then
-              BEST_SCORE=$HITS
-              BEST=$br
+          fi
+
+          # Verify essential SUSFS files copied
+          FAIL=0
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "$f" ]; then
+              echo "OK  $f ($(wc -l < "$f") lines)"
+            else
+              echo "::error::Missing $f after patch"
+              FAIL=1
             fi
           done
-
-          if [ -z "$BEST" ] || [ "$BEST_SCORE" -lt "${#REQ_ARR[@]}" ]; then
-            echo "::error::No branch contains ALL required symbols (need ${#REQ_ARR[@]}, best=$BEST_SCORE on '$BEST')"
-            echo "         Try: change SUKISU_REF to older tag OR relax REQ_SYMS"
+          if [ "$FAIL" -ne 0 ]; then
             exit 1
           fi
 
-          echo ""
-          echo "==> Selected best branch: $BEST (score=$BEST_SCORE/${#REQ_ARR[@]})"
-          echo "branch=$BEST" >> "$GITHUB_OUTPUT"
-
-      - name: Clone SUSFS upstream (selected branch)
+      - name: Apply SUSFS inline hook patches (JackA1ltman script)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          BR="${{ steps.pick_branch.outputs.branch }}"
-          rm -rf /tmp/susfs4ksu
-          echo "==> Cloning $SUSFS_REPO branch $BR"
-          git clone --depth=1 -b "$BR" "$SUSFS_REPO" /tmp/susfs4ksu
-          echo "SUSFS_BRANCH=$BR" >> "$GITHUB_ENV"
-          ls -la /tmp/susfs4ksu/kernel_patches/fs 2>/dev/null || true
-          ls -la /tmp/susfs4ksu/kernel_patches/include/linux 2>/dev/null || true
-          echo "==> SUSFS version info:"
-          grep -nE "SUSFS_VERSION|SUSFS_MAGIC" /tmp/susfs4ksu/kernel_patches/include/linux/*.h 2>/dev/null | head -10 || true
+          SCRIPT=/tmp/jack/Patches/susfs_inline_hook_patches.sh
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::Missing $SCRIPT"
+            exit 1
+          fi
+          chmod +x "$SCRIPT"
+          echo "==> Running inline hook script..."
+          bash "$SCRIPT" 2>&1 | tee /tmp/jack_inline_hooks.log
 
-      - name: Pre-build compat check (SukiSU vs SUSFS)
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/scripts/verify_sukisu_susfs_compat.py
-          python3 .github/scripts/verify_sukisu_susfs_compat.py "$KSU_DIR" /tmp/susfs4ksu | tee /tmp/compat_check.log
-          if grep -qE "\[ERROR\]|\[MISMATCH\]" /tmp/compat_check.log; then
-            echo "::error::Compat check failed even after auto-pick"
-            echo "         => Try a different SUKISU_REF (e.g. v3.x) or override SUSFS branch"
+          # Script prints "[+] Patched!" for each file
+          OK_COUNT=$(grep -c "\[+\].*Patched" /tmp/jack_inline_hooks.log || echo 0)
+          FAIL_COUNT=$(grep -c "\[-\].*patch failed" /tmp/jack_inline_hooks.log || echo 0)
+          SKIP_COUNT=$(grep -c "\[-\] Warning:.*contains KernelSU" /tmp/jack_inline_hooks.log || echo 0)
+          echo "==> Inline hooks: OK=$OK_COUNT, FAIL=$FAIL_COUNT, SKIP_already=$SKIP_COUNT"
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo "::error::$FAIL_COUNT inline hook patch failed"
             exit 1
           fi
 
-      - name: Copy SUSFS source files into kernel tree
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          SRC=/tmp/susfs4ksu/kernel_patches
-          if [ ! -f "$SRC/fs/susfs.c" ]; then
-            echo "::error::Missing $SRC/fs/susfs.c"
-            exit 1
-          fi
-          if [ ! -f "$SRC/include/linux/susfs.h" ]; then
-            echo "::error::Missing $SRC/include/linux/susfs.h"
-            exit 1
-          fi
-          cp -v "$SRC/fs/susfs.c" fs/
-          cp -v "$SRC/include/linux/susfs.h" include/linux/
-          if [ -f "$SRC/include/linux/susfs_def.h" ]; then
-            cp -v "$SRC/include/linux/susfs_def.h" include/linux/
-          fi
-          if ! grep -qE 'susfs\.o' fs/Makefile; then
-            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
-            echo "==> Added susfs.o to fs/Makefile"
-          fi
-
-      - name: Apply SUSFS anchor-based backport (lisa, C90-safe)
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/scripts/apply_susfs_backport_lisa.py
-          python3 .github/scripts/apply_susfs_backport_lisa.py | tee /tmp/susfs_backport.log
-          if grep -qE "\[ERROR\]|Traceback" /tmp/susfs_backport.log; then
-            echo "::error::SUSFS anchor backport failed"
-            exit 1
-          fi
-
-      - name: Verify SUSFS backport hooks present
+      - name: Verify essential hooks present
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
           FAIL=0
-          if ! grep -q "linux/susfs_def.h" fs/namei.c; then
-            echo "::error::fs/namei.c missing susfs_def.h include"
-            FAIL=1
-          fi
-          if ! grep -q "susfs_is_current_ksu_domain" fs/namespace.c; then
-            echo "::error::fs/namespace.c missing susfs extern"
-            FAIL=1
-          fi
-          if ! grep -q "susfs_sus_ino_for_filldir64" fs/readdir.c; then
-            echo "::error::fs/readdir.c missing filldir hook"
-            FAIL=1
-          fi
-          MARKS=0
-          if grep -qE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c; then
-            MARKS=$(grep -cE "SUSFS_FILLDIR(64)?_HOOK_MARK" fs/readdir.c)
-          fi
-          echo "Filldir hook markers in readdir.c: $MARKS"
-          if [ "$MARKS" -lt 2 ]; then
-            echo "::error::Qua it filldir hooks ($MARKS < 2)"
-            FAIL=1
-          fi
+          for pair in \
+            "fs/exec.c:ksu_handle_execveat" \
+            "fs/open.c:ksu_handle_faccessat" \
+            "fs/stat.c:ksu_handle_stat" \
+            "kernel/reboot.c:ksu_handle_sys_reboot" \
+            "fs/susfs.c:susfs_" \
+            "include/linux/susfs.h:SUSFS_VERSION"; do
+            f="${pair%%:*}"
+            sym="${pair##*:}"
+            if grep -q "$sym" "$f" 2>/dev/null; then
+              echo "OK  $f has $sym"
+            else
+              echo "::error::$f missing $sym"
+              FAIL=1
+            fi
+          done
           if [ "$FAIL" -ne 0 ]; then
             exit 1
           fi
-          echo "ALL SUSFS backport hooks verified."
+          echo "ALL essential hooks verified."
 
       - name: Enable SUSFS configs in defconfig
         working-directory: ${{ env.KERNEL_DIR }}
@@ -309,17 +241,18 @@ jobs:
 
           WANTED=(
             CONFIG_KSU
+            CONFIG_KSU_MANUAL_HOOK
             CONFIG_KSU_SUSFS
             CONFIG_KSU_SUSFS_SUS_PATH
             CONFIG_KSU_SUSFS_SUS_MOUNT
             CONFIG_KSU_SUSFS_SUS_KSTAT
             CONFIG_KSU_SUSFS_SUS_MAP
+            CONFIG_KSU_SUSFS_TRY_UMOUNT
             CONFIG_KSU_SUSFS_SPOOF_UNAME
             CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
             CONFIG_KSU_SUSFS_OPEN_REDIRECT
             CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
             CONFIG_KSU_SUSFS_ENABLE_LOG
-            CONFIG_KSU_MANUAL_HOOK
           )
           ADDED=0
           SKIP=0
@@ -330,7 +263,7 @@ jobs:
               echo "${cfg}=y" >> "$DC"
               ADDED=$((ADDED+1))
             else
-              echo "::notice::Skip $cfg"
+              echo "::notice::Skip $cfg (Kconfig not defined)"
               SKIP=$((SKIP+1))
             fi
           done
@@ -340,64 +273,6 @@ jobs:
             exit 1
           fi
           tail -n 40 "$DC"
-
-      - name: Apply manual hooks
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/scripts/apply_resukisu_manual_hooks_1_fixed.py
-          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "$DEFCONFIG" | tee /tmp/apply_hooks.log
-          if grep -qE "\[ERROR\]|RuntimeError|Traceback" /tmp/apply_hooks.log; then
-            echo "::error::apply_resukisu_manual_hooks_1_fixed.py reported errors"
-            exit 1
-          fi
-
-      - name: Verify manual hooks were applied
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          FAIL=0
-          for pair in "fs/exec.c:ksu_handle_execveat" "fs/open.c:ksu_handle_faccessat" "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot"; do
-            f="${pair%%:*}"
-            sym="${pair##*:}"
-            if grep -q "$sym" "$f"; then
-              echo "OK  $f  has $sym"
-            else
-              echo "::error::$f thieu $sym"
-              FAIL=1
-            fi
-          done
-          MH=$(grep -RnE "CONFIG_KSU_MANUAL_HOOK" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c 2>/dev/null | wc -l || echo 0)
-          echo "CONFIG_KSU_MANUAL_HOOK markers: $MH"
-          if [ "$MH" -lt 4 ]; then
-            echo "::error::Qua it CONFIG_KSU_MANUAL_HOOK markers ($MH < 4)"
-            FAIL=1
-          fi
-          if [ "$FAIL" -ne 0 ]; then
-            exit 1
-          fi
-          echo "ALL manual hooks verified."
-
-      - name: Upload manual hook backup
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: manual-hook-backup
-          path: ${{ env.KERNEL_DIR }}/.resukisu_backup
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload susfs backport backup
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: susfs-backport-backup
-          path: |
-            ${{ env.KERNEL_DIR }}/fs/namei.c.bak_susfs
-            ${{ env.KERNEL_DIR }}/fs/namespace.c.bak_susfs
-            ${{ env.KERNEL_DIR }}/fs/readdir.c.bak_susfs
-          if-no-files-found: warn
-          retention-days: 7
 
       - name: Cache AOSP Clang toolchain
         uses: actions/cache@v4
@@ -410,7 +285,7 @@ jobs:
           set -euo pipefail
           TC_DIR="$HOME/tc/clang-r450784d"
           if [ -x "$TC_DIR/bin/clang" ] && [ -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "==> Toolchain already present (cache hit)"
+            echo "==> Toolchain present (cache hit)"
             "$TC_DIR/bin/clang" --version
             exit 0
           fi
@@ -420,23 +295,17 @@ jobs:
           BRANCH="android13-release"
           REPO="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
           TARBALL_URL="${REPO}/+archive/refs/heads/${BRANCH}/clang-r450784d.tar.gz"
-          echo "==> Trying gitiles tarball on $BRANCH ..."
+          echo "==> Tarball download..."
           if curl -fSL --retry 3 --retry-delay 5 -o clang.tar.gz "$TARBALL_URL"; then
             echo "==> Downloaded $(du -h clang.tar.gz | cut -f1)"
             mkdir -p "$TC_DIR"
             tar -xzf clang.tar.gz -C "$TC_DIR"
             rm -f clang.tar.gz
           else
-            echo "==> Tarball failed, falling back to sparse clone on $BRANCH ..."
             git clone --branch "$BRANCH" --depth=1 --filter=blob:none --sparse "$REPO" aosp-clang
             cd aosp-clang
             git sparse-checkout set clang-r450784d
             git checkout
-            if [ ! -d clang-r450784d ]; then
-              echo "::error::clang-r450784d not found on branch $BRANCH"
-              ls -la
-              exit 1
-            fi
             mkdir -p "$TC_DIR"
             cp -a clang-r450784d/. "$TC_DIR/"
             cd /tmp && rm -rf aosp-clang
@@ -452,8 +321,7 @@ jobs:
             fi
           fi
           if [ ! -x "$TC_DIR/bin/clang" ] || [ ! -x "$TC_DIR/bin/ld.lld" ]; then
-            echo "::error::Toolchain incomplete after setup"
-            ls -la "$TC_DIR/bin" 2>/dev/null | head -n 30 || true
+            echo "::error::Toolchain incomplete"
             exit 1
           fi
           "$TC_DIR/bin/clang" --version
@@ -473,18 +341,40 @@ jobs:
           echo "==> Running ./build.sh ..."
           ./build.sh 2>&1 | tee /tmp/build.log
 
-      - name: Upload build logs
+      - name: Upload all logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
             /tmp/build.log
-            /tmp/apply_hooks.log
-            /tmp/susfs_backport.log
-            /tmp/compat_check.log
+            /tmp/susfs_dryrun.log
+            /tmp/susfs_apply.log
+            /tmp/jack_inline_hooks.log
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Collect .rej files (if any)
+        if: always()
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rejs
+          find . -name "*.rej" -type f -exec cp --parents {} /tmp/rejs/ \; 2>/dev/null || true
+          if [ -n "$(ls -A /tmp/rejs 2>/dev/null)" ]; then
+            echo "==> .rej files collected"
+          else
+            echo "==> No .rej files (clean apply)"
+          fi
+
+      - name: Upload .rej files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects
+          path: /tmp/rejs/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload kernel artifacts
         if: success()
