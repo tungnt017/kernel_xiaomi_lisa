@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Official fix v2 for missing ksu_selinux_hide_handle_* link errors.
+Official fix v3 for selinux_hide feature compatibility.
 
-v2 changes:
-  - Kbuild lookup: recursive search (was top-level only)
-  - Smart placement: prefer Kbuild nearest to selinux_hide.c
-  - Handle feature/ subdir Kbuild vs parent Kbuild scenarios
+selinux_hide.c in SukiSU v4.1.3 uses:
+  - struct selinux_state.policy / .status_lock / .status_page (kernel 6.x layout)
+  - LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) gated internals
+On kernel 5.4, the function bodies cannot compile because the required
+selinux internals don't exist in that layout.
 
-NOT a bypass. Real impl, real link.
+Strategy (NOT a bypass):
+  - Detect kernel version from kernel Makefile root
+  - If kernel < 6.6: guard the call sites in ksud.c with the SAME version
+    guard used inside selinux_hide.c itself, AND skip building selinux_hide.o
+  - If kernel >= 6.6: wire build normally
+
+This is standard C version-guarded compat, used by Linux kernel itself
+for back/forward compatibility across versions.
 """
 import os
 import re
@@ -17,7 +25,8 @@ import urllib.request
 from pathlib import Path
 
 
-MARKER = "SUSFS_5_4_SELINUX_HIDE_BUILD"
+BUILD_MARKER = "SUSFS_5_4_SELINUX_HIDE_BUILD"
+GUARD_MARKER = "SUSFS_5_4_SELINUX_HIDE_GUARD"
 
 
 def safe_locate_ksu_dir() -> Path:
@@ -34,168 +43,142 @@ def find_first(root: Path, name: str):
     return None
 
 
-def find_all_kbuilds(ksu_dir: Path):
-    """Find all Kbuild/Makefile in KSU dir tree."""
-    result = []
-    for name in ("Kbuild", "Makefile"):
-        result.extend(ksu_dir.rglob(name))
-    return sorted(set(result), key=lambda p: len(p.parts))
-
-
-def find_feature_dir(ksu_dir: Path) -> Path:
-    for cand in [
-        ksu_dir / "feature",
-        ksu_dir / "kernel" / "feature",
-    ]:
-        if cand.is_dir():
-            return cand
-    return None
-
-
-def fetch_from_upstream(target: Path, ref: str, repo_path: str) -> bool:
-    url = f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{ref}/{repo_path}"
-    print(f"[FETCH] {url}")
+def detect_kernel_version() -> tuple:
+    """Read VERSION, PATCHLEVEL, SUBLEVEL from kernel root Makefile."""
+    mk = Path("Makefile")
+    if not mk.is_file():
+        return (0, 0, 0)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "kernel-fix-script"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read().decode("utf-8", errors="surrogateescape")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", errors="surrogateescape")
-        print(f"[OK]    Saved {target} ({len(content)} bytes)")
+        head = mk.read_text(encoding="utf-8", errors="surrogateescape").splitlines()[:10]
+    except Exception:
+        return (0, 0, 0)
+    ver = patch = sub = 0
+    for line in head:
+        m = re.match(r'(VERSION|PATCHLEVEL|SUBLEVEL)\s*=\s*(\d+)', line.strip())
+        if m:
+            if m.group(1) == "VERSION":
+                ver = int(m.group(2))
+            elif m.group(1) == "PATCHLEVEL":
+                patch = int(m.group(2))
+            elif m.group(1) == "SUBLEVEL":
+                sub = int(m.group(2))
+    return (ver, patch, sub)
+
+
+def kver_ge(v: tuple, target: tuple) -> bool:
+    return v >= target
+
+
+def remove_build_wiring(ksu_dir: Path) -> bool:
+    """Remove the previously added 'obj-... += feature/selinux_hide.o' line."""
+    removed_any = False
+    for kb in list(ksu_dir.rglob("Kbuild")) + list(ksu_dir.rglob("Makefile")):
+        try:
+            src = kb.read_text(encoding="utf-8", errors="surrogateescape")
+        except Exception:
+            continue
+        if BUILD_MARKER not in src:
+            continue
+        pat = re.compile(
+            rf'\n*#\s*{BUILD_MARKER}\n[^\n]*selinux_hide[^\n]*\n*',
+            re.MULTILINE,
+        )
+        new_src = pat.sub("\n", src)
+        if new_src != src:
+            backup = kb.with_suffix(kb.suffix + ".bak_selinux_hide_unwire")
+            if not backup.exists():
+                shutil.copy2(kb, backup)
+            kb.write_text(new_src, encoding="utf-8", errors="surrogateescape")
+            print(f"[OK]    Removed build wiring from {kb}")
+            removed_any = True
+    return removed_any
+
+
+def guard_ksud_calls(ksu_dir: Path) -> bool:
+    """Wrap 2 ksu_selinux_hide_handle_* call sites with version guard."""
+    ksud = find_first(ksu_dir, "ksud.c")
+    if ksud is None:
+        print("[ERROR] ksud.c not found")
+        return False
+    src = ksud.read_text(encoding="utf-8", errors="surrogateescape")
+    if GUARD_MARKER in src:
+        print(f"[SKIP]  {ksud} already has version guards")
         return True
-    except Exception as e:
-        print(f"[ERROR] Fetch failed: {e}")
+
+    # Ensure <linux/version.h> is included
+    if "<linux/version.h>" not in src and "linux/version.h" not in src:
+        # Insert at top of file after first existing include
+        m = re.search(r'^#include\s+[<"][^>"]+[>"]\s*\n', src, re.MULTILINE)
+        if m:
+            insert_at = m.end()
+            src = src[:insert_at] + "#include <linux/version.h>\n" + src[insert_at:]
+            print(f"[OK]    Added '#include <linux/version.h>' to {ksud}")
+
+    # Pattern: a call line like:  ksu_selinux_hide_handle_post_fs_data();
+    pat = re.compile(
+        r'^(\s*)(ksu_selinux_hide_handle_(?:post_fs_data|second_stage)\s*\(\s*\)\s*;)',
+        re.MULTILINE,
+    )
+
+    def repl(m):
+        indent = m.group(1)
+        stmt = m.group(2)
+        return (
+            f"{indent}#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)\n"
+            f"{indent}{stmt}  /* {GUARD_MARKER} */\n"
+            f"{indent}#endif"
+        )
+
+    new_src, n = pat.subn(repl, src)
+    if n == 0:
+        print(f"[WARN]  No call sites found to guard in {ksud}")
         return False
 
-
-def detect_kbuild_style(kbuild: Path) -> str:
-    src = kbuild.read_text(encoding="utf-8", errors="surrogateescape")
-    if re.search(r'kernelsu-y\s*\+=', src):
-        return "kernelsu-y"
-    if re.search(r'kernelsu-objs\s*\+=', src):
-        return "kernelsu-objs"
-    if re.search(r'obj-y\s*\+=', src):
-        return "obj-y"
-    if re.search(r'obj-\$\(CONFIG_KSU\)', src):
-        return "obj-CONFIG_KSU"
-    return "obj-y"
+    backup = ksud.with_suffix(ksud.suffix + ".bak_selinux_hide_guard")
+    if not backup.exists():
+        shutil.copy2(ksud, backup)
+    ksud.write_text(new_src, encoding="utf-8", errors="surrogateescape")
+    print(f"[OK]    Guarded {n} call site(s) in {ksud}")
+    return True
 
 
-def add_to_kbuild(kbuild: Path, line: str) -> bool:
-    src = kbuild.read_text(encoding="utf-8", errors="surrogateescape")
-    if MARKER in src:
-        print(f"[SKIP]  {kbuild} already has {MARKER}")
+def add_to_kbuild_wiring(ksu_dir: Path) -> bool:
+    """Wire selinux_hide.o build (only for kernel 6.6+ where it works)."""
+    src_c = find_first(ksu_dir, "selinux_hide.c")
+    if src_c is None:
+        print("[ERROR] selinux_hide.c not found")
+        return False
+
+    kbuilds = list(ksu_dir.rglob("Kbuild")) + list(ksu_dir.rglob("Makefile"))
+    if not kbuilds:
+        print(f"[ERROR] No Kbuild/Makefile found in {ksu_dir}")
+        return False
+
+    # Pick Kbuild closest to selinux_hide.c
+    same_dir = [k for k in kbuilds if k.parent == src_c.parent]
+    parent_kb = [k for k in kbuilds if k.parent == src_c.parent.parent]
+    kbuild = same_dir[0] if same_dir else (parent_kb[0] if parent_kb else kbuilds[0])
+
+    text = kbuild.read_text(encoding="utf-8", errors="surrogateescape")
+    if BUILD_MARKER in text:
+        print(f"[SKIP]  {kbuild} already has wiring")
         return True
-    new_src = src.rstrip() + "\n\n" + f"# {MARKER}\n" + line + "\n"
+
+    rel_path = src_c.relative_to(kbuild.parent).with_suffix(".o").as_posix()
+    if "kernelsu-y" in text:
+        line = f"kernelsu-y += {rel_path}"
+    elif "kernelsu-objs" in text:
+        line = f"kernelsu-objs += {rel_path}"
+    else:
+        line = f"obj-$(CONFIG_KSU) += {rel_path}"
+
+    new_src = text.rstrip() + f"\n\n# {BUILD_MARKER}\n{line}\n"
     backup = kbuild.with_suffix(kbuild.suffix + ".bak_selinux_hide")
     if not backup.exists():
         shutil.copy2(kbuild, backup)
     kbuild.write_text(new_src, encoding="utf-8", errors="surrogateescape")
-    print(f"[OK]    Added '{line.strip()}' to {kbuild}")
+    print(f"[OK]    Added '{line}' to {kbuild}")
     return True
-
-
-def pick_best_kbuild(kbuilds, src_c: Path, ksu_dir: Path):
-    """Choose Kbuild closest to (parent or ancestor of) src_c."""
-    # First: Kbuild in the SAME directory as src_c
-    same_dir = [kb for kb in kbuilds if kb.parent == src_c.parent]
-    if same_dir:
-        return same_dir[0], "same_dir"
-
-    # Second: Kbuild in parent of src_c's dir (e.g. KernelSU/kernel/Kbuild for src in feature/)
-    parent_of_feature = src_c.parent.parent
-    parent_kbuild = [kb for kb in kbuilds if kb.parent == parent_of_feature]
-    if parent_kbuild:
-        return parent_kbuild[0], "parent_of_feature"
-
-    # Third: Kbuild in KSU dir root
-    root_kbuild = [kb for kb in kbuilds if kb.parent == ksu_dir]
-    if root_kbuild:
-        return root_kbuild[0], "ksu_root"
-
-    # Fallback: any Kbuild that already references other 'feature/' objects
-    for kb in kbuilds:
-        text = kb.read_text(encoding="utf-8", errors="surrogateescape")
-        if re.search(r'feature/\w+\.o', text):
-            return kb, "feature_referenced"
-
-    # Last resort: first Kbuild found
-    return kbuilds[0], "first"
-
-
-def relative_object_path(src_c: Path, kbuild: Path) -> str:
-    """Compute object path relative to the Kbuild's directory."""
-    kb_dir = kbuild.parent
-    try:
-        rel = src_c.relative_to(kb_dir)
-    except ValueError:
-        rel = src_c
-    return rel.with_suffix(".o").as_posix()
-
-
-def diagnose(ksu_dir: Path):
-    print("\n=== DIAGNOSTIC ===")
-    print(f"KSU_DIR: {ksu_dir}")
-
-    print("\n-- selinux_hide files in KSU_DIR --")
-    items = sorted(ksu_dir.rglob("selinux_hide*"))
-    if items:
-        for p in items:
-            print(f"  {p}")
-    else:
-        print("  (none)")
-
-    print("\n-- ksu_selinux_hide_handle_* DEFINITIONS --")
-    pat = re.compile(r'\b(?:void|int)\s+ksu_selinux_hide_handle_(post_fs_data|second_stage)\s*\(')
-    found = False
-    for p in ksu_dir.rglob("*.c"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="surrogateescape")
-            for m in pat.finditer(text):
-                print(f"  {p}: ksu_selinux_hide_handle_{m.group(1)}")
-                found = True
-        except Exception:
-            pass
-    if not found:
-        print("  (none found)")
-
-    print("\n-- ksu_selinux_hide_handle_* CALL SITES --")
-    cpat = re.compile(r'\bksu_selinux_hide_handle_(post_fs_data|second_stage)\s*\(')
-    for p in ksu_dir.rglob("*.c"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="surrogateescape")
-            for ln_no, line in enumerate(text.splitlines(), 1):
-                if cpat.search(line):
-                    print(f"  {p}:{ln_no}: {line.strip()[:120]}")
-        except Exception:
-            pass
-
-    print("\n-- ALL Kbuild/Makefile in KSU_DIR --")
-    kbs = find_all_kbuilds(ksu_dir)
-    if kbs:
-        for kb in kbs:
-            print(f"  {kb}")
-    else:
-        print("  (none)")
-
-    print("\n-- Kbuild/Makefile entries mentioning 'selinux_hide' or 'feature/' --")
-    for kb in kbs:
-        try:
-            text = kb.read_text(encoding="utf-8", errors="surrogateescape")
-            for ln_no, line in enumerate(text.splitlines(), 1):
-                if "selinux_hide" in line or "feature/" in line:
-                    print(f"  {kb}:{ln_no}: {line.strip()}")
-        except Exception:
-            pass
-
-    print("\n-- feature/ subdir contents --")
-    fd = find_feature_dir(ksu_dir)
-    if fd:
-        for p in sorted(fd.iterdir()):
-            print(f"  {p.name}")
-    else:
-        print("  (no feature/ subdir)")
-    print("=== END DIAGNOSTIC ===\n")
 
 
 def main() -> int:
@@ -205,62 +188,24 @@ def main() -> int:
         return 1
     print(f"[INFO] Using KSU dir: {ksu_dir}")
 
-    ref = os.environ.get("SUKISU_REF", "v4.1.3").strip()
-    print(f"[INFO] Pinned SukiSU ref: {ref}")
+    kver = detect_kernel_version()
+    print(f"[INFO] Kernel version: {kver[0]}.{kver[1]}.{kver[2]}")
 
-    diagnose(ksu_dir)
-
-    src_c = find_first(ksu_dir, "selinux_hide.c")
-    src_h = find_first(ksu_dir, "selinux_hide.h")
-    feature_dir = find_feature_dir(ksu_dir)
-
-    if src_c is None:
-        print(f"[INFO] selinux_hide.c MISSING - fetching from upstream@{ref}")
-        if feature_dir is None:
-            if (ksu_dir / "kernel").is_dir():
-                feature_dir = ksu_dir / "kernel" / "feature"
-            else:
-                feature_dir = ksu_dir / "feature"
-            feature_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[INFO] Created {feature_dir}")
-        if not fetch_from_upstream(feature_dir / "selinux_hide.c", ref, "kernel/feature/selinux_hide.c"):
-            print("[ERROR] Cannot proceed without selinux_hide.c")
+    target = (6, 6, 0)
+    if kver_ge(kver, target):
+        print(f"[INFO] Kernel >= 6.6, wiring selinux_hide.o normally")
+        if not add_to_kbuild_wiring(ksu_dir):
             return 1
-        fetch_from_upstream(feature_dir / "selinux_hide.h", ref, "kernel/feature/selinux_hide.h")
-        src_c = feature_dir / "selinux_hide.c"
-        src_h = feature_dir / "selinux_hide.h"
     else:
-        print(f"[INFO] Existing source: {src_c}")
-        if src_h:
-            print(f"[INFO] Existing header: {src_h}")
+        print(f"[INFO] Kernel < 6.6, selinux_hide.c is incompatible")
+        print(f"[INFO] Will guard ksud.c call sites and skip selinux_hide.o build")
+        # Remove any wiring added by previous v2
+        remove_build_wiring(ksu_dir)
+        # Guard call sites
+        if not guard_ksud_calls(ksu_dir):
+            return 1
 
-    kbuilds = find_all_kbuilds(ksu_dir)
-    if not kbuilds:
-        print(f"[ERROR] No Kbuild/Makefile found anywhere in {ksu_dir}")
-        return 1
-
-    kbuild, reason = pick_best_kbuild(kbuilds, src_c, ksu_dir)
-    print(f"[INFO] Selected Kbuild: {kbuild} (reason: {reason})")
-
-    style = detect_kbuild_style(kbuild)
-    print(f"[INFO] Build style: {style}")
-
-    rel_path = relative_object_path(src_c, kbuild)
-    print(f"[INFO] Object path (relative to Kbuild dir): {rel_path}")
-
-    if style == "kernelsu-y":
-        line = f"kernelsu-y += {rel_path}"
-    elif style == "kernelsu-objs":
-        line = f"kernelsu-objs += {rel_path}"
-    elif style == "obj-CONFIG_KSU":
-        line = f"obj-$(CONFIG_KSU) += {rel_path}"
-    else:
-        line = f"obj-y += {rel_path}"
-
-    if not add_to_kbuild(kbuild, line):
-        return 1
-
-    print("\n[DONE] selinux_hide build wiring applied")
+    print("\n[DONE] selinux_hide compat applied")
     return 0
 
 
