@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v13
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat v14
 
 on:
   workflow_dispatch:
@@ -269,7 +269,7 @@ jobs:
             exit 1
           fi
 
-      - name: Fix selinux_hide build wiring
+      - name: Fix selinux_hide (version-aware compat v3)
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           SUKISU_REF: ${{ env.SUKISU_REF }}
@@ -278,7 +278,7 @@ jobs:
           chmod +x .github/scripts/fix_selinux_hide_build.py
           python3 .github/scripts/fix_selinux_hide_build.py | tee /tmp/fix_selinux_hide.log
           if grep -qE "^\[ERROR\]|Traceback" /tmp/fix_selinux_hide.log; then
-            echo "::error::selinux_hide build fix reported errors"
+            echo "::error::selinux_hide compat fix reported errors"
             exit 1
           fi
 
@@ -318,25 +318,48 @@ jobs:
             echo "OK  struct mount fwd decl in fs/stat.c"
           fi
 
-          KBUILD_FIX=$(find "$KSU_DIR" \( -name "Kbuild" -o -name "Makefile" \) -exec grep -l "SUSFS_5_4_SELINUX_HIDE_BUILD" {} \; 2>/dev/null | head -1)
-          if [ -z "$KBUILD_FIX" ]; then
-            echo "::error::selinux_hide build wiring marker missing"
+          # selinux_hide version-aware check
+          KSUD_FILE=$(find "$KSU_DIR" -name "ksud.c" | head -1)
+          if [ -z "$KSUD_FILE" ]; then
+            echo "::error::ksud.c not found"
             FAIL=1
           else
-            echo "OK  selinux_hide build wiring in $KBUILD_FIX"
+            KVER=$(head -3 Makefile | grep -E "^(VERSION|PATCHLEVEL)" | awk '{print $3}' | paste -sd '.')
+            MAJOR=$(echo "$KVER" | cut -d. -f1)
+            MINOR=$(echo "$KVER" | cut -d. -f2)
+            echo "Kernel version detected: $MAJOR.$MINOR"
+
+            if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 6 ]; }; then
+              # Kernel < 6.6: expect guard markers, NO build wiring
+              if ! grep -q "SUSFS_5_4_SELINUX_HIDE_GUARD" "$KSUD_FILE"; then
+                echo "::error::Expected guard markers in $KSUD_FILE for kernel < 6.6"
+                FAIL=1
+              else
+                GUARD_COUNT=$(grep -c "SUSFS_5_4_SELINUX_HIDE_GUARD" "$KSUD_FILE")
+                echo "OK  ksud.c has $GUARD_COUNT guard markers for selinux_hide calls"
+              fi
+
+              BAD=$(find "$KSU_DIR" \( -name "Kbuild" -o -name "Makefile" \) -exec grep -l "SUSFS_5_4_SELINUX_HIDE_BUILD" {} \; 2>/dev/null | head -1)
+              if [ -n "$BAD" ]; then
+                echo "::warning::Build wiring still present in $BAD (should be removed for kernel < 6.6)"
+              else
+                echo "OK  No selinux_hide.o build wiring (correct for kernel < 6.6)"
+              fi
+            else
+              # Kernel >= 6.6: expect build wiring
+              KBUILD_FIX=$(find "$KSU_DIR" \( -name "Kbuild" -o -name "Makefile" \) -exec grep -l "SUSFS_5_4_SELINUX_HIDE_BUILD" {} \; 2>/dev/null | head -1)
+              if [ -z "$KBUILD_FIX" ]; then
+                echo "::error::Expected build wiring for kernel >= 6.6"
+                FAIL=1
+              else
+                echo "OK  selinux_hide.o wired in $KBUILD_FIX"
+              fi
+            fi
           fi
 
-          SELHIDE_C=$(find "$KSU_DIR" -name "selinux_hide.c" 2>/dev/null | head -1)
-          if [ -z "$SELHIDE_C" ]; then
-            echo "::error::selinux_hide.c source missing"
-            FAIL=1
-          else
-            echo "OK  selinux_hide.c at $SELHIDE_C ($(wc -l < "$SELHIDE_C") lines)"
-          fi
-
-          BAD=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
-          if [ -n "$BAD" ]; then
-            echo "::warning::misplaced shim still in $BAD"
+          BAD_INCL=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
+          if [ -n "$BAD_INCL" ]; then
+            echo "::warning::misplaced strncpy shim still in $BAD_INCL"
           fi
 
           if [ "$FAIL" -ne 0 ]; then
