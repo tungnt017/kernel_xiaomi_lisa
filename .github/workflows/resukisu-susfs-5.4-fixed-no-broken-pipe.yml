@@ -1,4 +1,5 @@
-name: ReSukiSU SUSFS 5.4 - Final Build.sh 3 Debug Files
+
+name: ReSukiSU SUSFS 5.4 - Fix Setresuid Build.sh
 
 on:
   workflow_dispatch:
@@ -32,7 +33,7 @@ on:
         required: false
         default: "true"
       auto_fix_defconfig:
-        description: "Auto add missing CONFIG_KSU/CONFIG_KSU_MANUAL_HOOK/CONFIG_KSU_SUSFS to defconfig? true/false"
+        description: "Auto add missing KSU/SUSFS configs? true/false"
         required: false
         default: "true"
 
@@ -40,11 +41,9 @@ permissions:
   contents: read
 
 jobs:
-  verify-patch-build:
-    name: Verify, patch SUSFS, fix defconfig, run build.sh
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       JACK_REPO: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git"
       JACK_BRANCH: "mainline"
@@ -56,27 +55,24 @@ jobs:
       DEBUG_BUILD_LOG: "/tmp/resukisu-susfs-debug/build.log"
 
     steps:
-      - name: Checkout kernel repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Install dependencies including clang/lld
+      - name: Install deps
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libelf-dev \
-            libssl-dev make patch python3 rsync unzip xz-utils ca-certificates \
-            clang lld llvm
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            make patch python3 rsync unzip xz-utils ca-certificates clang lld llvm
           command -v clang
           command -v ld.lld
-          clang --version | sed -n '1,2p'
-          ld.lld --version
 
-      - name: Export inputs and init debug files
+      - name: Init vars/debug
         shell: bash
         run: |
           set -euo pipefail
@@ -88,10 +84,8 @@ jobs:
           echo "BUILD_ARGS=${{ github.event.inputs.build_args }}" >> "$GITHUB_ENV"
           echo "RUN_BUILD=${{ github.event.inputs.run_build }}" >> "$GITHUB_ENV"
           echo "AUTO_FIX_DEFCONFIG=${{ github.event.inputs.auto_fix_defconfig }}" >> "$GITHUB_ENV"
-          rm -rf "$DEBUG_DIR"
-          mkdir -p "$DEBUG_DIR"
-          : > "$DEBUG_BUILD_LOG"
-          : > "$DEBUG_DIFF"
+          rm -rf "$DEBUG_DIR" && mkdir -p "$DEBUG_DIR"
+          : > "$DEBUG_SUMMARY"; : > "$DEBUG_DIFF"; : > "$DEBUG_BUILD_LOG"
           {
             echo "=== Inputs ==="
             echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
@@ -111,84 +105,38 @@ jobs:
             echo
           } > "$DEBUG_SUMMARY"
 
-      - name: Verify kernel tree, version, and defconfig path
+      - name: Detect kernel/defconfig
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          test -f Makefile || { echo "[ERROR] Makefile not found"; exit 1; }
-          test -d fs || { echo "[ERROR] fs/ not found"; exit 1; }
-          test -d include || { echo "[ERROR] include/ not found"; exit 1; }
-          test -d arch || { echo "[ERROR] arch/ not found"; exit 1; }
-
+          test -f Makefile && test -d fs && test -d include && test -d arch
           VERSION=$(awk '/^VERSION =/{print $3}' Makefile)
           PATCHLEVEL=$(awk '/^PATCHLEVEL =/{print $3}' Makefile)
           SUBLEVEL=$(awk '/^SUBLEVEL =/{print $3}' Makefile)
-          echo "[INFO] Kernel version: ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-          if [ "$VERSION" != "5" ] || [ "$PATCHLEVEL" != "4" ]; then
-            echo "[ERROR] This workflow uses susfs_patch_to_5.4.patch but kernel is ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-            exit 1
-          fi
-
+          echo "[INFO] Kernel ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+          [ "$VERSION" = "5" ] && [ "$PATCHLEVEL" = "4" ] || { echo "[ERROR] Need kernel 5.4"; exit 1; }
           DEFCONFIG="$INPUT_DEFCONFIG"
           if [ -z "$DEFCONFIG" ]; then
-            if [ -f arch/arm64/configs/lisa_defconfig ]; then
-              DEFCONFIG="arch/arm64/configs/lisa_defconfig"
-            else
-              DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p')
-            fi
+            if [ -f arch/arm64/configs/lisa_defconfig ]; then DEFCONFIG="arch/arm64/configs/lisa_defconfig"; else DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p'); fi
           fi
-          test -n "$DEFCONFIG" || { echo "[ERROR] Could not auto-detect defconfig"; exit 1; }
           test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
-          {
-            echo "=== Kernel ==="
-            echo "version=${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-            echo "defconfig=$DEFCONFIG"
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== Kernel ==="; echo "version=${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; echo "defconfig=$DEFCONFIG"; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Clone JackA1ltman repo and copy SUSFS 5.4 patch
+      - name: Fetch Jack SUSFS 5.4 patch
         shell: bash
         run: |
           set -euo pipefail
           rm -rf /tmp/NonGKI_Kernel_Build_2nd
           git clone --depth=1 --branch "$JACK_BRANCH" "$JACK_REPO" /tmp/NonGKI_Kernel_Build_2nd
-          SRC="/tmp/NonGKI_Kernel_Build_2nd/$JACK_PATCH_REL"
-          test -f "$SRC" || { echo "[ERROR] Patch not found: $SRC"; exit 1; }
-          cp -f "$SRC" "$PATCH_LOCAL"
-          {
-            echo "=== SUSFS Patch ==="
-            sha256sum "$PATCH_LOCAL"
-            echo "diff files:"
-            grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,220p' || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          cp "/tmp/NonGKI_Kernel_Build_2nd/$JACK_PATCH_REL" "$PATCH_LOCAL"
+          { echo "=== SUSFS patch ==="; sha256sum "$PATCH_LOCAL"; grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,240p' || true; echo; } >> "$DEBUG_SUMMARY"
+          grep -q 'diff --git a/fs/susfs\.c b/fs/susfs\.c' "$PATCH_LOCAL"
+          grep -q 'diff --git a/include/linux/susfs\.h b/include/linux/susfs\.h' "$PATCH_LOCAL"
+          grep -q 'diff --git a/include/linux/susfs_def\.h b/include/linux/susfs_def\.h' "$PATCH_LOCAL"
 
-      - name: Verify patch content safely
-        shell: bash
-        run: |
-          set -euo pipefail
-          fail=0
-          require_in_patch() {
-            local pattern="$1"
-            local desc="$2"
-            if grep -qE "$pattern" "$PATCH_LOCAL"; then
-              echo "[OK] Patch contains: $desc"
-            else
-              echo "[ERROR] Patch missing: $desc"
-              fail=1
-            fi
-          }
-          require_in_patch 'diff --git a/fs/Makefile b/fs/Makefile' 'fs/Makefile modification'
-          require_in_patch 'CONFIG_KSU_SUSFS' 'CONFIG_KSU_SUSFS references'
-          require_in_patch 'diff --git a/fs/namei\.c b/fs/namei\.c' 'fs/namei.c modification'
-          require_in_patch 'diff --git a/fs/susfs\.c b/fs/susfs\.c' 'fs/susfs.c included'
-          require_in_patch 'diff --git a/include/linux/susfs\.h b/include/linux/susfs\.h' 'include/linux/susfs.h included'
-          require_in_patch 'diff --git a/include/linux/susfs_def\.h b/include/linux/susfs_def\.h' 'include/linux/susfs_def.h included'
-          [ "$fail" -eq 0 ] || exit 1
-
-      - name: Optional - run ReSukiSU setup.sh
+      - name: Optional ReSukiSU setup
         if: ${{ github.event.inputs.run_resukisu_setup == 'true' }}
         shell: bash
         run: |
@@ -196,258 +144,161 @@ jobs:
           cd "$KERNEL_DIR"
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
-      - name: Verify ReSukiSU or KernelSU source exists
+      - name: Existing manual hook script
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if [ -d KernelSU ] || [ -d ReSukiSU ] || grep -Rqs "config KSU" . 2>/dev/null; then
-            echo "[OK] ReSukiSU/KernelSU detected"
-          else
-            echo "[ERROR] ReSukiSU/KernelSU not detected"
-            exit 1
-          fi
+          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then python3 "$MANUAL_HOOK_SCRIPT"; else echo "[WARN] $MANUAL_HOOK_SCRIPT not found"; fi
 
-      - name: Apply manual hook script if present
+      - name: Auto-patch ksu_handle_setresuid hook
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if [ -n "$MANUAL_HOOK_SCRIPT" ] && [ -f "$MANUAL_HOOK_SCRIPT" ]; then
-            python3 "$MANUAL_HOOK_SCRIPT"
-          else
-            echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel/sys.c')
+          s = p.read_text()
+          marker = 'SYSCALL_DEFINE3(setresuid'
+          if marker not in s:
+              raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(setresuid in kernel/sys.c')
+          changed = False
+          if 'ksu_handle_setresuid' not in s:
+              extern = '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n'
+              idx = s.find(marker)
+              s = s[:idx] + extern + s[idx:]
+              changed = True
+          start = s.find(marker)
+          brace = s.find('{', start)
+          depth = 0; end = None
+          for i in range(brace, len(s)):
+              if s[i] == '{': depth += 1
+              elif s[i] == '}':
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1; break
+          if end is None:
+              raise SystemExit('[ERROR] Cannot parse setresuid body')
+          body = s[brace:end]
+          if 'ksu_handle_setresuid(ruid, euid, suid)' not in body:
+              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
+              if 'return commit_creds(new);' in body:
+                  body = body.replace('return commit_creds(new);', hook + 'return commit_creds(new);', 1)
+              elif 'commit_creds(new);' in body:
+                  body = body.replace('commit_creds(new);', hook + 'commit_creds(new);', 1)
+              else:
+                  raise SystemExit('[ERROR] commit_creds(new) not found in setresuid')
+              s = s[:brace] + body + s[end:]
+              changed = True
+          if changed:
+              p.write_text(s)
+              print('[FIXED] ksu_handle_setresuid hook added')
+          else:
+              print('[OK] ksu_handle_setresuid already present')
+          PY
+          { echo "=== setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Verify required ReSukiSU manual hooks
+      - name: Verify manual hooks
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           fail=0
-          check_required() {
-            local file="$1"
-            local pattern="$2"
-            if [ -f "$file" ] && grep -q "$pattern" "$file"; then
-              echo "[OK] $file has $pattern"
-            else
-              echo "[ERROR] $file missing required hook: $pattern"
-              fail=1
-            fi
-          }
-          check_required fs/exec.c "ksu_handle_execveat"
-          check_required fs/stat.c "ksu_handle_stat"
-          check_required fs/open.c "ksu_handle_faccessat"
-          {
-            echo "=== KSU hooks ==="
-            grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c 2>/dev/null | sed -n '1,240p' || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          check() { grep -q "$2" "$1" && echo "[OK] $1 -> $2" || { echo "[ERROR] missing $1 -> $2"; fail=1; }; }
+          check fs/exec.c ksu_handle_execveat
+          check fs/stat.c ksu_handle_stat
+          check fs/open.c ksu_handle_faccessat
+          check kernel/sys.c ksu_handle_setresuid
+          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c 2>/dev/null | sed -n '1,320p' || true; echo; } >> "$DEBUG_SUMMARY"
           [ "$fail" -eq 0 ] || exit 1
 
-      - name: Dry-run SUSFS patch - prefer git apply, fallback patch -p1
+      - name: Apply SUSFS patch
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           if git apply --check "$PATCH_LOCAL"; then
-            echo "SUSFS_PATCH_METHOD=git_apply" >> "$GITHUB_ENV"
-            echo "SUSFS_PATCH_STATE=need_apply" >> "$GITHUB_ENV"
-          else
-            echo "[WARN] git apply failed. Trying patch -p1 --dry-run..."
-            if patch -p1 --dry-run < "$PATCH_LOCAL"; then
-              echo "SUSFS_PATCH_METHOD=patch_p1" >> "$GITHUB_ENV"
-              echo "SUSFS_PATCH_STATE=need_apply" >> "$GITHUB_ENV"
-            else
-              echo "[WARN] Both dry-runs failed. Checking if already applied..."
-              if grep -q "CONFIG_KSU_SUSFS" fs/Makefile 2>/dev/null && { test -f fs/susfs.c || grep -Rqs "susfs" fs include 2>/dev/null; }; then
-                echo "SUSFS_PATCH_STATE=already_applied" >> "$GITHUB_ENV"
-                echo "SUSFS_PATCH_METHOD=none" >> "$GITHUB_ENV"
-              else
-                echo "[ERROR] SUSFS patch cannot be applied and is not already applied"
-                exit 1
-              fi
-            fi
-          fi
-
-      - name: Apply SUSFS 5.4 patch
-        if: env.SUSFS_PATCH_STATE == 'need_apply'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          if [ "$SUSFS_PATCH_METHOD" = "git_apply" ]; then
             git apply "$PATCH_LOCAL"
-          elif [ "$SUSFS_PATCH_METHOD" = "patch_p1" ]; then
+          elif patch -p1 --dry-run < "$PATCH_LOCAL"; then
             patch -p1 < "$PATCH_LOCAL"
+          elif grep -q "CONFIG_KSU_SUSFS" fs/Makefile 2>/dev/null && { test -f fs/susfs.c || grep -Rqs "susfs" fs include 2>/dev/null; }; then
+            echo "[OK] SUSFS already applied"
           else
-            echo "[ERROR] Unknown SUSFS_PATCH_METHOD=$SUSFS_PATCH_METHOD"
-            exit 1
+            echo "[ERROR] SUSFS patch failed and not already applied"; exit 1
           fi
-          echo "[OK] SUSFS patch applied using $SUSFS_PATCH_METHOD"
+          rej=$(find . -name "*.rej" -print)
+          [ -z "$rej" ] || { echo "$rej"; exit 1; }
+          find . -name "*.orig" -print -delete || true
 
-      - name: Verify no rejects and remove .orig backups
+      - name: Fix defconfig KSU/SUSFS
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          rej_found=$(find . -name "*.rej" -print)
-          if [ -n "$rej_found" ]; then
-            echo "[ERROR] Patch reject files found:"
-            echo "$rej_found"
-            printf '%s\n' "$rej_found" >> "$DEBUG_SUMMARY"
-            exit 1
-          fi
-          orig_found=$(find . -name "*.orig" -print)
-          if [ -n "$orig_found" ]; then
-            echo "[WARN] .orig backup files found. Removing before build."
-            {
-              echo "=== Removed .orig files ==="
-              echo "$orig_found"
-              echo
-            } >> "$DEBUG_SUMMARY"
-            find . -name "*.orig" -delete
-          fi
-
-      - name: Auto-fix and verify defconfig KSU/SUSFS options
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
-
-          ensure_config_y() {
-            local cfg="$1"
-            if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then
-              echo "[OK] $cfg=y already set"
-              return 0
-            fi
-            if [ "$AUTO_FIX_DEFCONFIG" = "true" ]; then
-              sed -i "/^# ${cfg} is not set$/d" "$DEFCONFIG"
-              sed -i "/^${cfg}=/d" "$DEFCONFIG"
-              printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"
-              echo "[FIXED] Added $cfg=y to $DEFCONFIG"
-            else
-              echo "[ERROR] Missing $cfg=y in $DEFCONFIG"
-              return 1
-            fi
+          ensure_y() {
+            cfg="$1"
+            if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then return 0; fi
+            [ "$AUTO_FIX_DEFCONFIG" = "true" ] || { echo "[ERROR] Missing $cfg=y"; exit 1; }
+            sed -i "/^# ${cfg} is not set$/d;/^${cfg}=/d" "$DEFCONFIG"
+            printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"
           }
+          unset_cfg() { cfg="$1"; sed -i "/^${cfg}=y$/d;/^${cfg}=/d" "$DEFCONFIG"; grep -qE "^# ${cfg} is not set$" "$DEFCONFIG" || printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"; }
+          ensure_y CONFIG_KSU
+          ensure_y CONFIG_KSU_MANUAL_HOOK
+          ensure_y CONFIG_KSU_SUSFS
+          ensure_y CONFIG_KALLSYMS
+          unset_cfg CONFIG_KSU_KPROBE_HOOKS
+          unset_cfg CONFIG_KSU_KPROBES_HOOK
+          unset_cfg CONFIG_KSU_KPROBES_HOOKS
+          unset_cfg CONFIG_KSU_WITH_KPROBES
+          { echo "=== Defconfig KSU/SUSFS ==="; grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true; echo; } >> "$DEBUG_SUMMARY"
 
-          ensure_config_unset() {
-            local cfg="$1"
-            sed -i "/^${cfg}=y$/d" "$DEFCONFIG"
-            sed -i "/^${cfg}=/d" "$DEFCONFIG"
-            grep -qE "^# ${cfg} is not set$" "$DEFCONFIG" || printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"
-            echo "[OK] $cfg disabled"
-          }
-
-          ensure_config_y CONFIG_KSU
-          ensure_config_y CONFIG_KSU_MANUAL_HOOK
-          ensure_config_y CONFIG_KSU_SUSFS
-          ensure_config_y CONFIG_KALLSYMS
-          ensure_config_unset CONFIG_KSU_KPROBE_HOOKS
-          ensure_config_unset CONFIG_KSU_KPROBES_HOOK
-          ensure_config_unset CONFIG_KSU_KPROBES_HOOKS
-          ensure_config_unset CONFIG_KSU_WITH_KPROBES
-
-          fail=0
-          for cfg in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KSU_SUSFS CONFIG_KALLSYMS; do
-            grep -qE "^${cfg}=y$" "$DEFCONFIG" || { echo "[ERROR] Still missing $cfg=y"; fail=1; }
-          done
-          {
-            echo "=== Defconfig KSU/SUSFS ==="
-            echo "$DEFCONFIG"
-            grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-          [ "$fail" -eq 0 ] || exit 1
-
-      - name: Verify SUSFS files and markers after patch
+      - name: Verify SUSFS integration
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          fail=0
-          grep -q "CONFIG_KSU_SUSFS" fs/Makefile || { echo "[ERROR] fs/Makefile missing CONFIG_KSU_SUSFS"; fail=1; }
-          test -f fs/susfs.c || { echo "[ERROR] fs/susfs.c missing"; fail=1; }
-          ls include/linux/susfs* >/dev/null 2>&1 || { echo "[ERROR] include/linux/susfs* headers missing"; fail=1; }
-          grep -Rqs "KSU_SUSFS" . 2>/dev/null || { echo "[ERROR] KSU_SUSFS not found anywhere after patch"; fail=1; }
-          {
-            echo "=== SUSFS verify ==="
-            grep -n "CONFIG_KSU_SUSFS" fs/Makefile || true
-            ls -l include/linux/susfs* 2>/dev/null || true
-            test -f fs/susfs.c && echo "fs/susfs.c exists" || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-          [ "$fail" -eq 0 ] || exit 1
+          grep -q "CONFIG_KSU_SUSFS" fs/Makefile
+          test -f fs/susfs.c
+          ls include/linux/susfs* >/dev/null
+          { echo "=== SUSFS verify ==="; grep -n "CONFIG_KSU_SUSFS" fs/Makefile; ls -l include/linux/susfs*; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Pre-build debug snapshot
+      - name: Pre-build snapshot
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          {
-            echo "=== Git status before build ==="
-            git status --short || true
-            echo
-            echo "=== Git diff stat before build ==="
-            git diff --stat || true
-            echo
-            echo "=== .rej/.orig before build ==="
-            find . -name "*.rej" -o -name "*.orig" || true
-            echo
-            echo "=== Build script ==="
-            ls -l "$BUILD_SCRIPT" || true
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== Git status before build ==="; git status --short || true; echo; echo "=== Git diff stat before build ==="; git diff --stat || true; echo; echo "=== .rej/.orig before build ==="; find . -name "*.rej" -o -name "*.orig" || true; echo; } >> "$DEBUG_SUMMARY"
           git diff > "$DEBUG_DIFF" || true
 
-      - name: Run kernel build.sh
+      - name: Run build.sh
         if: ${{ github.event.inputs.run_build == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if [ ! -f "$BUILD_SCRIPT" ]; then
-            echo "[ERROR] Build script not found: $BUILD_SCRIPT" | tee -a "$DEBUG_BUILD_LOG"
-            ls -la | tee -a "$DEBUG_BUILD_LOG"
-            exit 1
-          fi
+          test -f "$BUILD_SCRIPT" || { echo "[ERROR] Build script not found: $BUILD_SCRIPT" | tee -a "$DEBUG_BUILD_LOG"; exit 1; }
           chmod +x "$BUILD_SCRIPT" || true
           echo "[INFO] Running: bash $BUILD_SCRIPT $BUILD_ARGS" | tee -a "$DEBUG_BUILD_LOG"
           bash "$BUILD_SCRIPT" $BUILD_ARGS 2>&1 | tee -a "$DEBUG_BUILD_LOG"
 
-      - name: Skip build notice
+      - name: Skip build
         if: ${{ github.event.inputs.run_build != 'true' }}
         shell: bash
-        run: |
-          echo "[OK] run_build is not true, verification-only completed" | tee -a "$DEBUG_BUILD_LOG"
+        run: echo "[OK] run_build != true" | tee -a "$DEBUG_BUILD_LOG"
 
-      - name: Finalize 3 debug files
+      - name: Finalize exactly 3 debug files
         if: always()
         shell: bash
         run: |
           set +e
-          mkdir -p "$DEBUG_DIR"
-          touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
+          mkdir -p "$DEBUG_DIR"; touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
           if [ -n "$KERNEL_DIR" ] && [ -d "$KERNEL_DIR" ]; then
             cd "$KERNEL_DIR"
-            {
-              echo
-              echo "=== Final status ==="
-              git status --short
-              echo
-              echo "=== Final diff stat ==="
-              git diff --stat
-              echo
-              echo "=== Final .rej/.orig ==="
-              find . -name "*.rej" -o -name "*.orig"
-              echo
-              echo "=== Final SUSFS files ==="
-              find fs include/linux -maxdepth 3 -iname "*susfs*" -print | sort
-            } >> "$DEBUG_SUMMARY" 2>&1
+            { echo; echo "=== Final status ==="; git status --short; echo; echo "=== Final diff stat ==="; git diff --stat; echo; echo "=== Final .rej/.orig ==="; find . -name "*.rej" -o -name "*.orig"; echo; echo "=== Final setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; } >> "$DEBUG_SUMMARY" 2>&1
             git diff > "$DEBUG_DIFF" 2>&1
           fi
-          echo "[INFO] Uploading exactly 3 debug files:"
           ls -lh "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG" || true
 
       - name: Upload 3 debug files
