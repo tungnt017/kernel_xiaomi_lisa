@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman patches
+name: Build SukiSU-Ultra builtin (lisa) - JackA1ltman + compat
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
         options:
           - builtin
       sukisu_ref:
-        description: "SukiSU-Ultra git ref (need v4.x for SUSFS v2)"
+        description: "SukiSU-Ultra git ref"
         required: true
         default: "v4.1.3"
       jack_repo:
@@ -66,6 +66,13 @@ jobs:
           path: ${{ env.KERNEL_DIR }}
           fetch-depth: 1
 
+      - name: Copy scripts into kernel tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$KERNEL_DIR/.github/scripts"
+          cp -v workflow-repo/.github/scripts/fix_show_smap_return.py "$KERNEL_DIR/.github/scripts/"
+          cp -v workflow-repo/.github/scripts/fix_sukisu_5_4_compat.py "$KERNEL_DIR/.github/scripts/"
+
       - name: Install minimal build deps
         run: |
           sudo apt-get update
@@ -79,7 +86,6 @@ jobs:
           echo "==> Running setup.sh from SukiSU-Ultra@$REF"
           curl -fLSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${REF}/kernel/setup.sh" | bash -s "$SUKISU_MODE"
 
-          # Locate KSU dir
           KSU_DIR=""
           if [ -d "KernelSU" ]; then
             KSU_DIR="KernelSU"
@@ -93,7 +99,6 @@ jobs:
           echo "==> KSU_DIR contents:"
           ls -la "$KSU_DIR"
 
-          # Verify Kconfig files exist
           KCFG_FILES=$(find "$KSU_DIR" -maxdepth 4 -name "Kconfig" 2>/dev/null)
           if [ -z "$KCFG_FILES" ]; then
             echo "::error::No Kconfig found in $KSU_DIR"
@@ -102,12 +107,10 @@ jobs:
           echo "==> Kconfig files found:"
           echo "$KCFG_FILES"
 
-          # Verify SUSFS Kconfig entries
           KCFG_COUNT=$(grep -RnE "^[[:space:]]*config[[:space:]]+KSU_SUSFS" "$KSU_DIR" 2>/dev/null | wc -l)
           echo "==> SUSFS Kconfig entries: $KCFG_COUNT"
           if [ "$KCFG_COUNT" -lt 5 ]; then
             echo "::error::Not enough SUSFS Kconfig entries (need >=5, got $KCFG_COUNT)"
-            echo "==> All configs in $KSU_DIR:"
             grep -RnE "^[[:space:]]*config[[:space:]]+" "$KSU_DIR" 2>/dev/null | head -50
             exit 1
           fi
@@ -153,7 +156,7 @@ jobs:
 
           echo "==> Dry-run apply..."
           if ! patch -p1 --dry-run -i "$PATCH" >/tmp/susfs_dryrun.log 2>&1; then
-            echo "::warning::Dry-run reported some hunks, will try real apply with --forward"
+            echo "::warning::Dry-run reported some hunks"
             tail -30 /tmp/susfs_dryrun.log
           fi
 
@@ -162,7 +165,7 @@ jobs:
 
           REJ=$(find . -name "*.rej" -type f 2>/dev/null || true)
           if [ -n "$REJ" ]; then
-            echo "::warning::.rej files present (refactored source diff):"
+            echo "::warning::.rej files present:"
             echo "$REJ"
             for f in $REJ; do
               echo "--- $f ---"
@@ -170,7 +173,6 @@ jobs:
             done
           fi
 
-          # Verify essential SUSFS files
           FAIL=0
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ -f "$f" ]; then
@@ -232,6 +234,62 @@ jobs:
           fi
           echo "ALL essential hooks verified."
 
+      - name: Apply show_smap return-type compat fix
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/fix_show_smap_return.py
+          python3 .github/scripts/fix_show_smap_return.py | tee /tmp/fix_smap.log
+          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_smap.log; then
+            echo "::error::show_smap fix reported errors"
+            exit 1
+          fi
+
+      - name: Apply SukiSU 5.4 compat shims
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/fix_sukisu_5_4_compat.py
+          python3 .github/scripts/fix_sukisu_5_4_compat.py | tee /tmp/fix_sukisu_compat.log
+          if grep -qE "\[ERROR\]|Traceback" /tmp/fix_sukisu_compat.log; then
+            echo "::error::SukiSU 5.4 compat fix reported errors"
+            exit 1
+          fi
+
+      - name: Verify compat fixes applied
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+
+          if ! grep -q "SUSFS_SHOW_SMAP_RETURN_FIX" fs/proc/task_mmu.c; then
+            echo "::error::show_smap fix marker missing"
+            FAIL=1
+          else
+            echo "OK  show_smap fix applied"
+          fi
+
+          STRNCPY=$(find "$KSU_DIR" -name "kernel_includes.h" -exec grep -l "SUSFS_5_4_STRNCPY_COMPAT" {} \; 2>/dev/null | head -1)
+          if [ -z "$STRNCPY" ]; then
+            echo "::error::strncpy compat shim missing"
+            FAIL=1
+          else
+            echo "OK  strncpy compat shim in $STRNCPY"
+          fi
+
+          KSUD=$(find "$KSU_DIR" -name "ksud.c" -exec grep -l "SUSFS_5_4_SELINUX_HIDE_DECL" {} \; 2>/dev/null | head -1)
+          if [ -z "$KSUD" ]; then
+            echo "::error::selinux_hide extern decls missing"
+            FAIL=1
+          else
+            echo "OK  selinux_hide decls in $KSUD"
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "ALL compat fixes verified."
+
       - name: Enable SUSFS configs in defconfig
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -249,7 +307,6 @@ jobs:
           fi
           echo "Defconfig: $DC"
 
-          # Pre-extract all available KSU* Kconfig symbols (avoid grep errors)
           AVAILABLE_CFGS=$(grep -RhE "^[[:space:]]*config[[:space:]]+KSU" "$KSU_DIR" 2>/dev/null | awk '{print $2}' | sort -u)
           echo "==> Available KSU* Kconfig symbols:"
           echo "$AVAILABLE_CFGS"
@@ -369,6 +426,8 @@ jobs:
             /tmp/susfs_dryrun.log
             /tmp/susfs_apply.log
             /tmp/jack_inline_hooks.log
+            /tmp/fix_smap.log
+            /tmp/fix_sukisu_compat.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -382,7 +441,7 @@ jobs:
           if [ -n "$(ls -A /tmp/rejs 2>/dev/null)" ]; then
             echo "==> .rej files collected"
           else
-            echo "==> No .rej files (clean apply)"
+            echo "==> No .rej files"
           fi
 
       - name: Upload .rej files (if any)
