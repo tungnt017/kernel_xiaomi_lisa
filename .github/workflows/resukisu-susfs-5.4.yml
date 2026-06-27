@@ -354,32 +354,42 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          if [ -z "${DEFCONFIG_PATH:-}" ]; then
-            echo "[ERROR] DEFCONFIG_PATH is empty"
+          # Workflow currently exports DEFCONFIG, not DEFCONFIG_PATH.
+          # Use DEFCONFIG_PATH if available, otherwise fallback to DEFCONFIG.
+          DEFCONFIG_FILE="${DEFCONFIG_PATH:-${DEFCONFIG:-}}"
+
+          if [ -z "$DEFCONFIG_FILE" ]; then
+            echo "[ERROR] DEFCONFIG_FILE is empty. DEFCONFIG_PATH and DEFCONFIG are both empty."
             exit 1
           fi
-          if [ ! -f "$DEFCONFIG_PATH" ]; then
-            echo "[ERROR] DEFCONFIG_PATH not found: $DEFCONFIG_PATH"
+          if [ ! -f "$DEFCONFIG_FILE" ]; then
+            echo "[ERROR] defconfig not found: $DEFCONFIG_FILE"
+            echo "[INFO] Available defconfigs:"
+            find arch/arm64/configs -type f -name '*defconfig' | sort | sed 's/^/  - /' || true
             exit 1
           fi
 
           # Source/config fix only: replace any previous KALLSYMS_ALL state with =y.
-          sed -i '/^CONFIG_KALLSYMS_ALL=/d' "$DEFCONFIG_PATH"
-          sed -i '/^# CONFIG_KALLSYMS_ALL is not set$/d' "$DEFCONFIG_PATH"
-          grep -q '^CONFIG_KALLSYMS=y$' "$DEFCONFIG_PATH" || echo 'CONFIG_KALLSYMS=y' >> "$DEFCONFIG_PATH"
-          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG_PATH" || echo 'CONFIG_KALLSYMS_ALL=y' >> "$DEFCONFIG_PATH"
+          sed -i '/^CONFIG_KALLSYMS=/d' "$DEFCONFIG_FILE"
+          sed -i '/^CONFIG_KALLSYMS_ALL=/d' "$DEFCONFIG_FILE"
+          sed -i '/^# CONFIG_KALLSYMS is not set$/d' "$DEFCONFIG_FILE"
+          sed -i '/^# CONFIG_KALLSYMS_ALL is not set$/d' "$DEFCONFIG_FILE"
+
+          echo 'CONFIG_KALLSYMS=y' >> "$DEFCONFIG_FILE"
+          echo 'CONFIG_KALLSYMS_ALL=y' >> "$DEFCONFIG_FILE"
 
           # Strict sanity: manager/non-GKI compatibility requires KALLSYMS_ALL=y.
-          grep -q '^CONFIG_KALLSYMS=y$' "$DEFCONFIG_PATH" || { echo "[ERROR] CONFIG_KALLSYMS=y missing"; exit 1; }
-          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG_PATH" || { echo "[ERROR] CONFIG_KALLSYMS_ALL=y missing"; exit 1; }
-          if grep -q '^CONFIG_KALLSYMS_ALL=n$' "$DEFCONFIG_PATH"; then
+          grep -q '^CONFIG_KALLSYMS=y$' "$DEFCONFIG_FILE" || { echo "[ERROR] CONFIG_KALLSYMS=y missing"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG_FILE" || { echo "[ERROR] CONFIG_KALLSYMS_ALL=y missing"; exit 1; }
+          if grep -q '^CONFIG_KALLSYMS_ALL=n$' "$DEFCONFIG_FILE"; then
             echo "[ERROR] CONFIG_KALLSYMS_ALL=n remains"
             exit 1
           fi
 
           {
             echo "=== KALLSYMS manager compatibility ==="
-            grep -n '^CONFIG_KALLSYMS\|^CONFIG_KALLSYMS_ALL' "$DEFCONFIG_PATH" || true
+            echo "defconfig=$DEFCONFIG_FILE"
+            grep -n '^CONFIG_KALLSYMS\|^CONFIG_KALLSYMS_ALL' "$DEFCONFIG_FILE" || true
             echo
           } >> "$DEBUG_SUMMARY"
 
