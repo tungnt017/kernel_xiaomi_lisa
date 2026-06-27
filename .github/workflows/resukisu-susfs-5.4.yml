@@ -601,6 +601,53 @@ jobs:
         shell: bash
         run: echo "[OK] run_build != true" | tee -a "$DEBUG_BUILD_LOG"
 
+           - name: Collect output zip artifacts
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/resukisu-susfs-output
+          mkdir -p /tmp/resukisu-susfs-output
+          cd "$KERNEL_DIR"
+
+          # Collect real build zip outputs only.
+          # Do not create dummy/fake zip artifacts.
+          mapfile -t zips < <(
+            find . -type f -name "*.zip" \
+              -not -path "./.git/*" \
+              -not -path "./.github/*" \
+              -not -path "./KernelSU/.git/*" \
+              -not -path "./KernelSU/.github/*" \
+              -print | sort
+          )
+
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "[ERROR] Build completed but no .zip artifact was found. Not creating a fake zip."
+            exit 1
+          fi
+
+          {
+            echo "=== Output ZIP artifacts ==="
+            printf '%s\n' "${zips[@]}"
+            echo
+          } >> "$DEBUG_SUMMARY"
+
+          for z in "${zips[@]}"; do
+            cp -f "$z" "/tmp/resukisu-susfs-output/$(basename "$z")"
+          done
+
+          ls -lh /tmp/resukisu-susfs-output
+
+      - name: Upload output zip artifacts
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: resukisu-susfs-output-zip-${{ github.run_id }}
+          path: /tmp/resukisu-susfs-output/*.zip
+          if-no-files-found: error
+          retention-days: 14
+   
+
       - name: Finalize exactly 3 debug files
         if: always()
         shell: bash
