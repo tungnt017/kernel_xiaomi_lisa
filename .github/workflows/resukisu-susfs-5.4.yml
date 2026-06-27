@@ -441,6 +441,62 @@ jobs:
             grep -n "susfs_def.h\|SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK" fs/open.c include/linux/susfs_def.h || true
             echo
           } >> "$DEBUG_SUMMARY"
+
+
+      
+      - name: Real compile fix for SUSFS stat.c mount type visibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('fs/stat.c')
+          if not p.exists():
+              raise SystemExit('[ERROR] fs/stat.c not found')
+
+          s = p.read_text()
+          uses_mount = 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)' in s or 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s
+          has_mount_include = '#include "mount.h"' in s
+
+          if uses_mount and not has_mount_include:
+              anchor = '#include <asm/unistd.h>\n'
+              block = anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include "mount.h"\n#endif\n'
+              if anchor in s:
+                  s = s.replace(anchor, block, 1)
+              else:
+                  lines = s.splitlines(True)
+                  pos = None
+                  for i, line in enumerate(lines):
+                      if line.startswith('#include '):
+                          pos = i + 1
+                  if pos is None:
+                      raise SystemExit('[ERROR] Cannot find include location in fs/stat.c')
+                  lines.insert(pos, '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n')
+                  lines.insert(pos + 1, '#include "mount.h"\n')
+                  lines.insert(pos + 2, '#endif\n')
+                  s = ''.join(lines)
+              p.write_text(s)
+              print('[FIXED] Added fs/mount.h include to fs/stat.c for struct mount visibility')
+          else:
+              print('[OK] fs/stat.c mount type visibility already satisfied or not needed')
+          PY
+
+          # Strict sanity: if stat.c declares the SUSFS mount helper, mount.h must be included.
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('fs/stat.c').read_text()
+          if 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s and '#include "mount.h"' not in s:
+              raise SystemExit('[ERROR] fs/stat.c uses struct mount in SUSFS prototype without including mount.h')
+          print('[OK] fs/stat.c mount.h include sanity passed')
+          PY
+
+          {
+            echo "=== SUSFS stat.c mount type visibility fix ==="
+            grep -n "mount.h\|susfs_get_non_sus_mnt_id_from_mnt" fs/stat.c || true
+            echo
+          } >> "$DEBUG_SUMMARY"
     
       
       - name: Verify SUSFS integration
