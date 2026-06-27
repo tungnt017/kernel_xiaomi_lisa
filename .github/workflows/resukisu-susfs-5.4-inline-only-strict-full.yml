@@ -138,8 +138,8 @@ jobs:
 
           SCRIPT="${INLINE_HOOK_SCRIPT:-${MANUAL_HOOK_SCRIPT:-.github/scripts/apply_resukisu_manual_hooks_1_fixed_susfs.py}}"
           if [ ! -f "$SCRIPT" ]; then
-            if [ -f .github/scripts/apply_resukisu_manual_hooks_1_fixed.py ]; then
-              SCRIPT=.github/scripts/apply_resukisu_manual_hooks_1_fixed.py
+            if [ -f .github/scripts/apply_resukisu_manual_hooks_1_fixed_susfs.py ]; then
+              SCRIPT=.github/scripts/apply_resukisu_manual_hooks_1_fixed_susfs.py
             else
               echo "[ERROR] Hook script not found"
               exit 1
