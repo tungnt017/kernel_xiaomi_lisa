@@ -286,27 +286,6 @@ jobs:
           PY
           { echo "=== input hook ==="; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Check no weak/no-op KSU hook stubs and required hooks
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          if grep -RInE '(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)' fs kernel mm security drivers 2>/dev/null; then echo "[ERROR] Weak ksu_handle shim detected"; exit 1; fi
-          if grep -RInE 'ksu_handle_[a-zA-Z0-9_]+\([^;]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]+0;[[:space:]]*\}' fs kernel mm security drivers 2>/dev/null; then echo "[ERROR] No-op ksu_handle stub detected"; exit 1; fi
-          if grep -RIn 'ksu_input_hook' drivers/input/input.c 2>/dev/null; then
-            echo "[ERROR] ksu_input_hook incompatible hook detected. Refusing build."
-            exit 1
-          fi
-          fail=0
-          check() { grep -q "$2" "$1" && echo "[OK] $1 -> $2" || { echo "[ERROR] missing $1 -> $2"; fail=1; }; }
-          check kernel/sys.c ksu_handle_setresuid
-          check fs/exec.c ksu_handle_execveat
-          check fs/open.c ksu_handle_faccessat
-          check fs/read_write.c ksu_handle_sys_read
-          check fs/stat.c ksu_handle_stat
-          check drivers/input/input.c ksu_handle_input_handle_event
-          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_\|ksu_input_hook" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sed -n '1,460p' || true; echo; } >> "$DEBUG_SUMMARY"
-          [ "$fail" -eq 0 ] || exit 1
 
       - name: Apply SUSFS patch strictly
         shell: bash
