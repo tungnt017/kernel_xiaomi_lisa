@@ -1,0 +1,329 @@
+name: ReSukiSU SUSFS 5.4 - Inline Only Strict Full
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_dir:
+        description: "Kernel source directory"
+        required: false
+        default: "."
+      defconfig:
+        description: "Defconfig path. Empty = auto-detect arch/arm64/configs/lisa_defconfig"
+        required: false
+        default: ""
+      inline_hook_script:
+        description: "Inline hook script path"
+        required: false
+        default: ".github/scripts/apply_resukisu_manual_hooks_1_fixed_susfs.py"
+      run_resukisu_setup:
+        description: "Run ReSukiSU setup.sh? true/false"
+        required: false
+        default: "true"
+      build_script:
+        description: "Build script inside kernel source"
+        required: false
+        default: "build.sh"
+      build_args:
+        description: "Optional args passed to build script"
+        required: false
+        default: ""
+      run_build:
+        description: "Run build.sh after verification? true/false"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  strict-inline-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      JACK_REPO: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git"
+      JACK_BRANCH: "mainline"
+      JACK_PATCH_REL: "Patches/Patch/susfs_patch_to_5.4.patch"
+      PATCH_LOCAL: "/tmp/susfs_patch_to_5.4.patch"
+      DEBUG_DIR: "/tmp/resukisu-susfs-debug"
+      DEBUG_SUMMARY: "/tmp/resukisu-susfs-debug/debug-summary.txt"
+      DEBUG_DIFF: "/tmp/resukisu-susfs-debug/source-diff.patch"
+      DEBUG_BUILD_LOG: "/tmp/resukisu-susfs-debug/build.log"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            make patch python3 rsync unzip zip xz-utils ca-certificates clang lld llvm
+          clang --version | sed -n '1,2p'
+          ld.lld --version
+
+      - name: Init variables and debug files
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "KERNEL_DIR=${{ github.event.inputs.kernel_dir }}" >> "$GITHUB_ENV"
+          echo "INPUT_DEFCONFIG=${{ github.event.inputs.defconfig }}" >> "$GITHUB_ENV"
+          echo "INLINE_HOOK_SCRIPT=${{ github.event.inputs.inline_hook_script }}" >> "$GITHUB_ENV"
+          echo "RUN_RESUKISU_SETUP=${{ github.event.inputs.run_resukisu_setup }}" >> "$GITHUB_ENV"
+          echo "BUILD_SCRIPT=${{ github.event.inputs.build_script }}" >> "$GITHUB_ENV"
+          echo "BUILD_ARGS=${{ github.event.inputs.build_args }}" >> "$GITHUB_ENV"
+          echo "RUN_BUILD=${{ github.event.inputs.run_build }}" >> "$GITHUB_ENV"
+          rm -rf "$DEBUG_DIR" && mkdir -p "$DEBUG_DIR"
+          : > "$DEBUG_SUMMARY"; : > "$DEBUG_DIFF"; : > "$DEBUG_BUILD_LOG"
+          {
+            echo "=== Inputs ==="
+            echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
+            echo "defconfig=${{ github.event.inputs.defconfig }}"
+            echo "inline_hook_script=${{ github.event.inputs.inline_hook_script }}"
+            echo "run_resukisu_setup=${{ github.event.inputs.run_resukisu_setup }}"
+            echo "build_script=${{ github.event.inputs.build_script }}"
+            echo "build_args=${{ github.event.inputs.build_args }}"
+            echo "run_build=${{ github.event.inputs.run_build }}"
+            echo
+          } > "$DEBUG_SUMMARY"
+
+      - name: Detect kernel and defconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          test -f Makefile && test -d fs && test -d include && test -d arch
+          VERSION=$(awk '/^VERSION =/{print $3}' Makefile)
+          PATCHLEVEL=$(awk '/^PATCHLEVEL =/{print $3}' Makefile)
+          SUBLEVEL=$(awk '/^SUBLEVEL =/{print $3}' Makefile)
+          [ "$VERSION" = "5" ] && [ "$PATCHLEVEL" = "4" ] || { echo "[ERROR] Need kernel 5.4, got ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; exit 1; }
+          DEFCONFIG="$INPUT_DEFCONFIG"
+          if [ -z "$DEFCONFIG" ]; then
+            if [ -f arch/arm64/configs/lisa_defconfig ]; then DEFCONFIG="arch/arm64/configs/lisa_defconfig"; else DEFCONFIG=$(find arch/arm64/configs -type f -name "*defconfig" | sed -n '1p'); fi
+          fi
+          test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+          { echo "=== Kernel ==="; echo "version=${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; echo "defconfig=$DEFCONFIG"; echo; } >> "$DEBUG_SUMMARY"
+
+      - name: Fetch Jack SUSFS patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/NonGKI_Kernel_Build_2nd
+          git clone --depth=1 --branch "$JACK_BRANCH" "$JACK_REPO" /tmp/NonGKI_Kernel_Build_2nd
+          cp "/tmp/NonGKI_Kernel_Build_2nd/$JACK_PATCH_REL" "$PATCH_LOCAL"
+          grep -q 'diff --git a/fs/susfs\.c b/fs/susfs\.c' "$PATCH_LOCAL"
+          grep -q 'diff --git a/include/linux/susfs\.h b/include/linux/susfs\.h' "$PATCH_LOCAL"
+          grep -q 'diff --git a/include/linux/susfs_def\.h b/include/linux/susfs_def\.h' "$PATCH_LOCAL"
+          { echo "=== SUSFS Patch ==="; sha256sum "$PATCH_LOCAL"; grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,240p' || true; echo; } >> "$DEBUG_SUMMARY"
+
+      - name: ReSukiSU setup
+        if: ${{ github.event.inputs.run_resukisu_setup == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+      - name: Apply inline-only hook script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          test -f "$INLINE_HOOK_SCRIPT" || { echo "[ERROR] Inline hook script not found: $INLINE_HOOK_SCRIPT"; exit 1; }
+          python3 "$INLINE_HOOK_SCRIPT" "$(basename "$DEFCONFIG")"
+          {
+            echo "=== Inline hooks after script ==="
+            grep -Rsn "ksu_handle_\|CONFIG_KSU_MANUAL_HOOK\|ksu_input_hook" kernel/sys.c fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c drivers/input/input.c || true
+            echo
+            echo "=== Defconfig KSU/KALLSYMS ==="
+            grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true
+            echo
+          } >> "$DEBUG_SUMMARY"
+
+      - name: Apply SUSFS patch strictly - no bypass
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          if git apply --check "$PATCH_LOCAL"; then git apply "$PATCH_LOCAL"; elif patch -p1 --dry-run < "$PATCH_LOCAL"; then patch -p1 < "$PATCH_LOCAL"; else echo "[ERROR] SUSFS patch failed. Not bypassing."; exit 1; fi
+          rej=$(find . -name "*.rej" -print)
+          [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
+          find . -name "*.orig" -print -delete || true
+
+      - name: Real compile/source fixes - SUSFS and Clang 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          changed=[]
+          def txt(p): return Path(p).read_text(errors='ignore')
+          def put(p,s): Path(p).write_text(s)
+          def func_body(s, pat):
+              m=re.search(pat,s)
+              if not m: return None
+              st=m.end()-1; d=0; en=None
+              for i in range(st,len(s)):
+                  if s[i]=='{': d+=1
+                  elif s[i]=='}':
+                      d-=1
+                      if d==0: en=i+1; break
+              return st,en,s[st:en]
+          p='fs/proc/task_mmu.c'; s=txt(p); r=func_body(s,r'static\s+int\s+show_smap\s*\([^)]*\)\s*\{')
+          if r:
+              st,en,b=r
+              if re.search(r'(?m)^\s*return\s*;\s*$',b):
+                  b=re.sub(r'(?m)^(\s*)return\s*;\s*$',r'\1return 0;',b); put(p,s[:st]+b+s[en:]); changed.append('show_smap return 0')
+          h='include/linux/susfs_def.h'; o='fs/open.c'
+          hs=txt(h); os=txt(o); need='SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'; base='SUSFS_IS_INODE_OPEN_REDIRECT'
+          if need in os and need not in hs:
+              if base not in hs: raise SystemExit('[ERROR] base open_redirect macro missing')
+              put(h,hs.rstrip()+"\n\n#ifndef SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\n#define SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(inode) \\\n\tSUSFS_IS_INODE_OPEN_REDIRECT(inode)\n#endif\n")
+              changed.append('open_redirect alias')
+          os=txt(o)
+          if 'SUSFS_IS_INODE_OPEN_REDIRECT' in os and '#include <linux/susfs_def.h>' not in os:
+              os=os.replace('#include <linux/falloc.h>\n','#include <linux/falloc.h>\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n#include <linux/susfs_def.h>\n#endif\n',1); put(o,os); changed.append('open.c include susfs_def')
+          p='fs/stat.c'; s=txt(p)
+          if 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s and '#include "mount.h"' not in s:
+              s=s.replace('#include <asm/unistd.h>\n','#include <asm/unistd.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include "mount.h"\n#endif\n',1); put(p,s); changed.append('stat.c mount.h')
+          p='techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c';
+          if Path(p).exists():
+              s=txt(p)
+              if 'q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;' in s: s=s.replace('q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;','q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;',1); changed.append('rmnet ip cast')
+              if 'q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;' in s: s=s.replace('q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;','q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;',1); changed.append('rmnet action cast')
+              put(p,s)
+          p='net/ipv4/tcp_timer.c'
+          if Path(p).exists():
+              s=txt(p)
+              if 'icsk->icsk_mtup.enabled = 1;' in s: s=s.replace('icsk->icsk_mtup.enabled = 1;','icsk->icsk_mtup.enabled = -1;',1); put(p,s); changed.append('tcp bitfield')
+          p='drivers/usb/misc/usbdtp.c'
+          if Path(p).exists():
+              s=txt(p)
+              if 'drv->disconnected = 1;' in s: s=s.replace('drv->disconnected = 1;','drv->disconnected = -1;'); put(p,s); changed.append('usbdtp bitfield')
+          p='drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c'
+          if Path(p).exists():
+              s=txt(p)
+              if 'uint8_t mdie[SIR_MDIE_SIZE])' in s: s=s.replace('uint8_t mdie[SIR_MDIE_SIZE])','uint8_t mdie[])',1); put(p,s); changed.append('parser mdie[]')
+          for p,old,new in [('techpack/display/msm/sde/sde_hw_dsc_1_2.c','static inline _dsc_subblk_offset(','static inline int _dsc_subblk_offset('),('techpack/display/msm/sde/sde_hw_vdc.c','static inline _vdc_subblk_offset(','static inline int _vdc_subblk_offset(')]:
+              if Path(p).exists():
+                  s=txt(p)
+                  if old in s: put(p,s.replace(old,new,1)); changed.append(p+' int return')
+          print('[FIXED] '+ '; '.join(changed) if changed else '[OK] source fixes already present')
+          PY
+
+      - name: Verify inline-only ReSukiSU hooks before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          grep -q '^CONFIG_KSU=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KSU=y missing"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KSU_SUSFS=y missing"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KALLSYMS=y missing"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KALLSYMS_ALL=y missing"; exit 1; }
+          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' "$DEFCONFIG"; then echo "[ERROR] CONFIG_KSU_MANUAL_HOOK=y detected"; exit 1; fi
+          grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set$' "$DEFCONFIG" || { echo "[ERROR] manual hook unset line missing"; exit 1; }
+          if grep -RIn 'CONFIG_KSU_MANUAL_HOOK' kernel/sys.c fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c drivers/input/input.c 2>/dev/null; then echo "[ERROR] CONFIG_KSU_MANUAL_HOOK guard remains in source"; exit 1; fi
+          fail=0
+          check_hook() { file="$1"; symbol="$2"; grep -q "$symbol" "$file" && echo "[OK] $file -> $symbol" || { echo "[ERROR] missing $file -> $symbol"; fail=1; }; }
+          check_hook kernel/sys.c ksu_handle_setresuid
+          check_hook fs/exec.c ksu_handle_execveat
+          check_hook fs/open.c ksu_handle_faccessat
+          check_hook fs/read_write.c ksu_handle_sys_read
+          check_hook fs/stat.c ksu_handle_stat
+          check_hook kernel/reboot.c ksu_handle_sys_reboot
+          check_hook drivers/input/input.c ksu_handle_input_handle_event
+          [ "$fail" -eq 0 ] || exit 1
+          if grep -RInE '(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)' kernel fs drivers/input 2>/dev/null; then echo "[ERROR] Weak ksu_handle shim detected"; exit 1; fi
+          if grep -RInE 'ksu_handle_[A-Za-z0-9_]+\([^;]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]+0;[[:space:]]*\}' kernel fs drivers/input 2>/dev/null; then echo "[ERROR] No-op ksu_handle stub detected"; exit 1; fi
+          if grep -RIn 'ksu_input_hook' drivers/input/input.c 2>/dev/null; then echo "[ERROR] ksu_input_hook incompatible hook detected"; exit 1; fi
+          { echo "=== Pre-build inline-only verification ==="; grep -nE '^CONFIG_KSU|^# CONFIG_KSU_MANUAL_HOOK|^CONFIG_KALLSYMS' "$DEFCONFIG" || true; echo; grep -Rsn 'ksu_handle_' kernel/sys.c fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c drivers/input/input.c 2>/dev/null || true; echo; } >> "$DEBUG_SUMMARY"
+          echo "[OK] Inline-only verification passed. Starting build is safe."
+
+      - name: Verify SUSFS integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          grep -q "CONFIG_KSU_SUSFS" fs/Makefile
+          test -f fs/susfs.c
+          ls include/linux/susfs* >/dev/null
+          { echo "=== SUSFS verify ==="; grep -n "CONFIG_KSU_SUSFS" fs/Makefile; ls -l include/linux/susfs*; echo; } >> "$DEBUG_SUMMARY"
+
+      - name: Pre-build snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          { echo "=== Git status before build ==="; git status --short || true; echo; echo "=== Git diff stat before build ==="; git diff --stat || true; echo; } >> "$DEBUG_SUMMARY"
+          git diff > "$DEBUG_DIFF" || true
+
+      - name: Run full build.sh
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          test -f "$BUILD_SCRIPT" || { echo "[ERROR] Build script not found: $BUILD_SCRIPT" | tee -a "$DEBUG_BUILD_LOG"; exit 1; }
+          chmod +x "$BUILD_SCRIPT" || true
+          echo "[INFO] Running full build: bash $BUILD_SCRIPT $BUILD_ARGS" | tee -a "$DEBUG_BUILD_LOG"
+          bash "$BUILD_SCRIPT" $BUILD_ARGS 2>&1 | tee -a "$DEBUG_BUILD_LOG"
+
+      - name: Skip build
+        if: ${{ github.event.inputs.run_build != 'true' }}
+        shell: bash
+        run: echo "[OK] run_build != true" | tee -a "$DEBUG_BUILD_LOG"
+
+      - name: Collect output zip artifacts
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/resukisu-susfs-output && mkdir -p /tmp/resukisu-susfs-output
+          cd "$KERNEL_DIR"
+          mapfile -t zips < <(find . -type f -name "*.zip" -not -path "./.git/*" -not -path "./.github/*" -not -path "./KernelSU/.git/*" -print | sort)
+          if [ "${#zips[@]}" -eq 0 ]; then echo "[ERROR] Build completed but no .zip artifact was found. Not creating a fake zip."; exit 1; fi
+          { echo "=== Output ZIP artifacts ==="; printf '%s\n' "${zips[@]}"; echo; } >> "$DEBUG_SUMMARY"
+          for z in "${zips[@]}"; do cp -f "$z" "/tmp/resukisu-susfs-output/$(basename "$z")"; done
+          ls -lh /tmp/resukisu-susfs-output
+
+      - name: Upload output zip artifacts
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: resukisu-susfs-output-zip-${{ github.run_id }}
+          path: /tmp/resukisu-susfs-output/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Finalize debug files
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$DEBUG_DIR"; touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
+          if [ -n "$KERNEL_DIR" ] && [ -d "$KERNEL_DIR" ]; then
+            cd "$KERNEL_DIR"
+            { echo; echo "=== Final status ==="; git status --short; echo; echo "=== Final diff stat ==="; git diff --stat; echo; echo "=== Final manual guard scan ==="; grep -RIn 'CONFIG_KSU_MANUAL_HOOK' kernel/sys.c fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c drivers/input/input.c 2>/dev/null || true; echo; } >> "$DEBUG_SUMMARY" 2>&1
+            git diff > "$DEBUG_DIFF" 2>&1
+          fi
+          ls -lh "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG" || true
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resukisu-susfs-debug-${{ github.run_id }}
+          path: |
+            /tmp/resukisu-susfs-debug/debug-summary.txt
+            /tmp/resukisu-susfs-debug/source-diff.patch
+            /tmp/resukisu-susfs-debug/build.log
+          if-no-files-found: warn
+          retention-days: 14
