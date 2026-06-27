@@ -601,7 +601,7 @@ jobs:
         shell: bash
         run: echo "[OK] run_build != true" | tee -a "$DEBUG_BUILD_LOG"
 
-           - name: Collect output zip artifacts
+      - name: Collect output zip artifacts
         if: ${{ github.event.inputs.run_build == 'true' }}
         shell: bash
         run: |
