@@ -331,6 +331,60 @@ jobs:
           PY
           { echo "=== show_smap return fix ==="; grep -n "static int show_smap" fs/proc/task_mmu.c || true; grep -n "return 0;" fs/proc/task_mmu.c | sed -n '1,100p' || true; echo; } >> "$DEBUG_SUMMARY"
 
+      
+      - name: Real compile fix for SUSFS open_redirect macro compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          hdr = Path('include/linux/susfs_def.h')
+          opn = Path('fs/open.c')
+          if not hdr.exists():
+              raise SystemExit('[ERROR] include/linux/susfs_def.h not found')
+          if not opn.exists():
+              raise SystemExit('[ERROR] fs/open.c not found')
+
+          h = hdr.read_text()
+          o = opn.read_text()
+          need = 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
+          base = 'SUSFS_IS_INODE_OPEN_REDIRECT'
+
+          if need in o and need not in h:
+              if base not in h:
+                  raise SystemExit('[ERROR] fs/open.c uses %s but %s is also missing in susfs_def.h' % (need, base))
+              block = (
+                  '\n\n#ifndef SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\n'
+                  '#define SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(inode) \\\n'
+                  '\tSUSFS_IS_INODE_OPEN_REDIRECT(inode)\n'
+                  '#endif\n'
+              )
+              h = h.rstrip() + block + '\n'
+              hdr.write_text(h)
+              print('[FIXED] Added SUSFS open_redirect WITHOUT_UID_CHECK compatibility macro alias')
+          else:
+              print('[OK] SUSFS open_redirect macro compatibility already satisfied or not needed')
+          PY
+
+          # Strict sanity: if fs/open.c references the macro, header must define it.
+          python3 - <<'PY'
+          from pathlib import Path
+          o = Path('fs/open.c').read_text()
+          h = Path('include/linux/susfs_def.h').read_text()
+          need = 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
+          if need in o and need not in h:
+              raise SystemExit('[ERROR] %s still missing from include/linux/susfs_def.h' % need)
+          print('[OK] SUSFS open_redirect macro sanity passed')
+          PY
+
+          {
+            echo "=== SUSFS open_redirect macro fix ==="
+            grep -n "SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\|SUSFS_IS_INODE_OPEN_REDIRECT" include/linux/susfs_def.h fs/open.c || true
+            echo
+          } >> "$DEBUG_SUMMARY"
+      
       - name: Verify SUSFS integration
         shell: bash
         run: |
