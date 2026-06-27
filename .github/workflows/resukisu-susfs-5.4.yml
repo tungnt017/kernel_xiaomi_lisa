@@ -1,4 +1,4 @@
-name: ReSukiSU SUSFS 5.4 - Strict Full Build Input Hook
+name: ReSukiSU SUSFS 5.4 - Strict Full Build Input Direct Hook
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   strict-full-build:
-    name: Strict full build - no bypass, no weak, no stub
+    name: Strict full build - direct input hook, no bypass, no weak, no stub
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -87,13 +87,8 @@ jobs:
           echo "BUILD_ARGS=${{ github.event.inputs.build_args }}" >> "$GITHUB_ENV"
           echo "RUN_BUILD=${{ github.event.inputs.run_build }}" >> "$GITHUB_ENV"
           echo "AUTO_FIX_DEFCONFIG=${{ github.event.inputs.auto_fix_defconfig }}" >> "$GITHUB_ENV"
-
-          rm -rf "$DEBUG_DIR"
-          mkdir -p "$DEBUG_DIR"
-          : > "$DEBUG_SUMMARY"
-          : > "$DEBUG_DIFF"
-          : > "$DEBUG_BUILD_LOG"
-
+          rm -rf "$DEBUG_DIR" && mkdir -p "$DEBUG_DIR"
+          : > "$DEBUG_SUMMARY"; : > "$DEBUG_DIFF"; : > "$DEBUG_BUILD_LOG"
           {
             echo "=== Inputs ==="
             echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
@@ -118,36 +113,18 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          test -f Makefile || { echo "[ERROR] Makefile not found"; exit 1; }
-          test -d fs || { echo "[ERROR] fs/ not found"; exit 1; }
-          test -d include || { echo "[ERROR] include/ not found"; exit 1; }
-          test -d arch || { echo "[ERROR] arch/ not found"; exit 1; }
-
+          test -f Makefile && test -d fs && test -d include && test -d arch
           VERSION=$(awk '/^VERSION =/{print $3}' Makefile)
           PATCHLEVEL=$(awk '/^PATCHLEVEL =/{print $3}' Makefile)
           SUBLEVEL=$(awk '/^SUBLEVEL =/{print $3}' Makefile)
-          [ "$VERSION" = "5" ] && [ "$PATCHLEVEL" = "4" ] || {
-            echo "[ERROR] Need kernel 5.4, got ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-            exit 1
-          }
-
+          [ "$VERSION" = "5" ] && [ "$PATCHLEVEL" = "4" ] || { echo "[ERROR] Need kernel 5.4, got ${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; exit 1; }
           DEFCONFIG="$INPUT_DEFCONFIG"
           if [ -z "$DEFCONFIG" ]; then
-            if [ -f arch/arm64/configs/lisa_defconfig ]; then
-              DEFCONFIG="arch/arm64/configs/lisa_defconfig"
-            else
-              DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p')
-            fi
+            if [ -f arch/arm64/configs/lisa_defconfig ]; then DEFCONFIG="arch/arm64/configs/lisa_defconfig"; else DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -type f -name "*defconfig" | sed -n '1p'); fi
           fi
           test -f "$DEFCONFIG" || { echo "[ERROR] Defconfig not found: $DEFCONFIG"; exit 1; }
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
-
-          {
-            echo "=== Kernel ==="
-            echo "version=${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-            echo "defconfig=$DEFCONFIG"
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== Kernel ==="; echo "version=${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"; echo "defconfig=$DEFCONFIG"; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Fetch Jack SUSFS patch
         shell: bash
@@ -156,17 +133,10 @@ jobs:
           rm -rf /tmp/NonGKI_Kernel_Build_2nd
           git clone --depth=1 --branch "$JACK_BRANCH" "$JACK_REPO" /tmp/NonGKI_Kernel_Build_2nd
           cp "/tmp/NonGKI_Kernel_Build_2nd/$JACK_PATCH_REL" "$PATCH_LOCAL"
-
           grep -q 'diff --git a/fs/susfs\.c b/fs/susfs\.c' "$PATCH_LOCAL"
           grep -q 'diff --git a/include/linux/susfs\.h b/include/linux/susfs\.h' "$PATCH_LOCAL"
           grep -q 'diff --git a/include/linux/susfs_def\.h b/include/linux/susfs_def\.h' "$PATCH_LOCAL"
-
-          {
-            echo "=== SUSFS Patch ==="
-            sha256sum "$PATCH_LOCAL"
-            grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,240p' || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== SUSFS Patch ==="; sha256sum "$PATCH_LOCAL"; grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,240p' || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: ReSukiSU setup
         if: ${{ github.event.inputs.run_resukisu_setup == 'true' }}
@@ -181,11 +151,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then
-            python3 "$MANUAL_HOOK_SCRIPT"
-          else
-            echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"
-          fi
+          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then python3 "$MANUAL_HOOK_SCRIPT"; else echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"; fi
 
       - name: Strict real setresuid hook
         shell: bash
@@ -195,56 +161,39 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
-
           p = Path('kernel/sys.c')
           s = p.read_text()
           marker = 'SYSCALL_DEFINE3(setresuid'
-          if marker not in s:
-              raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(setresuid)')
-
+          if marker not in s: raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(setresuid)')
           if 'extern int ksu_handle_setresuid' not in s:
               idx = s.find(marker)
               s = s[:idx] + '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n' + s[idx:]
-
-          start = s.find(marker)
-          brace = s.find('{', start)
-          depth = 0
-          end = None
+          start = s.find(marker); brace = s.find('{', start)
+          depth=0; end=None
           for i in range(brace, len(s)):
-              if s[i] == '{':
-                  depth += 1
-              elif s[i] == '}':
-                  depth -= 1
-                  if depth == 0:
-                      end = i + 1
-                      break
-          if end is None:
-              raise SystemExit('[ERROR] Cannot parse setresuid body')
-
-          body = s[brace:end]
-          call = 'ksu_handle_setresuid(ruid, euid, suid);'
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse setresuid body')
+          body=s[brace:end]
+          call='ksu_handle_setresuid(ruid, euid, suid);'
           if call not in body:
-              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
+              hook='#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
               if 'return commit_creds(new);' in body:
-                  body = body.replace('return commit_creds(new);', hook + 'return commit_creds(new);', 1)
+                  body=body.replace('return commit_creds(new);', hook+'return commit_creds(new);', 1)
               elif 'commit_creds(new);' in body:
-                  body = body.replace('commit_creds(new);', hook + 'commit_creds(new);', 1)
+                  body=body.replace('commit_creds(new);', hook+'commit_creds(new);', 1)
               else:
-                  returns = list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
-                  if not returns:
-                      raise SystemExit('[ERROR] No return found in setresuid')
-                  r = returns[-1]
-                  body = body[:r.start()] + '\t' + hook + body[r.start():]
-              s = s[:brace] + body + s[end:]
-
+                  returns=list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
+                  if not returns: raise SystemExit('[ERROR] No return found in setresuid')
+                  r=returns[-1]
+                  body=body[:r.start()]+'\t'+hook+body[r.start():]
+              s=s[:brace]+body+s[end:]
           p.write_text(s)
           print('[OK] Real ksu_handle_setresuid call present')
           PY
-          {
-            echo "=== setresuid hook ==="
-            grep -n "ksu_handle_setresuid" kernel/sys.c || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Strict real sys_read hook
         shell: bash
@@ -254,155 +203,103 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
-
           p = Path('fs/read_write.c')
           s = p.read_text()
           marker = 'SYSCALL_DEFINE3(read'
-          if marker not in s:
-              raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(read)')
-          if 'ksu_handle_vfs_read' in s:
-              raise SystemExit('[ERROR] ksu_handle_vfs_read found; ReSukiSU inline expects ksu_handle_sys_read')
-
+          if marker not in s: raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(read)')
+          if 'ksu_handle_vfs_read' in s: raise SystemExit('[ERROR] ksu_handle_vfs_read found; ReSukiSU inline expects ksu_handle_sys_read')
           if 'extern int ksu_handle_sys_read' not in s:
-              idx = s.find(marker)
-              s = s[:idx] + '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n' + s[idx:]
-
-          start = s.find(marker)
-          brace = s.find('{', start)
-          depth = 0
-          end = None
+              idx=s.find(marker)
+              s=s[:idx]+'#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n'+s[idx:]
+          start=s.find(marker); brace=s.find('{', start)
+          depth=0; end=None
           for i in range(brace, len(s)):
-              if s[i] == '{':
-                  depth += 1
-              elif s[i] == '}':
-                  depth -= 1
-                  if depth == 0:
-                      end = i + 1
-                      break
-          if end is None:
-              raise SystemExit('[ERROR] Cannot parse read syscall body')
-
-          body = s[brace:end]
-          call = 'ksu_handle_sys_read(fd, &buf, &count);'
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse read syscall body')
+          body=s[brace:end]
+          call='ksu_handle_sys_read(fd, &buf, &count);'
           if call not in body:
-              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n\t'
+              hook='#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n\t'
               if 'return ksys_read(fd, buf, count);' in body:
-                  body = body.replace('return ksys_read(fd, buf, count);', hook + 'return ksys_read(fd, buf, count);', 1)
+                  body=body.replace('return ksys_read(fd, buf, count);', hook+'return ksys_read(fd, buf, count);', 1)
               else:
-                  returns = list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
-                  if not returns:
-                      raise SystemExit('[ERROR] No return found in read syscall body')
-                  r = returns[-1]
-                  body = body[:r.start()] + '\t' + hook + body[r.start():]
-              s = s[:brace] + body + s[end:]
-
+                  returns=list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
+                  if not returns: raise SystemExit('[ERROR] No return found in read syscall body')
+                  r=returns[-1]
+                  body=body[:r.start()]+'\t'+hook+body[r.start():]
+              s=s[:brace]+body+s[end:]
           p.write_text(s)
           print('[OK] Real ksu_handle_sys_read call present')
           PY
-          {
-            echo "=== sys_read hook ==="
-            grep -n "ksu_handle_sys_read" fs/read_write.c || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== sys_read hook ==="; grep -n "ksu_handle_sys_read" fs/read_write.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: Strict real input_handle_event hook
+      - name: Strict real input_handle_event direct hook - no ksu_input_hook
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
-
-          p = Path('drivers/input/input.c')
-          if not p.exists():
-              raise SystemExit('[ERROR] drivers/input/input.c not found')
-          s = p.read_text()
-
-          markers = [
-              'void input_handle_event(struct input_dev *dev,',
-              'void input_handle_event (struct input_dev *dev,'
-          ]
-          marker = next((m for m in markers if m in s), None)
-          if marker is None:
-              raise SystemExit('[ERROR] Cannot find input_handle_event in drivers/input/input.c')
-
+          p=Path('drivers/input/input.c')
+          if not p.exists(): raise SystemExit('[ERROR] drivers/input/input.c not found')
+          s=p.read_text()
+          # Remove incompatible old/failed ksu_input_hook snippets if script is re-run on a dirty tree.
+          s=s.replace('extern bool ksu_input_hook __read_mostly;\n','')
+          s=s.replace('\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n','')
+          s=s.replace('\tif (unlikely (ksu_input_hook))\n\t\tksu_handle_input_handle_event (&type, &code, &value);\n','')
+          markers=['static void input_handle_event(struct input_dev *dev,','static void input_handle_event (struct input_dev *dev,','void input_handle_event(struct input_dev *dev,','void input_handle_event (struct input_dev *dev,']
+          marker=next((m for m in markers if m in s), None)
+          if marker is None: raise SystemExit('[ERROR] Cannot find input_handle_event in drivers/input/input.c')
           if 'extern int ksu_handle_input_handle_event' not in s:
-              idx = s.find(marker)
-              decl = '#ifdef CONFIG_KSU_MANUAL_HOOK\nextern bool ksu_input_hook __read_mostly;\n__attribute__((hot))\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n'
-              s = s[:idx] + decl + s[idx:]
-
-          start = s.find(marker)
-          brace = s.find('{', start)
-          depth = 0
-          end = None
+              idx=s.find(marker)
+              decl='#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n'
+              s=s[:idx]+decl+s[idx:]
+          # Re-find marker after inserting declaration.
+          marker=next((m for m in markers if m in s), None)
+          start=s.find(marker); brace=s.find('{', start)
+          depth=0; end=None
           for i in range(brace, len(s)):
-              if s[i] == '{':
-                  depth += 1
-              elif s[i] == '}':
-                  depth -= 1
-                  if depth == 0:
-                      end = i + 1
-                      break
-          if end is None:
-              raise SystemExit('[ERROR] Cannot parse input_handle_event body')
-
-          body = s[brace:end]
-          call = 'ksu_handle_input_handle_event(&type, &code, &value);'
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse input_handle_event body')
+          body=s[brace:end]
+          call='ksu_handle_input_handle_event(&type, &code, &value);'
           if call not in body:
-              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n'
-              anchors = [
-                  'disposition = input_get_disposition(dev, type, code, &value);',
-                  'disposition = input_get_disposition (dev, type, code, &value);'
-              ]
-              anchor = next((a for a in anchors if a in body), None)
-              if anchor is None:
-                  raise SystemExit('[ERROR] Cannot find input_get_disposition anchor in input_handle_event')
-              body = body.replace(anchor, anchor + '\n' + hook, 1)
-              s = s[:brace] + body + s[end:]
-
+              hook='#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n'
+              anchors=['disposition = input_get_disposition(dev, type, code, &value);','disposition = input_get_disposition (dev, type, code, &value);']
+              anchor=next((a for a in anchors if a in body), None)
+              if anchor is None: raise SystemExit('[ERROR] Cannot find input_get_disposition anchor in input_handle_event')
+              body=body.replace(anchor, anchor+'\n'+hook, 1)
+              s=s[:brace]+body+s[end:]
+          if 'ksu_input_hook' in s:
+              raise SystemExit('[ERROR] ksu_input_hook remains in drivers/input/input.c; ReSukiSU says it is incompatible')
           p.write_text(s)
-          print('[OK] Real ksu_handle_input_handle_event call present')
+          print('[OK] Real direct ksu_handle_input_handle_event call present; no ksu_input_hook')
           PY
-          {
-            echo "=== input hook ==="
-            grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== input hook ==="; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Check no weak/no-op KSU hook stubs and required hooks
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-
-          if grep -RInE '(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)' fs kernel mm security drivers 2>/dev/null; then
-            echo "[ERROR] Weak ksu_handle shim detected"
-            exit 1
-          fi
-          if grep -RInE 'ksu_handle_[a-zA-Z0-9_]+\([^;]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]+0;[[:space:]]*\}' fs kernel mm security drivers 2>/dev/null; then
-            echo "[ERROR] No-op ksu_handle stub detected"
-            exit 1
-          fi
-
+          if grep -RInE '(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)' fs kernel mm security drivers 2>/dev/null; then echo "[ERROR] Weak ksu_handle shim detected"; exit 1; fi
+          if grep -RInE 'ksu_handle_[a-zA-Z0-9_]+\([^;]*\)[[:space:]]*\{[[:space:]]*return[[:space:]]+0;[[:space:]]*\}' fs kernel mm security drivers 2>/dev/null; then echo "[ERROR] No-op ksu_handle stub detected"; exit 1; fi
+          if grep -RIn 'ksu_input_hook' drivers/input/input.c 2>/dev/null; then echo "[ERROR] ksu_input_hook incompatible hook detected"; exit 1; fi
           fail=0
-          check() {
-            grep -q "$2" "$1" && echo "[OK] $1 -> $2" || { echo "[ERROR] missing $1 -> $2"; fail=1; }
-          }
+          check() { grep -q "$2" "$1" && echo "[OK] $1 -> $2" || { echo "[ERROR] missing $1 -> $2"; fail=1; }; }
           check kernel/sys.c ksu_handle_setresuid
           check fs/exec.c ksu_handle_execveat
           check fs/open.c ksu_handle_faccessat
           check fs/read_write.c ksu_handle_sys_read
           check fs/stat.c ksu_handle_stat
           check drivers/input/input.c ksu_handle_input_handle_event
-
-          {
-            echo "=== KSU hooks ==="
-            grep -Rsn "ksu_handle_\|ksu_input_hook" \
-              fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c drivers/input/input.c \
-              2>/dev/null | sed -n '1,460p' || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-
+          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sed -n '1,460p' || true; echo; } >> "$DEBUG_SUMMARY"
           [ "$fail" -eq 0 ] || exit 1
 
       - name: Apply SUSFS patch strictly - no bypass
@@ -410,15 +307,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          if git apply --check "$PATCH_LOCAL"; then
-            git apply "$PATCH_LOCAL"
-          elif patch -p1 --dry-run < "$PATCH_LOCAL"; then
-            patch -p1 < "$PATCH_LOCAL"
-          else
-            echo "[ERROR] SUSFS patch failed. Not bypassing."
-            exit 1
-          fi
-
+          if git apply --check "$PATCH_LOCAL"; then git apply "$PATCH_LOCAL"; elif patch -p1 --dry-run < "$PATCH_LOCAL"; then patch -p1 < "$PATCH_LOCAL"; else echo "[ERROR] SUSFS patch failed. Not bypassing."; exit 1; fi
           rej=$(find . -name "*.rej" -print)
           [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
           find . -name "*.orig" -print -delete || true
@@ -428,19 +317,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          ensure_y() {
-            cfg="$1"
-            if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then return 0; fi
-            [ "$AUTO_FIX_DEFCONFIG" = "true" ] || { echo "[ERROR] Missing $cfg=y"; exit 1; }
-            sed -i "/^# ${cfg} is not set$/d;/^${cfg}=/d" "$DEFCONFIG"
-            printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"
-          }
-          unset_cfg() {
-            cfg="$1"
-            sed -i "/^${cfg}=y$/d;/^${cfg}=/d" "$DEFCONFIG"
-            grep -qE "^# ${cfg} is not set$" "$DEFCONFIG" || printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"
-          }
-
+          ensure_y() { cfg="$1"; if grep -qE "^${cfg}=y$" "$DEFCONFIG"; then return 0; fi; [ "$AUTO_FIX_DEFCONFIG" = "true" ] || { echo "[ERROR] Missing $cfg=y"; exit 1; }; sed -i "/^# ${cfg} is not set$/d;/^${cfg}=/d" "$DEFCONFIG"; printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"; }
+          unset_cfg() { cfg="$1"; sed -i "/^${cfg}=y$/d;/^${cfg}=/d" "$DEFCONFIG"; grep -qE "^# ${cfg} is not set$" "$DEFCONFIG" || printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"; }
           ensure_y CONFIG_KSU
           ensure_y CONFIG_KSU_MANUAL_HOOK
           ensure_y CONFIG_KSU_SUSFS
@@ -449,12 +327,7 @@ jobs:
           unset_cfg CONFIG_KSU_KPROBES_HOOK
           unset_cfg CONFIG_KSU_KPROBES_HOOKS
           unset_cfg CONFIG_KSU_WITH_KPROBES
-
-          {
-            echo "=== Defconfig ==="
-            grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== Defconfig ==="; grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Verify SUSFS integration
         shell: bash
@@ -464,29 +337,14 @@ jobs:
           grep -q "CONFIG_KSU_SUSFS" fs/Makefile
           test -f fs/susfs.c
           ls include/linux/susfs* >/dev/null
-          {
-            echo "=== SUSFS verify ==="
-            grep -n "CONFIG_KSU_SUSFS" fs/Makefile
-            ls -l include/linux/susfs*
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== SUSFS verify ==="; grep -n "CONFIG_KSU_SUSFS" fs/Makefile; ls -l include/linux/susfs*; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Pre-build snapshot
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          {
-            echo "=== Git status before build ==="
-            git status --short || true
-            echo
-            echo "=== Git diff stat before build ==="
-            git diff --stat || true
-            echo
-            echo "=== .rej/.orig before build ==="
-            find . -name "*.rej" -o -name "*.orig" || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== Git status before build ==="; git status --short || true; echo; echo "=== Git diff stat before build ==="; git diff --stat || true; echo; echo "=== .rej/.orig before build ==="; find . -name "*.rej" -o -name "*.orig" || true; echo; } >> "$DEBUG_SUMMARY"
           git diff > "$DEBUG_DIFF" || true
 
       - name: Run full build.sh
@@ -510,26 +368,10 @@ jobs:
         shell: bash
         run: |
           set +e
-          mkdir -p "$DEBUG_DIR"
-          touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
+          mkdir -p "$DEBUG_DIR"; touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
           if [ -n "$KERNEL_DIR" ] && [ -d "$KERNEL_DIR" ]; then
             cd "$KERNEL_DIR"
-            {
-              echo
-              echo "=== Final status ==="
-              git status --short
-              echo
-              echo "=== Final diff stat ==="
-              git diff --stat
-              echo
-              echo "=== Final .rej/.orig ==="
-              find . -name "*.rej" -o -name "*.orig"
-              echo
-              echo "=== Final required hooks ==="
-              grep -n "ksu_handle_setresuid" kernel/sys.c || true
-              grep -n "ksu_handle_sys_read" fs/read_write.c || true
-              grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true
-            } >> "$DEBUG_SUMMARY" 2>&1
+            { echo; echo "=== Final status ==="; git status --short; echo; echo "=== Final diff stat ==="; git diff --stat; echo; echo "=== Final .rej/.orig ==="; find . -name "*.rej" -o -name "*.orig"; echo; echo "=== Final required hooks ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; grep -n "ksu_handle_sys_read" fs/read_write.c || true; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; } >> "$DEBUG_SUMMARY" 2>&1
             git diff > "$DEBUG_DIFF" 2>&1
           fi
           ls -lh "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG" || true
