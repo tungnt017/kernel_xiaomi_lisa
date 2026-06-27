@@ -1,4 +1,5 @@
-name: ReSukiSU SUSFS 5.4 - Strict Build ShowSmap Fix
+
+name: ReSukiSU SUSFS 5.4 - Strict Official Source Fix Full V2
 
 on:
   workflow_dispatch:
@@ -41,7 +42,6 @@ permissions:
 
 jobs:
   strict-full-build:
-    name: Strict full build - no bypass, no weak, no stub
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -71,8 +71,10 @@ jobs:
             make patch python3 rsync unzip xz-utils ca-certificates clang lld llvm
           command -v clang
           command -v ld.lld
+          clang --version | sed -n '1,2p'
+          ld.lld --version
 
-      - name: Init variables and exactly 3 debug files
+      - name: Init variables and 3 debug logs
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +87,9 @@ jobs:
           echo "RUN_BUILD=${{ github.event.inputs.run_build }}" >> "$GITHUB_ENV"
           echo "AUTO_FIX_DEFCONFIG=${{ github.event.inputs.auto_fix_defconfig }}" >> "$GITHUB_ENV"
           rm -rf "$DEBUG_DIR" && mkdir -p "$DEBUG_DIR"
-          : > "$DEBUG_SUMMARY"; : > "$DEBUG_DIFF"; : > "$DEBUG_BUILD_LOG"
+          : > "$DEBUG_SUMMARY"
+          : > "$DEBUG_DIFF"
+          : > "$DEBUG_BUILD_LOG"
           {
             echo "=== Inputs ==="
             echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
@@ -150,7 +154,7 @@ jobs:
           cd "$KERNEL_DIR"
           if [ -f "$MANUAL_HOOK_SCRIPT" ]; then python3 "$MANUAL_HOOK_SCRIPT"; else echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"; fi
 
-      - name: Strict real ReSukiSU hook fixes
+      - name: Strict real setresuid hook
         shell: bash
         run: |
           set -euo pipefail
@@ -158,83 +162,125 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import re
-
-          def find_func(s, markers):
-              marker = next((m for m in markers if m in s), None)
-              if marker is None:
-                  raise SystemExit('[ERROR] cannot find function marker: ' + str(markers))
-              start = s.find(marker); brace = s.find('{', start)
-              depth = 0; end = None
-              for i in range(brace, len(s)):
-                  if s[i] == '{': depth += 1
-                  elif s[i] == '}':
-                      depth -= 1
-                      if depth == 0: end = i + 1; break
-              if end is None: raise SystemExit('[ERROR] cannot parse function body')
-              return marker, start, brace, end, s[brace:end]
-
-          # setresuid real call
-          p = Path('kernel/sys.c'); s = p.read_text(); marker = 'SYSCALL_DEFINE3(setresuid'
-          if marker not in s: raise SystemExit('[ERROR] Cannot find setresuid')
+          p = Path('kernel/sys.c')
+          s = p.read_text()
+          marker = 'SYSCALL_DEFINE3(setresuid'
+          if marker not in s: raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(setresuid)')
           if 'extern int ksu_handle_setresuid' not in s:
               idx = s.find(marker)
               s = s[:idx] + '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n' + s[idx:]
-          _,_,brace,end,body = find_func(s, [marker])
-          if 'ksu_handle_setresuid(ruid, euid, suid);' not in body:
+          start = s.find(marker); brace = s.find('{', start)
+          depth = 0; end = None
+          for i in range(brace, len(s)):
+              if s[i] == '{': depth += 1
+              elif s[i] == '}':
+                  depth -= 1
+                  if depth == 0: end = i + 1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse setresuid body')
+          body = s[brace:end]
+          call = 'ksu_handle_setresuid(ruid, euid, suid);'
+          if call not in body:
               hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n\t'
-              if 'return commit_creds(new);' in body: body = body.replace('return commit_creds(new);', hook+'return commit_creds(new);', 1)
-              elif 'commit_creds(new);' in body: body = body.replace('commit_creds(new);', hook+'commit_creds(new);', 1)
+              if 'return commit_creds(new);' in body:
+                  body = body.replace('return commit_creds(new);', hook + 'return commit_creds(new);', 1)
+              elif 'commit_creds(new);' in body:
+                  body = body.replace('commit_creds(new);', hook + 'commit_creds(new);', 1)
               else:
                   returns = list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
-                  if not returns: raise SystemExit('[ERROR] No return in setresuid')
-                  r = returns[-1]; body = body[:r.start()] + '\t' + hook + body[r.start():]
+                  if not returns: raise SystemExit('[ERROR] No return found in setresuid')
+                  r = returns[-1]
+                  body = body[:r.start()] + '\t' + hook + body[r.start():]
               s = s[:brace] + body + s[end:]
           p.write_text(s)
+          print('[OK] Real ksu_handle_setresuid call present')
+          PY
+          { echo "=== setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-          # sys_read real call
-          p = Path('fs/read_write.c'); s = p.read_text(); marker = 'SYSCALL_DEFINE3(read'
-          if marker not in s: raise SystemExit('[ERROR] Cannot find read syscall')
+      - name: Strict real sys_read hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('fs/read_write.c')
+          s = p.read_text()
+          marker = 'SYSCALL_DEFINE3(read'
+          if marker not in s: raise SystemExit('[ERROR] Cannot find SYSCALL_DEFINE3(read)')
           if 'ksu_handle_vfs_read' in s: raise SystemExit('[ERROR] ksu_handle_vfs_read found; ReSukiSU inline expects ksu_handle_sys_read')
           if 'extern int ksu_handle_sys_read' not in s:
               idx = s.find(marker)
               s = s[:idx] + '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n' + s[idx:]
-          _,_,brace,end,body = find_func(s, [marker])
-          if 'ksu_handle_sys_read(fd, &buf, &count);' not in body:
+          start = s.find(marker); brace = s.find('{', start)
+          depth = 0; end = None
+          for i in range(brace, len(s)):
+              if s[i] == '{': depth += 1
+              elif s[i] == '}':
+                  depth -= 1
+                  if depth == 0: end = i + 1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse read syscall body')
+          body = s[brace:end]
+          call = 'ksu_handle_sys_read(fd, &buf, &count);'
+          if call not in body:
               hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n\t'
-              if 'return ksys_read(fd, buf, count);' in body: body = body.replace('return ksys_read(fd, buf, count);', hook+'return ksys_read(fd, buf, count);', 1)
+              if 'return ksys_read(fd, buf, count);' in body:
+                  body = body.replace('return ksys_read(fd, buf, count);', hook + 'return ksys_read(fd, buf, count);', 1)
               else:
+                  import re
                   returns = list(re.finditer(r'(?m)^[ \t]*return\b[^;]*;', body))
-                  if not returns: raise SystemExit('[ERROR] No return in read syscall')
-                  r = returns[-1]; body = body[:r.start()] + '\t' + hook + body[r.start():]
+                  if not returns: raise SystemExit('[ERROR] No return found in read syscall body')
+                  r = returns[-1]
+                  body = body[:r.start()] + '\t' + hook + body[r.start():]
               s = s[:brace] + body + s[end:]
           p.write_text(s)
-
-          # input direct real call, no ksu_input_hook
-          p = Path('drivers/input/input.c'); s = p.read_text()
-          s = s.replace('extern bool ksu_input_hook __read_mostly;\n', '')
-          s = s.replace('\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n', '')
-          markers = ['static void input_handle_event(struct input_dev *dev,','static void input_handle_event (struct input_dev *dev,','void input_handle_event(struct input_dev *dev,','void input_handle_event (struct input_dev *dev,']
-          marker,_,_,_,_ = find_func(s, markers)
-          if 'extern int ksu_handle_input_handle_event' not in s:
-              idx = s.find(marker)
-              s = s[:idx] + '#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n' + s[idx:]
-          marker,_,brace,end,body = find_func(s, markers)
-          if 'ksu_handle_input_handle_event(&type, &code, &value);' not in body:
-              hook = '#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n'
-              anchors = ['disposition = input_get_disposition(dev, type, code, &value);','disposition = input_get_disposition (dev, type, code, &value);']
-              anchor = next((a for a in anchors if a in body), None)
-              if anchor is None: raise SystemExit('[ERROR] Cannot find input_get_disposition anchor')
-              body = body.replace(anchor, anchor+'\n'+hook, 1)
-              s = s[:brace] + body + s[end:]
-          if 'ksu_input_hook' in s: raise SystemExit('[ERROR] ksu_input_hook remains in input.c')
-          p.write_text(s)
-          print('[OK] real hooks applied')
+          print('[OK] Real ksu_handle_sys_read call present')
           PY
-          {
-            echo "=== setresuid hook ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; echo
-            echo "=== sys_read hook ==="; grep -n "ksu_handle_sys_read" fs/read_write.c || true; echo
-            echo "=== input hook ==="; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== sys_read hook ==="; grep -n "ksu_handle_sys_read" fs/read_write.c || true; echo; } >> "$DEBUG_SUMMARY"
+
+      - name: Strict real input_handle_event direct hook - no ksu_input_hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('drivers/input/input.c')
+          if not p.exists(): raise SystemExit('[ERROR] drivers/input/input.c not found')
+          s=p.read_text()
+          s=s.replace('extern bool ksu_input_hook __read_mostly;\n','')
+          s=s.replace('\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n','')
+          s=s.replace('\tif (unlikely (ksu_input_hook))\n\t\tksu_handle_input_handle_event (&type, &code, &value);\n','')
+          markers=['static void input_handle_event(struct input_dev *dev,','static void input_handle_event (struct input_dev *dev,','void input_handle_event(struct input_dev *dev,','void input_handle_event (struct input_dev *dev,']
+          marker=next((m for m in markers if m in s), None)
+          if marker is None: raise SystemExit('[ERROR] Cannot find input_handle_event in drivers/input/input.c')
+          if 'extern int ksu_handle_input_handle_event' not in s:
+              idx=s.find(marker)
+              decl='#ifdef CONFIG_KSU_MANUAL_HOOK\n__attribute__((hot))\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n'
+              s=s[:idx]+decl+s[idx:]
+          marker=next((m for m in markers if m in s), None)
+          start=s.find(marker); brace=s.find('{', start)
+          depth=0; end=None
+          for i in range(brace, len(s)):
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse input_handle_event body')
+          body=s[brace:end]
+          call='ksu_handle_input_handle_event(&type, &code, &value);'
+          if call not in body:
+              hook='#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n'
+              anchors=['disposition = input_get_disposition(dev, type, code, &value);','disposition = input_get_disposition (dev, type, code, &value);']
+              anchor=next((a for a in anchors if a in body), None)
+              if anchor is None: raise SystemExit('[ERROR] Cannot find input_get_disposition anchor in input_handle_event')
+              body=body.replace(anchor, anchor+'\n'+hook, 1)
+              s=s[:brace]+body+s[end:]
+          if 'ksu_input_hook' in s:
+              raise SystemExit('[ERROR] ksu_input_hook remains in drivers/input/input.c; ReSukiSU says it is incompatible')
+          p.write_text(s)
+          print('[OK] Real direct ksu_handle_input_handle_event call present; no ksu_input_hook')
+          PY
+          { echo "=== input hook ==="; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Check no weak/no-op KSU hook stubs and required hooks
         shell: bash
@@ -252,10 +298,10 @@ jobs:
           check fs/read_write.c ksu_handle_sys_read
           check fs/stat.c ksu_handle_stat
           check drivers/input/input.c ksu_handle_input_handle_event
-          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sed -n '1,460p' || true; echo; } >> "$DEBUG_SUMMARY"
+          { echo "=== KSU hooks ==="; grep -Rsn "ksu_handle_\|ksu_input_hook" fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sed -n '1,460p' || true; echo; } >> "$DEBUG_SUMMARY"
           [ "$fail" -eq 0 ] || exit 1
 
-      - name: Apply SUSFS patch strictly - no bypass
+      - name: Apply SUSFS patch strictly
         shell: bash
         run: |
           set -euo pipefail
@@ -282,6 +328,7 @@ jobs:
           unset_cfg CONFIG_KSU_WITH_KPROBES
           { echo "=== Defconfig ==="; grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true; echo; } >> "$DEBUG_SUMMARY"
 
+
       - name: Real compile fix for SUSFS show_smap return type
         shell: bash
         run: |
@@ -293,45 +340,37 @@ jobs:
           p = Path('fs/proc/task_mmu.c')
           s = p.read_text()
           m = re.search(r'static\s+int\s+show_smap\s*\([^)]*\)\s*\{', s)
-          if not m:
-              raise SystemExit('[ERROR] static int show_smap not found')
-          start = m.end() - 1
-          depth = 0; end = None
-          for i in range(start, len(s)):
-              if s[i] == '{': depth += 1
-              elif s[i] == '}':
-                  depth -= 1
-                  if depth == 0: end = i + 1; break
-          if end is None:
-              raise SystemExit('[ERROR] Cannot parse show_smap body')
-          body = s[start:end]
-          if re.search(r'(?m)^\s*return\s*;\s*$', body):
-              body = re.sub(r'(?m)^(\s*)return\s*;\s*$', r'\1return 0;', body)
-              s = s[:start] + body + s[end:]
-              p.write_text(s)
-              print('[FIXED] show_smap bare return converted to return 0')
-          else:
-              print('[OK] show_smap has no bare return')
-          PY
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          s = Path('fs/proc/task_mmu.c').read_text()
-          m = re.search(r'static\s+int\s+show_smap\s*\([^)]*\)\s*\{', s)
+          if not m: raise SystemExit('[ERROR] static int show_smap not found')
           start = m.end() - 1; depth = 0; end = None
           for i in range(start, len(s)):
               if s[i] == '{': depth += 1
               elif s[i] == '}':
                   depth -= 1
                   if depth == 0: end = i + 1; break
+          if end is None: raise SystemExit('[ERROR] Cannot parse show_smap body')
           body = s[start:end]
           if re.search(r'(?m)^\s*return\s*;\s*$', body):
-              raise SystemExit('[ERROR] bare return remains in int show_smap')
+              body = re.sub(r'(?m)^(\s*)return\s*;\s*$', r'\1return 0;', body)
+              s = s[:start] + body + s[end:]
+              p.write_text(s)
+              print('[FIXED] show_smap bare return converted to return 0')
+          else: print('[OK] show_smap has no bare return')
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          s=Path('fs/proc/task_mmu.c').read_text(); m=re.search(r'static\s+int\s+show_smap\s*\([^)]*\)\s*\{', s)
+          start=m.end()-1; depth=0; end=None
+          for i in range(start,len(s)):
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if re.search(r'(?m)^\s*return\s*;\s*$', s[start:end]): raise SystemExit('[ERROR] bare return remains in int show_smap')
           print('[OK] show_smap sanity passed')
           PY
           { echo "=== show_smap return fix ==="; grep -n "static int show_smap" fs/proc/task_mmu.c || true; grep -n "return 0;" fs/proc/task_mmu.c | sed -n '1,100p' || true; echo; } >> "$DEBUG_SUMMARY"
 
-      
       - name: Real compile fix for SUSFS open_redirect macro compatibility
         shell: bash
         run: |
@@ -339,53 +378,24 @@ jobs:
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
-
-          hdr = Path('include/linux/susfs_def.h')
-          opn = Path('fs/open.c')
-          if not hdr.exists():
-              raise SystemExit('[ERROR] include/linux/susfs_def.h not found')
-          if not opn.exists():
-              raise SystemExit('[ERROR] fs/open.c not found')
-
-          h = hdr.read_text()
-          o = opn.read_text()
-          need = 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
-          base = 'SUSFS_IS_INODE_OPEN_REDIRECT'
-
+          hdr=Path('include/linux/susfs_def.h'); opn=Path('fs/open.c')
+          if not hdr.exists(): raise SystemExit('[ERROR] include/linux/susfs_def.h not found')
+          if not opn.exists(): raise SystemExit('[ERROR] fs/open.c not found')
+          h=hdr.read_text(); o=opn.read_text(); need='SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'; base='SUSFS_IS_INODE_OPEN_REDIRECT'
           if need in o and need not in h:
-              if base not in h:
-                  raise SystemExit('[ERROR] fs/open.c uses %s but %s is also missing in susfs_def.h' % (need, base))
-              block = (
-                  '\n\n#ifndef SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\n'
-                  '#define SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(inode) \\\n'
-                  '\tSUSFS_IS_INODE_OPEN_REDIRECT(inode)\n'
-                  '#endif\n'
-              )
-              h = h.rstrip() + block + '\n'
-              hdr.write_text(h)
-              print('[FIXED] Added SUSFS open_redirect WITHOUT_UID_CHECK compatibility macro alias')
-          else:
-              print('[OK] SUSFS open_redirect macro compatibility already satisfied or not needed')
+              if base not in h: raise SystemExit('[ERROR] fs/open.c uses %s but %s is also missing in susfs_def.h' % (need, base))
+              block=('\n\n#ifndef SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\n' '#define SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(inode) \\\n' '\tSUSFS_IS_INODE_OPEN_REDIRECT(inode)\n' '#endif\n')
+              hdr.write_text(h.rstrip()+block+'\n'); print('[FIXED] Added SUSFS open_redirect WITHOUT_UID_CHECK compatibility macro alias')
+          else: print('[OK] SUSFS open_redirect macro compatibility already satisfied or not needed')
           PY
-
-          # Strict sanity: if fs/open.c references the macro, header must define it.
           python3 - <<'PY'
           from pathlib import Path
-          o = Path('fs/open.c').read_text()
-          h = Path('include/linux/susfs_def.h').read_text()
-          need = 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
-          if need in o and need not in h:
-              raise SystemExit('[ERROR] %s still missing from include/linux/susfs_def.h' % need)
+          o=Path('fs/open.c').read_text(); h=Path('include/linux/susfs_def.h').read_text(); need='SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
+          if need in o and need not in h: raise SystemExit('[ERROR] %s still missing from include/linux/susfs_def.h' % need)
           print('[OK] SUSFS open_redirect macro sanity passed')
           PY
+          { echo "=== SUSFS open_redirect macro fix ==="; grep -n "SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\|SUSFS_IS_INODE_OPEN_REDIRECT" include/linux/susfs_def.h fs/open.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-          {
-            echo "=== SUSFS open_redirect macro fix ==="
-            grep -n "SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK\|SUSFS_IS_INODE_OPEN_REDIRECT" include/linux/susfs_def.h fs/open.c || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-
-      
       - name: Real compile fix for SUSFS open.c include susfs_def
         shell: bash
         run: |
@@ -393,57 +403,29 @@ jobs:
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
-
-          p = Path('fs/open.c')
-          if not p.exists():
-              raise SystemExit('[ERROR] fs/open.c not found')
-
-          s = p.read_text()
-          need_macro = 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'
-          need_include = '#include <linux/susfs_def.h>'
-
+          p=Path('fs/open.c')
+          if not p.exists(): raise SystemExit('[ERROR] fs/open.c not found')
+          s=p.read_text(); need_macro='SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK'; need_include='#include <linux/susfs_def.h>'
           if need_macro in s and need_include not in s:
-              # Put the include with other linux includes, before local/internal includes.
-              anchor = '#include <linux/falloc.h>\n'
-              if anchor in s:
-                  insert = anchor + '#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n#include <linux/susfs_def.h>\n#endif\n'
-                  s = s.replace(anchor, insert, 1)
+              anchor='#include <linux/falloc.h>\n'
+              if anchor in s: s=s.replace(anchor, anchor+'#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n#include <linux/susfs_def.h>\n#endif\n', 1)
               else:
-                  # Fallback: insert after the last top block linux include.
-                  lines = s.splitlines(True)
-                  pos = None
-                  for i, line in enumerate(lines):
-                      if line.startswith('#include <linux/'):
-                          pos = i + 1
-                  if pos is None:
-                      raise SystemExit('[ERROR] Cannot find linux include location in fs/open.c')
-                  lines.insert(pos, '#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n')
-                  lines.insert(pos + 1, '#include <linux/susfs_def.h>\n')
-                  lines.insert(pos + 2, '#endif\n')
-                  s = ''.join(lines)
-              p.write_text(s)
-              print('[FIXED] Added linux/susfs_def.h include to fs/open.c')
-          else:
-              print('[OK] fs/open.c include already present or macro not used')
+                  lines=s.splitlines(True); pos=None
+                  for i,line in enumerate(lines):
+                      if line.startswith('#include <linux/'): pos=i+1
+                  if pos is None: raise SystemExit('[ERROR] Cannot find linux include location in fs/open.c')
+                  lines.insert(pos,'#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n'); lines.insert(pos+1,'#include <linux/susfs_def.h>\n'); lines.insert(pos+2,'#endif\n'); s=''.join(lines)
+              p.write_text(s); print('[FIXED] Added linux/susfs_def.h include to fs/open.c')
+          else: print('[OK] fs/open.c include already present or macro not used')
           PY
-
-          # Strict sanity: if fs/open.c references SUSFS redirect macros, it must include susfs_def.h.
           python3 - <<'PY'
           from pathlib import Path
-          s = Path('fs/open.c').read_text()
-          if 'SUSFS_IS_INODE_OPEN_REDIRECT' in s and '#include <linux/susfs_def.h>' not in s:
-              raise SystemExit('[ERROR] fs/open.c uses SUSFS open redirect macros without linux/susfs_def.h include')
+          s=Path('fs/open.c').read_text()
+          if 'SUSFS_IS_INODE_OPEN_REDIRECT' in s and '#include <linux/susfs_def.h>' not in s: raise SystemExit('[ERROR] fs/open.c uses SUSFS open redirect macros without linux/susfs_def.h include')
           print('[OK] fs/open.c susfs_def include sanity passed')
           PY
+          { echo "=== SUSFS open.c include fix ==="; grep -n "susfs_def.h\|SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK" fs/open.c include/linux/susfs_def.h || true; echo; } >> "$DEBUG_SUMMARY"
 
-          {
-            echo "=== SUSFS open.c include fix ==="
-            grep -n "susfs_def.h\|SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK" fs/open.c include/linux/susfs_def.h || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-
-
-      
       - name: Real compile fix for SUSFS stat.c mount type visibility
         shell: bash
         run: |
@@ -451,52 +433,28 @@ jobs:
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
-
-          p = Path('fs/stat.c')
-          if not p.exists():
-              raise SystemExit('[ERROR] fs/stat.c not found')
-
-          s = p.read_text()
-          uses_mount = 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)' in s or 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s
-          has_mount_include = '#include "mount.h"' in s
-
-          if uses_mount and not has_mount_include:
-              anchor = '#include <asm/unistd.h>\n'
-              block = anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include "mount.h"\n#endif\n'
-              if anchor in s:
-                  s = s.replace(anchor, block, 1)
+          p=Path('fs/stat.c')
+          if not p.exists(): raise SystemExit('[ERROR] fs/stat.c not found')
+          s=p.read_text(); uses_mount='susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)' in s or 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s
+          if uses_mount and '#include "mount.h"' not in s:
+              anchor='#include <asm/unistd.h>\n'; block=anchor+'#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include "mount.h"\n#endif\n'
+              if anchor in s: s=s.replace(anchor, block, 1)
               else:
-                  lines = s.splitlines(True)
-                  pos = None
-                  for i, line in enumerate(lines):
-                      if line.startswith('#include '):
-                          pos = i + 1
-                  if pos is None:
-                      raise SystemExit('[ERROR] Cannot find include location in fs/stat.c')
-                  lines.insert(pos, '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n')
-                  lines.insert(pos + 1, '#include "mount.h"\n')
-                  lines.insert(pos + 2, '#endif\n')
-                  s = ''.join(lines)
-              p.write_text(s)
-              print('[FIXED] Added fs/mount.h include to fs/stat.c for struct mount visibility')
-          else:
-              print('[OK] fs/stat.c mount type visibility already satisfied or not needed')
+                  lines=s.splitlines(True); pos=None
+                  for i,line in enumerate(lines):
+                      if line.startswith('#include '): pos=i+1
+                  if pos is None: raise SystemExit('[ERROR] Cannot find include location in fs/stat.c')
+                  lines.insert(pos,'#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'); lines.insert(pos+1,'#include "mount.h"\n'); lines.insert(pos+2,'#endif\n'); s=''.join(lines)
+              p.write_text(s); print('[FIXED] Added fs/mount.h include to fs/stat.c for struct mount visibility')
+          else: print('[OK] fs/stat.c mount type visibility already satisfied or not needed')
           PY
-
-          # Strict sanity: if stat.c declares the SUSFS mount helper, mount.h must be included.
           python3 - <<'PY'
           from pathlib import Path
-          s = Path('fs/stat.c').read_text()
-          if 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s and '#include "mount.h"' not in s:
-              raise SystemExit('[ERROR] fs/stat.c uses struct mount in SUSFS prototype without including mount.h')
+          s=Path('fs/stat.c').read_text()
+          if 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s and '#include "mount.h"' not in s: raise SystemExit('[ERROR] fs/stat.c uses struct mount in SUSFS prototype without including mount.h')
           print('[OK] fs/stat.c mount.h include sanity passed')
           PY
-
-          {
-            echo "=== SUSFS stat.c mount type visibility fix ==="
-            grep -n "mount.h\|susfs_get_non_sus_mnt_id_from_mnt" fs/stat.c || true
-            echo
-          } >> "$DEBUG_SUMMARY"
+          { echo "=== SUSFS stat.c mount type visibility fix ==="; grep -n "mount.h\|susfs_get_non_sus_mnt_id_from_mnt" fs/stat.c || true; echo; } >> "$DEBUG_SUMMARY"
 
       - name: Real compile fixes for Clang 18 driver warning errors
         shell: bash
@@ -505,100 +463,55 @@ jobs:
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
-          import re
-
-          changed = []
-
-          # 1) IPA enum type compatibility: make enum conversion explicit.
-          p = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c')
-          if p.exists():
-              s = p.read_text()
-              old = 'q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;'
-              new = 'q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;'
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  changed.append('rmnet_ipa.c enum cast: ip_type')
-              old = 'q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;'
-              new = 'q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;'
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  changed.append('rmnet_ipa.c enum cast: filter_action')
-              p.write_text(s)
-          else:
-              raise SystemExit('[ERROR] rmnet_ipa.c not found')
-
-          # 2) Signed one-bit bitfields: assign the representable non-zero value.
-          p = Path('net/ipv4/tcp_timer.c')
-          if p.exists():
-              s = p.read_text()
-              old = 'icsk->icsk_mtup.enabled = 1;'
-              new = 'icsk->icsk_mtup.enabled = -1;'
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  changed.append('tcp_timer.c signed one-bit bitfield assignment')
-              p.write_text(s)
-          else:
-              raise SystemExit('[ERROR] net/ipv4/tcp_timer.c not found')
-
-          p = Path('drivers/usb/misc/usbdtp.c')
-          if p.exists():
-              s = p.read_text()
-              n = s.count('drv->disconnected = 1;')
-              if n:
-                  s = s.replace('drv->disconnected = 1;', 'drv->disconnected = -1;')
-                  changed.append(f'usbdtp.c signed one-bit bitfield assignments: {n}')
-              p.write_text(s)
-          else:
-              raise SystemExit('[ERROR] drivers/usb/misc/usbdtp.c not found')
-
-          # 3) qcacld parser prototype consistency: definition must match header array parameter.
-          p = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c')
-          if p.exists():
-              s = p.read_text()
-              old = 'uint8_t mdie[SIR_MDIE_SIZE])'
-              new = 'uint8_t mdie[])'
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  changed.append('parser_api.c mdie parameter bound matches header')
-              p.write_text(s)
-          else:
-              raise SystemExit('[ERROR] parser_api.c not found')
-
-          if changed:
-              print('[FIXED] ' + '; '.join(changed))
-          else:
-              print('[OK] Clang 18 warning-error source fixes already present')
+          changed=[]
+          p=Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c')
+          if not p.exists(): raise SystemExit('[ERROR] rmnet_ipa.c not found')
+          s=p.read_text()
+          if 'q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;' in s: s=s.replace('q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;', 'q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;', 1); changed.append('rmnet_ipa.c enum cast: ip_type')
+          if 'q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;' in s: s=s.replace('q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;', 'q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;', 1); changed.append('rmnet_ipa.c enum cast: filter_action')
+          p.write_text(s)
+          p=Path('net/ipv4/tcp_timer.c')
+          if not p.exists(): raise SystemExit('[ERROR] net/ipv4/tcp_timer.c not found')
+          s=p.read_text()
+          if 'icsk->icsk_mtup.enabled = 1;' in s: s=s.replace('icsk->icsk_mtup.enabled = 1;', 'icsk->icsk_mtup.enabled = -1;', 1); changed.append('tcp_timer.c signed one-bit bitfield assignment')
+          p.write_text(s)
+          p=Path('drivers/usb/misc/usbdtp.c')
+          if not p.exists(): raise SystemExit('[ERROR] drivers/usb/misc/usbdtp.c not found')
+          s=p.read_text(); n=s.count('drv->disconnected = 1;')
+          if n: s=s.replace('drv->disconnected = 1;', 'drv->disconnected = -1;'); changed.append(f'usbdtp.c signed one-bit bitfield assignments: {n}')
+          p.write_text(s)
+          p=Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c')
+          if not p.exists(): raise SystemExit('[ERROR] parser_api.c not found')
+          s=p.read_text()
+          if 'uint8_t mdie[SIR_MDIE_SIZE])' in s: s=s.replace('uint8_t mdie[SIR_MDIE_SIZE])', 'uint8_t mdie[])', 1); changed.append('parser_api.c mdie parameter bound matches header')
+          p.write_text(s)
+          # Display DSC Clang 18 implicit-int fix: add explicit int return type.
+          p=Path('techpack/display/msm/sde/sde_hw_dsc_1_2.c')
+          if not p.exists(): raise SystemExit('[ERROR] techpack/display/msm/sde/sde_hw_dsc_1_2.c not found')
+          s=p.read_text()
+          if 'static inline _dsc_subblk_offset(struct sde_hw_dsc *hw_dsc, int s_id,' in s:
+              s=s.replace('static inline _dsc_subblk_offset(struct sde_hw_dsc *hw_dsc, int s_id,', 'static inline int _dsc_subblk_offset(struct sde_hw_dsc *hw_dsc, int s_id,', 1)
+              changed.append('sde_hw_dsc_1_2.c explicit int return type for _dsc_subblk_offset')
+          p.write_text(s)
+          if changed: print('[FIXED] ' + '; '.join(changed))
+          else: print('[OK] Clang 18 warning-error source fixes already present')
           PY
-
-          # Strict sanity: do not hide warnings with compiler flags; source must be corrected.
           python3 - <<'PY'
           from pathlib import Path
-          import re
-          checks = []
-          rm = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c').read_text()
+          checks=[]
+          rm=Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c').read_text()
           checks.append(('rmnet ip enum cast', '(enum ipa_ip_type)flt_spec_ptr->ip_type' in rm))
           checks.append(('rmnet action enum cast', '(enum ipa_flt_action)flt_spec_ptr->filter_action' in rm))
-          tcp = Path('net/ipv4/tcp_timer.c').read_text()
-          checks.append(('tcp signed bitfield assignment', 'icsk->icsk_mtup.enabled = -1;' in tcp))
-          usb = Path('drivers/usb/misc/usbdtp.c').read_text()
-          checks.append(('usbdtp signed bitfield assignment', 'drv->disconnected = -1;' in usb and 'drv->disconnected = 1;' not in usb))
-          parser = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c').read_text()
-          checks.append(('parser mdie parameter', 'uint8_t mdie[])' in parser))
-          bad = [name for name, ok in checks if not ok]
-          if bad:
-              raise SystemExit('[ERROR] Clang 18 source-fix sanity failed: ' + ', '.join(bad))
+          tcp=Path('net/ipv4/tcp_timer.c').read_text(); checks.append(('tcp signed bitfield assignment', 'icsk->icsk_mtup.enabled = -1;' in tcp))
+          usb=Path('drivers/usb/misc/usbdtp.c').read_text(); checks.append(('usbdtp signed bitfield assignment', 'drv->disconnected = -1;' in usb and 'drv->disconnected = 1;' not in usb))
+          parser=Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c').read_text(); checks.append(('parser mdie parameter', 'uint8_t mdie[])' in parser))
+          dsc=Path('techpack/display/msm/sde/sde_hw_dsc_1_2.c').read_text(); checks.append(('display DSC explicit return type', 'static inline int _dsc_subblk_offset(' in dsc))
+          bad=[name for name, ok in checks if not ok]
+          if bad: raise SystemExit('[ERROR] Clang 18 source-fix sanity failed: ' + ', '.join(bad))
           print('[OK] Clang 18 warning-error source-fix sanity passed')
           PY
+          { echo "=== Clang 18 source warning-error fixes ==="; grep -n "q6_ul_flt_rule_ptr->ip\|q6_ul_flt_rule_ptr->action" techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c || true; grep -n "icsk->icsk_mtup.enabled" net/ipv4/tcp_timer.c || true; grep -n "drv->disconnected" drivers/usb/misc/usbdtp.c || true; grep -n "mdie\[\]\|mdie\[SIR_MDIE_SIZE\]" drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h || true; grep -n "_dsc_subblk_offset" techpack/display/msm/sde/sde_hw_dsc_1_2.c || true; echo; } >> "$DEBUG_SUMMARY"
 
-          {
-            echo "=== Clang 18 source warning-error fixes ==="
-            grep -n "q6_ul_flt_rule_ptr->ip\|q6_ul_flt_rule_ptr->action" techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c || true
-            grep -n "icsk->icsk_mtup.enabled" net/ipv4/tcp_timer.c || true
-            grep -n "drv->disconnected" drivers/usb/misc/usbdtp.c || true
-            grep -n "mdie\[\]\|mdie\[SIR_MDIE_SIZE\]" drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h || true
-            echo
-          } >> "$DEBUG_SUMMARY"
-      
       - name: Verify SUSFS integration
         shell: bash
         run: |
@@ -641,7 +554,7 @@ jobs:
           mkdir -p "$DEBUG_DIR"; touch "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG"
           if [ -n "$KERNEL_DIR" ] && [ -d "$KERNEL_DIR" ]; then
             cd "$KERNEL_DIR"
-            { echo; echo "=== Final status ==="; git status --short; echo; echo "=== Final diff stat ==="; git diff --stat; echo; echo "=== Final .rej/.orig ==="; find . -name "*.rej" -o -name "*.orig"; echo; echo "=== Final required hooks ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; grep -n "ksu_handle_sys_read" fs/read_write.c || true; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; grep -n "static int show_smap" fs/proc/task_mmu.c || true; } >> "$DEBUG_SUMMARY" 2>&1
+            { echo; echo "=== Final status ==="; git status --short; echo; echo "=== Final diff stat ==="; git diff --stat; echo; echo "=== Final .rej/.orig ==="; find . -name "*.rej" -o -name "*.orig"; echo; echo "=== Final required hooks ==="; grep -n "ksu_handle_setresuid" kernel/sys.c || true; grep -n "ksu_handle_sys_read" fs/read_write.c || true; grep -n "ksu_handle_input_handle_event\|ksu_input_hook" drivers/input/input.c || true; } >> "$DEBUG_SUMMARY" 2>&1
             git diff > "$DEBUG_DIFF" 2>&1
           fi
           ls -lh "$DEBUG_SUMMARY" "$DEBUG_DIFF" "$DEBUG_BUILD_LOG" || true
