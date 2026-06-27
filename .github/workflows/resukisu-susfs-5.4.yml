@@ -442,164 +442,106 @@ jobs:
             echo
           } >> "$DEBUG_SUMMARY"
 
-
-      
-      - name: Real compile fix for SUSFS stat.c mount type visibility
+      - name: Real compile fixes for Clang 18 driver warning errors
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          p = Path('fs/stat.c')
-          if not p.exists():
-              raise SystemExit('[ERROR] fs/stat.c not found')
+          changed = []
 
-          s = p.read_text()
-          uses_mount = 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)' in s or 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s
-          has_mount_include = '#include "mount.h"' in s
-
-          if uses_mount and not has_mount_include:
-              anchor = '#include <asm/unistd.h>\n'
-              block = anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include "mount.h"\n#endif\n'
-              if anchor in s:
-                  s = s.replace(anchor, block, 1)
-              else:
-                  lines = s.splitlines(True)
-                  pos = None
-                  for i, line in enumerate(lines):
-                      if line.startswith('#include '):
-                          pos = i + 1
-                  if pos is None:
-                      raise SystemExit('[ERROR] Cannot find include location in fs/stat.c')
-                  lines.insert(pos, '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n')
-                  lines.insert(pos + 1, '#include "mount.h"\n')
-                  lines.insert(pos + 2, '#endif\n')
-                  s = ''.join(lines)
+          # 1) IPA enum type compatibility: make enum conversion explicit.
+          p = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c')
+          if p.exists():
+              s = p.read_text()
+              old = 'q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;'
+              new = 'q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;'
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  changed.append('rmnet_ipa.c enum cast: ip_type')
+              old = 'q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;'
+              new = 'q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;'
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  changed.append('rmnet_ipa.c enum cast: filter_action')
               p.write_text(s)
-              print('[FIXED] Added fs/mount.h include to fs/stat.c for struct mount visibility')
           else:
-              print('[OK] fs/stat.c mount type visibility already satisfied or not needed')
+              raise SystemExit('[ERROR] rmnet_ipa.c not found')
+
+          # 2) Signed one-bit bitfields: assign the representable non-zero value.
+          p = Path('net/ipv4/tcp_timer.c')
+          if p.exists():
+              s = p.read_text()
+              old = 'icsk->icsk_mtup.enabled = 1;'
+              new = 'icsk->icsk_mtup.enabled = -1;'
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  changed.append('tcp_timer.c signed one-bit bitfield assignment')
+              p.write_text(s)
+          else:
+              raise SystemExit('[ERROR] net/ipv4/tcp_timer.c not found')
+
+          p = Path('drivers/usb/misc/usbdtp.c')
+          if p.exists():
+              s = p.read_text()
+              n = s.count('drv->disconnected = 1;')
+              if n:
+                  s = s.replace('drv->disconnected = 1;', 'drv->disconnected = -1;')
+                  changed.append(f'usbdtp.c signed one-bit bitfield assignments: {n}')
+              p.write_text(s)
+          else:
+              raise SystemExit('[ERROR] drivers/usb/misc/usbdtp.c not found')
+
+          # 3) qcacld parser prototype consistency: definition must match header array parameter.
+          p = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c')
+          if p.exists():
+              s = p.read_text()
+              old = 'uint8_t mdie[SIR_MDIE_SIZE])'
+              new = 'uint8_t mdie[])'
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  changed.append('parser_api.c mdie parameter bound matches header')
+              p.write_text(s)
+          else:
+              raise SystemExit('[ERROR] parser_api.c not found')
+
+          if changed:
+              print('[FIXED] ' + '; '.join(changed))
+          else:
+              print('[OK] Clang 18 warning-error source fixes already present')
           PY
 
-          # Strict sanity: if stat.c declares the SUSFS mount helper, mount.h must be included.
+          # Strict sanity: do not hide warnings with compiler flags; source must be corrected.
           python3 - <<'PY'
           from pathlib import Path
-          s = Path('fs/stat.c').read_text()
-          if 'susfs_get_non_sus_mnt_id_from_mnt(struct mount *' in s and '#include "mount.h"' not in s:
-              raise SystemExit('[ERROR] fs/stat.c uses struct mount in SUSFS prototype without including mount.h')
-          print('[OK] fs/stat.c mount.h include sanity passed')
+          import re
+          checks = []
+          rm = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c').read_text()
+          checks.append(('rmnet ip enum cast', '(enum ipa_ip_type)flt_spec_ptr->ip_type' in rm))
+          checks.append(('rmnet action enum cast', '(enum ipa_flt_action)flt_spec_ptr->filter_action' in rm))
+          tcp = Path('net/ipv4/tcp_timer.c').read_text()
+          checks.append(('tcp signed bitfield assignment', 'icsk->icsk_mtup.enabled = -1;' in tcp))
+          usb = Path('drivers/usb/misc/usbdtp.c').read_text()
+          checks.append(('usbdtp signed bitfield assignment', 'drv->disconnected = -1;' in usb and 'drv->disconnected = 1;' not in usb))
+          parser = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c').read_text()
+          checks.append(('parser mdie parameter', 'uint8_t mdie[])' in parser))
+          bad = [name for name, ok in checks if not ok]
+          if bad:
+              raise SystemExit('[ERROR] Clang 18 source-fix sanity failed: ' + ', '.join(bad))
+          print('[OK] Clang 18 warning-error source-fix sanity passed')
           PY
 
           {
-            echo "=== SUSFS stat.c mount type visibility fix ==="
-            grep -n "mount.h\|susfs_get_non_sus_mnt_id_from_mnt" fs/stat.c || true
+            echo "=== Clang 18 source warning-error fixes ==="
+            grep -n "q6_ul_flt_rule_ptr->ip\|q6_ul_flt_rule_ptr->action" techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c || true
+            grep -n "icsk->icsk_mtup.enabled" net/ipv4/tcp_timer.c || true
+            grep -n "drv->disconnected" drivers/usb/misc/usbdtp.c || true
+            grep -n "mdie\[\]\|mdie\[SIR_MDIE_SIZE\]" drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h || true
             echo
           } >> "$DEBUG_SUMMARY"
-
-
-            - name: Real compile fixes for Clang 18 driver warning errors
-              shell: bash
-              run: |
-                set -euo pipefail
-                cd "$KERNEL_DIR"
-                python3 - <<'PY'
-                from pathlib import Path
-                import re
-      
-                changed = []
-      
-                # 1) IPA enum type compatibility: make enum conversion explicit.
-                p = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c')
-                if p.exists():
-                    s = p.read_text()
-                    old = 'q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;'
-                    new = 'q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;'
-                    if old in s:
-                        s = s.replace(old, new, 1)
-                        changed.append('rmnet_ipa.c enum cast: ip_type')
-                    old = 'q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;'
-                    new = 'q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;'
-                    if old in s:
-                        s = s.replace(old, new, 1)
-                        changed.append('rmnet_ipa.c enum cast: filter_action')
-                    p.write_text(s)
-                else:
-                    raise SystemExit('[ERROR] rmnet_ipa.c not found')
-      
-                # 2) Signed one-bit bitfields: assign the representable non-zero value.
-                p = Path('net/ipv4/tcp_timer.c')
-                if p.exists():
-                    s = p.read_text()
-                    old = 'icsk->icsk_mtup.enabled = 1;'
-                    new = 'icsk->icsk_mtup.enabled = -1;'
-                    if old in s:
-                        s = s.replace(old, new, 1)
-                        changed.append('tcp_timer.c signed one-bit bitfield assignment')
-                    p.write_text(s)
-                else:
-                    raise SystemExit('[ERROR] net/ipv4/tcp_timer.c not found')
-      
-                p = Path('drivers/usb/misc/usbdtp.c')
-                if p.exists():
-                    s = p.read_text()
-                    n = s.count('drv->disconnected = 1;')
-                    if n:
-                        s = s.replace('drv->disconnected = 1;', 'drv->disconnected = -1;')
-                        changed.append(f'usbdtp.c signed one-bit bitfield assignments: {n}')
-                    p.write_text(s)
-                else:
-                    raise SystemExit('[ERROR] drivers/usb/misc/usbdtp.c not found')
-      
-                # 3) qcacld parser prototype consistency: definition must match header array parameter.
-                p = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c')
-                if p.exists():
-                    s = p.read_text()
-                    old = 'uint8_t mdie[SIR_MDIE_SIZE])'
-                    new = 'uint8_t mdie[])'
-                    if old in s:
-                        s = s.replace(old, new, 1)
-                        changed.append('parser_api.c mdie parameter bound matches header')
-                    p.write_text(s)
-                else:
-                    raise SystemExit('[ERROR] parser_api.c not found')
-      
-                if changed:
-                    print('[FIXED] ' + '; '.join(changed))
-                else:
-                    print('[OK] Clang 18 warning-error source fixes already present')
-                PY
-      
-                # Strict sanity: do not hide warnings with compiler flags; source must be corrected.
-                python3 - <<'PY'
-                from pathlib import Path
-                import re
-                checks = []
-                rm = Path('techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c').read_text()
-                checks.append(('rmnet ip enum cast', '(enum ipa_ip_type)flt_spec_ptr->ip_type' in rm))
-                checks.append(('rmnet action enum cast', '(enum ipa_flt_action)flt_spec_ptr->filter_action' in rm))
-                tcp = Path('net/ipv4/tcp_timer.c').read_text()
-                checks.append(('tcp signed bitfield assignment', 'icsk->icsk_mtup.enabled = -1;' in tcp))
-                usb = Path('drivers/usb/misc/usbdtp.c').read_text()
-                checks.append(('usbdtp signed bitfield assignment', 'drv->disconnected = -1;' in usb and 'drv->disconnected = 1;' not in usb))
-                parser = Path('drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c').read_text()
-                checks.append(('parser mdie parameter', 'uint8_t mdie[])' in parser))
-                bad = [name for name, ok in checks if not ok]
-                if bad:
-                    raise SystemExit('[ERROR] Clang 18 source-fix sanity failed: ' + ', '.join(bad))
-                print('[OK] Clang 18 warning-error source-fix sanity passed')
-                PY
-      
-                {
-                  echo "=== Clang 18 source warning-error fixes ==="
-                  grep -n "q6_ul_flt_rule_ptr->ip\|q6_ul_flt_rule_ptr->action" techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c || true
-                  grep -n "icsk->icsk_mtup.enabled" net/ipv4/tcp_timer.c || true
-                  grep -n "drv->disconnected" drivers/usb/misc/usbdtp.c || true
-                  grep -n "mdie\[\]\|mdie\[SIR_MDIE_SIZE\]" drivers/staging/qcacld-3.0/core/mac/src/sys/legacy/src/utils/src/parser_api.c drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h || true
-                  echo
-                } >> "$DEBUG_SUMMARY"
-
       
       - name: Verify SUSFS integration
         shell: bash
