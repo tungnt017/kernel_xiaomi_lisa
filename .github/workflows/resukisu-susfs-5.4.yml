@@ -12,10 +12,6 @@ on:
         description: "Defconfig path. Empty = auto-detect arch/arm64/configs/lisa_defconfig"
         required: false
         default: ""
-      manual_hook_script:
-        description: "Manual hook script path"
-        required: false
-        default: ".github/scripts/apply_resukisu_manual_hooks_1_fixed.py"
       run_resukisu_setup:
         description: "Run ReSukiSU setup.sh? true/false"
         required: false
@@ -80,7 +76,6 @@ jobs:
           set -euo pipefail
           echo "KERNEL_DIR=${{ github.event.inputs.kernel_dir }}" >> "$GITHUB_ENV"
           echo "INPUT_DEFCONFIG=${{ github.event.inputs.defconfig }}" >> "$GITHUB_ENV"
-          echo "MANUAL_HOOK_SCRIPT=${{ github.event.inputs.manual_hook_script }}" >> "$GITHUB_ENV"
           echo "RUN_RESUKISU_SETUP=${{ github.event.inputs.run_resukisu_setup }}" >> "$GITHUB_ENV"
           echo "BUILD_SCRIPT=${{ github.event.inputs.build_script }}" >> "$GITHUB_ENV"
           echo "BUILD_ARGS=${{ github.event.inputs.build_args }}" >> "$GITHUB_ENV"
@@ -94,7 +89,6 @@ jobs:
             echo "=== Inputs ==="
             echo "kernel_dir=${{ github.event.inputs.kernel_dir }}"
             echo "defconfig=${{ github.event.inputs.defconfig }}"
-            echo "manual_hook_script=${{ github.event.inputs.manual_hook_script }}"
             echo "run_resukisu_setup=${{ github.event.inputs.run_resukisu_setup }}"
             echo "build_script=${{ github.event.inputs.build_script }}"
             echo "build_args=${{ github.event.inputs.build_args }}"
@@ -146,13 +140,6 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-
-      - name: Apply existing manual hook script
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          if [ -f "$MANUAL_HOOK_SCRIPT" ]; then python3 "$MANUAL_HOOK_SCRIPT"; else echo "[WARN] Manual hook script not found: $MANUAL_HOOK_SCRIPT"; fi
 
       - name: Strict real setresuid hook
         shell: bash
