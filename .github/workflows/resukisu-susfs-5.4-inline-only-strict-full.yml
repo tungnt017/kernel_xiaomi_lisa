@@ -130,6 +130,77 @@ jobs:
           cd "$KERNEL_DIR"
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
+      - name: Fix inline hook script weak sanity false positive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          SCRIPT="${INLINE_HOOK_SCRIPT:-${MANUAL_HOOK_SCRIPT:-.github/scripts/apply_resukisu_manual_hooks_1_fixed_susfs.py}}"
+          if [ ! -f "$SCRIPT" ]; then
+            if [ -f .github/scripts/apply_resukisu_manual_hooks_1_fixed.py ]; then
+              SCRIPT=.github/scripts/apply_resukisu_manual_hooks_1_fixed.py
+            else
+              echo "[ERROR] Hook script not found"
+              exit 1
+            fi
+          fi
+
+          python3 - "$SCRIPT" <<'PY'
+          from pathlib import Path
+          import py_compile
+          import re
+          import sys
+
+          p = Path(sys.argv[1])
+          s = p.read_text()
+
+          old = """        if \"__weak\" in data or re.search(r\"(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)\", data):
+            raise RuntimeError(f\"{path}: weak ksu_handle shim detected\")"""
+          new = """        weak_patterns = (
+            r'(^|\\s)__weak\\s+.*\\bksu_handle_[A-Za-z0-9_]+\\b',
+            r'\\bksu_handle_[A-Za-z0-9_]+\\b.*\\b__weak\\b',
+            r'__attribute__\\s*\\(\\s*\\(.*\\bweak\\b.*\\)\\s*\\)\\s*.*\\bksu_handle_[A-Za-z0-9_]+\\b',
+            r'\\bksu_handle_[A-Za-z0-9_]+\\b.*__attribute__\\s*\\(\\s*\\(.*\\bweak\\b.*\\)\\s*\\)',
+            r'^\\s*#\\s*pragma\\s+weak\\s+ksu_handle_[A-Za-z0-9_]+\\b',
+          )
+          for weak_pat in weak_patterns:
+              if re.search(weak_pat, data, re.M):
+                  raise RuntimeError(f\"{path}: real weak ksu_handle shim detected\")"""
+
+          if old in s:
+              s = s.replace(old, new, 1)
+              p.write_text(s)
+              print('[FIXED] Replaced broad weak regex with strict weak declaration detection')
+          elif 'real weak ksu_handle shim detected' in s:
+              print('[OK] Strict weak detection already present')
+          else:
+              # Fallback: replace only the broad re.search expression if exact block differs.
+              broad = "re.search(r\"(__weak|weak).*ksu_handle_|ksu_handle_.*(__weak|weak)\", data)"
+              if broad in s:
+                  s = s.replace(broad, "False  # broad weak regex disabled; strict weak_patterns inserted below", 1)
+                  insert = new + "\n"
+                  marker = "        if re.search(r\"ksu_handle_[A-Za-z0-9_]+"
+                  idx = s.find(marker)
+                  if idx < 0:
+                      raise SystemExit('[ERROR] Could not find insertion point for strict weak sanity')
+                  s = s[:idx] + insert + s[idx:]
+                  p.write_text(s)
+                  print('[FIXED] Disabled broad weak regex and inserted strict weak detection')
+              else:
+                  raise SystemExit('[ERROR] Broad weak sanity block not found; inspect script manually')
+
+          py_compile.compile(str(p), doraise=True)
+          print('[OK] Hook script compiles after weak sanity fix:', p)
+          PY
+
+          {
+            echo "=== Hook script weak sanity fix ==="
+            echo "script=$SCRIPT"
+            grep -n "real weak ksu_handle shim detected\|weak_patterns\|broad weak regex" "$SCRIPT" || true
+            echo
+          } >> "$DEBUG_SUMMARY"
+
       - name: Apply inline-only hook script
         shell: bash
         run: |
