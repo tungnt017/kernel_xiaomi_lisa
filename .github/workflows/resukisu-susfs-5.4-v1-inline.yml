@@ -635,7 +635,7 @@ jobs:
 
           echo "[OK] Defconfig inline release SUSFS flags applied"
 
-            - name: Verify final generated .config SUSFS flags before compile
+      - name: Verify final generated .config SUSFS flags before compile
         shell: bash
         run: |
           set -euo pipefail
