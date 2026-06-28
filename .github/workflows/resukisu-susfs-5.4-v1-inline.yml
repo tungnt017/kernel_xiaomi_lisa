@@ -552,43 +552,89 @@ jobs:
             echo
           } >> "$DEBUG_SUMMARY"
 
-      - name: Fix defconfig KSU/SUSFS
+
+      - name: Fix defconfig KSU/SUSFS - inline release flags
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # Inline-only mode: ReSukiSU uses SuSFS Inline hook.
-          # Do not enable CONFIG_KSU_MANUAL_HOOK here.
           clean_cfg() {
             cfg="$1"
             sed -i "/^${cfg}=y$/d;/^${cfg}=n$/d;/^${cfg}=/d;/^# ${cfg} is not set$/d" "$DEFCONFIG"
           }
-          set_y() { clean_cfg "$1"; printf '\n%s=y\n' "$1" >> "$DEFCONFIG"; }
-          set_not() { clean_cfg "$1"; printf '# %s is not set\n' "$1" >> "$DEFCONFIG"; }
 
+          set_y() {
+            cfg="$1"
+            clean_cfg "$cfg"
+            printf '\n%s=y\n' "$cfg" >> "$DEFCONFIG"
+          }
+
+          set_not() {
+            cfg="$1"
+            clean_cfg "$cfg"
+            printf '# %s is not set\n' "$cfg" >> "$DEFCONFIG"
+          }
+
+          # ReSukiSU inline-only base.
           set_y CONFIG_KSU
           set_not CONFIG_KSU_MANUAL_HOOK
           set_y CONFIG_KSU_SUSFS
           set_y CONFIG_KALLSYMS
           set_y CONFIG_KALLSYMS_ALL
+
+          # SUSFS release feature profile.
+          set_y CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+          set_not CONFIG_KSU_SUSFS_SUS_PATH
+          set_y CONFIG_KSU_SUSFS_SUS_MOUNT
+          set_y CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          set_y CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          set_y CONFIG_KSU_SUSFS_SUS_KSTAT
+          set_y CONFIG_KSU_SUSFS_SUS_OVERLAYFS
+          set_y CONFIG_KSU_SUSFS_TRY_UMOUNT
+          set_y CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          set_y CONFIG_KSU_SUSFS_SPOOF_UNAME
+          set_y CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          set_y CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          set_y CONFIG_KSU_SUSFS_OPEN_REDIRECT
+
+          # Release: no noisy logs, no alternate sus_su flow.
+          set_not CONFIG_KSU_SUSFS_ENABLE_LOG
+          set_not CONFIG_KSU_SUSFS_SUS_SU
+
+          # Keep all non-inline hook modes off.
           set_not CONFIG_KSU_KPROBE_HOOKS
           set_not CONFIG_KSU_KPROBES_HOOK
           set_not CONFIG_KSU_KPROBES_HOOKS
           set_not CONFIG_KSU_WITH_KPROBES
-          set_not CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
 
-          # Strict sanity.
-          grep -q '^CONFIG_KSU=y$' "$DEFCONFIG"
-          grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set$' "$DEFCONFIG"
-          grep -q '^CONFIG_KSU_SUSFS=y$' "$DEFCONFIG"
-          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG"
+          # Strict final defconfig sanity.
+          grep -q '^CONFIG_KSU=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KSU=y missing"; exit 1; }
+          grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set$' "$DEFCONFIG" || { echo "[ERROR] manual hook must be disabled"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KSU_SUSFS=y missing"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS_ALL=y$' "$DEFCONFIG" || { echo "[ERROR] CONFIG_KALLSYMS_ALL=y missing"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y$' "$DEFCONFIG" || { echo "[ERROR] SUS_MOUNT missing"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_TRY_UMOUNT=y$' "$DEFCONFIG" || { echo "[ERROR] TRY_UMOUNT missing"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_OPEN_REDIRECT=y$' "$DEFCONFIG" || { echo "[ERROR] OPEN_REDIRECT missing"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y$' "$DEFCONFIG" || { echo "[ERROR] HIDE_KSU_SUSFS_SYMBOLS missing"; exit 1; }
+          grep -q '^# CONFIG_KSU_SUSFS_SUS_PATH is not set$' "$DEFCONFIG" || { echo "[ERROR] SUS_PATH should be disabled for this profile"; exit 1; }
+          grep -q '^# CONFIG_KSU_SUSFS_ENABLE_LOG is not set$' "$DEFCONFIG" || { echo "[ERROR] ENABLE_LOG should be disabled for release"; exit 1; }
+          grep -q '^# CONFIG_KSU_SUSFS_SUS_SU is not set$' "$DEFCONFIG" || { echo "[ERROR] SUS_SU should be disabled for manager flow"; exit 1; }
+
           if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' "$DEFCONFIG"; then
-            echo "[ERROR] CONFIG_KSU_MANUAL_HOOK=y remains"
+            echo "[ERROR] CONFIG_KSU_MANUAL_HOOK=y detected; refusing duplicate hook mode"
             exit 1
           fi
 
-          { echo "=== Defconfig inline-only ==="; grep -nE "CONFIG_KSU|CONFIG_KALLSYMS" "$DEFCONFIG" || true; echo; } >> "$DEBUG_SUMMARY"
+          # Optional: show only final KSU/SUSFS/KALLSYMS configs.
+          {
+            echo "=== Defconfig inline release SUSFS flags ==="
+            grep -nE '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_KALLSYMS' "$DEFCONFIG" || true
+            echo
+          } >> "$DEBUG_SUMMARY"
+
+          echo "[OK] Defconfig inline release SUSFS flags applied"
+
 
       - name: Real compile/source fixes - SUSFS and Clang 18
         shell: bash
