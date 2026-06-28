@@ -140,13 +140,88 @@ jobs:
           grep -q 'diff --git a/include/linux/susfs_def\.h b/include/linux/susfs_def\.h' "$PATCH_LOCAL"
           { echo "=== SUSFS Patch ==="; sha256sum "$PATCH_LOCAL"; grep -n '^diff --git' "$PATCH_LOCAL" | sed -n '1,240p' || true; echo; } >> "$DEBUG_SUMMARY"
 
-      - name: ReSukiSU setup
+      - name: Setup SukiSU Ultra builtin
         if: ${{ github.event.inputs.run_resukisu_setup == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
+          echo "[INFO] Setup SukiSU Ultra builtin mode"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          test -d KernelSU || { echo "[ERROR] KernelSU directory missing after SukiSU Ultra setup"; exit 1; }
+          test -d drivers/kernelsu || { echo "[ERROR] drivers/kernelsu directory missing after SukiSU Ultra setup"; exit 1; }
+
+      - name: Fix SukiSU Ultra 5.4 builtin compat
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          changed = []
+          root = Path('drivers/kernelsu')
+          if not root.exists():
+              raise SystemExit('[ERROR] drivers/kernelsu not found; SukiSU Ultra setup did not finish')
+
+          # Fix 1: SukiSU Ultra builtin on some 5.4 trees calls selinux_hide handlers
+          # from runtime/ksud.c without visible prototypes.
+          ksud = root / 'runtime' / 'ksud.c'
+          if ksud.exists():
+              text = ksud.read_text()
+              need_selinux_hide = (
+                  'ksu_selinux_hide_handle_post_fs_data' in text or
+                  'ksu_selinux_hide_handle_second_stage' in text
+              )
+              if need_selinux_hide and 'feature/selinux_hide.h' not in text and 'ksu_selinux_hide_handle_post_fs_data(void)' not in text:
+                  header = root / 'feature' / 'selinux_hide.h'
+                  if header.exists():
+                      lines = text.splitlines(True)
+                      pos = 0
+                      for i, line in enumerate(lines):
+                          if line.startswith('#include '):
+                              pos = i + 1
+                      lines.insert(pos, '#include "feature/selinux_hide.h"\n')
+                      text = ''.join(lines)
+                      changed.append('ksud.c include feature/selinux_hide.h')
+                  else:
+                      proto = (
+                          '\nvoid ksu_selinux_hide_handle_second_stage(void);\n'
+                          'void ksu_selinux_hide_handle_post_fs_data(void);\n'
+                      )
+                      m = re.search(r'(?m)^(#include .+\n)+', text)
+                      if m:
+                          text = text[:m.end()] + proto + text[m.end():]
+                      else:
+                          text = proto + text
+                      changed.append('ksud.c selinux_hide extern prototypes')
+                  ksud.write_text(text)
+
+          # Fix 2: kernel 5.4 may not expose public strncpy_from_user_nofault,
+          # while SukiSU Ultra sources may call it. Map it to the compat/backport helper
+          # when __strncpy_from_user_nofault exists in KernelSU compat header.
+          compat = root / 'kernel_compat.h'
+          if compat.exists():
+              c = compat.read_text()
+              uses_public = any(
+                  'strncpy_from_user_nofault' in p.read_text(errors='ignore')
+                  for p in list(root.rglob('*.c')) + list(root.rglob('*.h'))
+              )
+              if uses_public and '__strncpy_from_user_nofault' in c and 'define strncpy_from_user_nofault __strncpy_from_user_nofault' not in c:
+                  c = c.rstrip() + (
+                      '\n\n#ifndef strncpy_from_user_nofault\n'
+                      '#define strncpy_from_user_nofault __strncpy_from_user_nofault\n'
+                      '#endif\n'
+                  )
+                  compat.write_text(c)
+                  changed.append('kernel_compat.h strncpy_from_user_nofault alias')
+
+          if changed:
+              print('[FIXED] ' + '; '.join(changed))
+          else:
+              print('[OK] SukiSU Ultra 5.4 compat fixes already present or not needed')
+          PY
 
       - name: Apply existing manual hook script
         shell: bash
