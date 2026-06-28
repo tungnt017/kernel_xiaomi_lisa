@@ -375,7 +375,7 @@ jobs:
           [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
           find . -name "*.orig" -print -delete || true
 
-      - name: Apply lisa SUSFS eplus fixes portable strict no-heredoc
+      - name: Apply lisa SUSFS eplus fixes portable strict no-heredoc v2 no-prompt
         shell: bash
         run: |
           set -euo pipefail
@@ -406,24 +406,28 @@ jobs:
             patch_file="$1"
             patch_name="$(basename "$patch_file")"
             echo "[INFO] Trying strict apply: $patch_name"
+
+            # Clean apply.
             if git apply --check "$patch_file"; then
               git apply "$patch_file"
               echo "[OK] applied with git apply: $patch_name"
               return 0
             fi
+
+            # Already applied check. Non-interactive, safe.
             if git apply --reverse --check "$patch_file"; then
-              echo "[OK] already applied: $patch_name"
+              echo "[OK] already applied according to git apply --reverse --check: $patch_name"
               return 0
             fi
-            if patch -p1 --dry-run < "$patch_file"; then
-              patch -p1 < "$patch_file"
-              echo "[OK] applied with patch -p1: $patch_name"
+
+            # Last clean apply attempt via GNU patch, forced non-interactive.
+            # --batch: never prompt. --forward: ignore reversed/already-applied patches.
+            if patch --batch --forward -p1 --dry-run < "$patch_file"; then
+              patch --batch --forward -p1 < "$patch_file"
+              echo "[OK] applied with patch --batch --forward -p1: $patch_name"
               return 0
             fi
-            if patch -p1 --reverse --dry-run < "$patch_file"; then
-              echo "[OK] already applied according to patch -R dry-run: $patch_name"
-              return 0
-            fi
+
             echo "[WARN] $patch_name context mismatch. Porting required fix by source intent with strict verification."
             return 1
           }
@@ -466,7 +470,7 @@ jobs:
           fi
 
           {
-            echo "=== Lisa SUSFS portable eplus fixes no-heredoc ==="
+            echo "=== Lisa SUSFS portable eplus fixes no-heredoc v2 no-prompt ==="
             echo "repo=$LISA_FIX_REPO"
             echo "branch=$LISA_FIX_BRANCH"
             echo "patch1=$SUSFS_FIXED_EPLUS"
