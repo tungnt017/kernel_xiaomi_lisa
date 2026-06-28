@@ -375,7 +375,7 @@ jobs:
           [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
           find . -name "*.orig" -print -delete || true
 
-      - name: Apply lisa SUSFS eplus fixes portable strict
+      - name: Apply lisa SUSFS eplus fixes portable strict no-heredoc
         shell: bash
         run: |
           set -euo pipefail
@@ -428,65 +428,14 @@ jobs:
             return 1
           }
 
-          # Patch 1 may fail on lisa because task_mmu.c include anchors differ.
+          # Patch 1: task_mmu.c susfs_def.h guard / SUS_KSTAT/SUS_MAPS support.
           if ! try_apply_or_port "$SUSFS_FIXED_EPLUS"; then
-            python3 - <<'PY'
-            from pathlib import Path
-            p = Path('fs/proc/task_mmu.c')
-            if not p.exists():
-                raise SystemExit('[ERROR] fs/proc/task_mmu.c not found')
-            s = p.read_text()
-            if 'linux/susfs_def.h' not in s:
-                lines = s.splitlines(True)
-                insert_at = None
-                for i, line in enumerate(lines):
-                    if line.startswith('#include '):
-                        insert_at = i + 1
-                if insert_at is None:
-                    raise SystemExit('[ERROR] Cannot find include block in fs/proc/task_mmu.c')
-                block = (
-                    '#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAPS)\n'
-                    '#include <linux/susfs_def.h>\n'
-                    '#endif\n'
-                )
-                lines.insert(insert_at, block)
-                p.write_text(''.join(lines))
-                print('[FIXED] task_mmu.c: added guarded linux/susfs_def.h include')
-            else:
-                print('[OK] task_mmu.c already references linux/susfs_def.h')
-            PY
+            python3 -c $'from pathlib import Path\np=Path("fs/proc/task_mmu.c")\nif not p.exists():\n    raise SystemExit("[ERROR] fs/proc/task_mmu.c not found")\ns=p.read_text()\nif "linux/susfs_def.h" not in s:\n    lines=s.splitlines(True)\n    insert_at=None\n    for i,line in enumerate(lines):\n        if line.startswith("#include "):\n            insert_at=i+1\n    if insert_at is None:\n        raise SystemExit("[ERROR] Cannot find include block in fs/proc/task_mmu.c")\n    block="#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAPS)\\n#include <linux/susfs_def.h>\\n#endif\\n"\n    lines.insert(insert_at, block)\n    p.write_text("".join(lines))\n    print("[FIXED] task_mmu.c: added guarded linux/susfs_def.h include")\nelse:\n    print("[OK] task_mmu.c already references linux/susfs_def.h")\n'
           fi
 
-          # Patch 2 may fail if mount.h KABI slot/context differs.
+          # Patch 2: fd.c SUS_MOUNT hide + mount.h KABI slot.
           if ! try_apply_or_port "$SUSFS_155_FIXED_EPLUS"; then
-            python3 - <<'PY'
-            from pathlib import Path
-            import re
-
-            # Ensure struct vfsmount has a KABI-safe susfs_mnt_id_backup field.
-            p = Path('include/linux/mount.h')
-            if not p.exists():
-                raise SystemExit('[ERROR] include/linux/mount.h not found')
-            s = p.read_text()
-            if 'susfs_mnt_id_backup' not in s:
-                m = re.search(r'ANDROID_KABI_RESERVE\((\d+)\)', s)
-                if not m:
-                    raise SystemExit('[ERROR] No free ANDROID_KABI_RESERVE(n) slot found in include/linux/mount.h for susfs_mnt_id_backup')
-                slot = m.group(1)
-                s = s[:m.start()] + f'ANDROID_KABI_USE({slot}, u64 susfs_mnt_id_backup)' + s[m.end():]
-                p.write_text(s)
-                print(f'[FIXED] mount.h: added ANDROID_KABI_USE({slot}, u64 susfs_mnt_id_backup)')
-            else:
-                print('[OK] mount.h already has susfs_mnt_id_backup')
-
-            # Best-effort fd.c verification/port marker: fail if patch expected fd.c changes are totally absent.
-            fd = Path('fs/proc/fd.c')
-            if not fd.exists():
-                raise SystemExit('[ERROR] fs/proc/fd.c not found')
-            fds = fd.read_text()
-            if 'susfs' not in fds.lower() and 'SUSFS' not in fds:
-                print('[WARN] fs/proc/fd.c has no SUSFS refs after patch context mismatch; generic patch may not require eplus fd.c hunk on this tree')
-            PY
+            python3 -c $'from pathlib import Path\nimport re\np=Path("include/linux/mount.h")\nif not p.exists():\n    raise SystemExit("[ERROR] include/linux/mount.h not found")\ns=p.read_text()\nif "susfs_mnt_id_backup" not in s:\n    m=re.search(r"ANDROID_KABI_RESERVE\\((\\d+)\\)", s)\n    if not m:\n        raise SystemExit("[ERROR] No free ANDROID_KABI_RESERVE(n) slot found in include/linux/mount.h for susfs_mnt_id_backup")\n    slot=m.group(1)\n    s=s[:m.start()] + f"ANDROID_KABI_USE({slot}, u64 susfs_mnt_id_backup)" + s[m.end():]\n    p.write_text(s)\n    print(f"[FIXED] mount.h: added ANDROID_KABI_USE({slot}, u64 susfs_mnt_id_backup)")\nelse:\n    print("[OK] mount.h already has susfs_mnt_id_backup")\nfd=Path("fs/proc/fd.c")\nif not fd.exists():\n    raise SystemExit("[ERROR] fs/proc/fd.c not found")\nfds=fd.read_text()\nif "susfs" in fds.lower() or "SUSFS" in fds:\n    print("[OK] fd.c SUSFS refs present")\nelse:\n    print("[WARN] fd.c has no SUSFS refs after context mismatch; generic tree may differ")\n'
           fi
 
           # Reject files are never allowed.
@@ -517,7 +466,7 @@ jobs:
           fi
 
           {
-            echo "=== Lisa SUSFS portable eplus fixes ==="
+            echo "=== Lisa SUSFS portable eplus fixes no-heredoc ==="
             echo "repo=$LISA_FIX_REPO"
             echo "branch=$LISA_FIX_BRANCH"
             echo "patch1=$SUSFS_FIXED_EPLUS"
