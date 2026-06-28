@@ -151,7 +151,7 @@ jobs:
           test -d KernelSU || { echo "[ERROR] KernelSU directory missing after SukiSU Ultra setup"; exit 1; }
           test -d drivers/kernelsu || { echo "[ERROR] drivers/kernelsu directory missing after SukiSU Ultra setup"; exit 1; }
 
-      - name: Fix SukiSU Ultra 5.4 builtin compat
+      - name: Fix SukiSU Ultra 5.4 builtin compat - no bypass no weak no stub no-op
         shell: bash
         run: |
           set -euo pipefail
@@ -165,8 +165,10 @@ jobs:
           if not root.exists():
               raise SystemExit('[ERROR] drivers/kernelsu not found; SukiSU Ultra setup did not finish')
 
-          # Fix 1: SukiSU Ultra builtin on some 5.4 trees calls selinux_hide handlers
-          # from runtime/ksud.c without visible prototypes.
+          modified_files = []
+
+          # Fix 1: add real declaration visibility only.
+          # This does NOT create weak symbols, stubs, empty handlers, fake return values, or bypasses.
           ksud = root / 'runtime' / 'ksud.c'
           if ksud.exists():
               text = ksud.read_text()
@@ -186,6 +188,7 @@ jobs:
                       text = ''.join(lines)
                       changed.append('ksud.c include feature/selinux_hide.h')
                   else:
+                      # Declaration only. If implementation is absent, link must fail; do not fake it.
                       proto = (
                           '\nvoid ksu_selinux_hide_handle_second_stage(void);\n'
                           'void ksu_selinux_hide_handle_post_fs_data(void);\n'
@@ -195,12 +198,11 @@ jobs:
                           text = text[:m.end()] + proto + text[m.end():]
                       else:
                           text = proto + text
-                      changed.append('ksud.c selinux_hide extern prototypes')
+                      changed.append('ksud.c selinux_hide declarations only')
                   ksud.write_text(text)
+                  modified_files.append(ksud)
 
-          # Fix 2: kernel 5.4 may not expose public strncpy_from_user_nofault,
-          # while SukiSU Ultra sources may call it. Map it to the compat/backport helper
-          # when __strncpy_from_user_nofault exists in KernelSU compat header.
+          # Fix 2: API alias only. This maps to an existing compat helper; it does not return fake success.
           compat = root / 'kernel_compat.h'
           if compat.exists():
               c = compat.read_text()
@@ -215,12 +217,30 @@ jobs:
                       '#endif\n'
                   )
                   compat.write_text(c)
-                  changed.append('kernel_compat.h strncpy_from_user_nofault alias')
+                  changed.append('kernel_compat.h strncpy_from_user_nofault alias to real compat helper')
+                  modified_files.append(compat)
+
+          # Strict guard for files modified by this step: no bypass, no weak, no stub, no no-op.
+          forbidden_patterns = [
+              (r'\b__weak\b', '__weak'),
+              (r'__attribute__\s*\(\s*\(\s*weak\s*\)\s*\)', '__attribute__((weak))'),
+              (r'ksu_selinux_hide_handle_(second_stage|post_fs_data)\s*\([^)]*\)\s*\{\s*\}', 'empty selinux_hide handler stub'),
+              (r'ksu_selinux_hide_handle_(second_stage|post_fs_data)\s*\([^)]*\)\s*\{\s*return\s*;\s*\}', 'no-op selinux_hide handler'),
+              (r'ksu_selinux_hide_handle_(second_stage|post_fs_data)\s*\([^)]*\)\s*\{\s*return\s+0\s*;\s*\}', 'fake return-0 selinux_hide handler'),
+              (r'Wno-error=implicit-function-declaration', 'Werror bypass'),
+              (r'-Wno-error', 'generic Werror bypass'),
+          ]
+          for path in modified_files:
+              body = path.read_text(errors='ignore')
+              for pattern, label in forbidden_patterns:
+                  if re.search(pattern, body, re.S):
+                      raise SystemExit(f'[ERROR] Forbidden {label} introduced/found in {path}')
 
           if changed:
               print('[FIXED] ' + '; '.join(changed))
           else:
               print('[OK] SukiSU Ultra 5.4 compat fixes already present or not needed')
+          print('[OK] Fix step contains no bypass, weak symbol, stub, or no-op handler')
           PY
 
       - name: Apply existing manual hook script
