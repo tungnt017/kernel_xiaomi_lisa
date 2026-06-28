@@ -330,6 +330,116 @@ jobs:
           [ -z "$rej" ] || { echo "[ERROR] Reject files:"; echo "$rej"; exit 1; }
           find . -name "*.orig" -print -delete || true
 
+      - name: Apply lisa required SUSFS device-specific fixes - eplus only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          PATCH_REPO="https://github.com/JackA1ltman/NonGKI_Kernel_Patches.git"
+          PATCH_BRANCH="mi_kernel"
+          PATCH_DIR="/tmp/NonGKI_Kernel_Patches-mi_kernel"
+
+          rm -rf "$PATCH_DIR"
+          git clone --depth=1 --branch "$PATCH_BRANCH" "$PATCH_REPO" "$PATCH_DIR"
+
+          echo "[INFO] Available SUSFS/eplus patches:"
+          find "$PATCH_DIR" -type f \( -iname '*susfs*' -o -iname '*eplus*' -o -iname '*.patch' \) | sort | sed 's/^/  - /'
+
+          find_patch() {
+            name="$1"
+            found="$(find "$PATCH_DIR" -type f -name "$name" | sort | sed -n '1p')"
+            if [ -z "$found" ]; then
+              echo "[ERROR] Required patch not found: $name"
+              echo "[INFO] Patch repo file list:"
+              find "$PATCH_DIR" -maxdepth 5 -type f | sort | sed 's/^/  - /' | sed -n '1,500p'
+              exit 1
+            fi
+            printf '%s\n' "$found"
+          }
+
+          SUSFS_FIXED_EPLUS="$(find_patch 'susfs_fixed_eplus.patch')"
+          SUSFS_155_FIXED_EPLUS="$(find_patch 'susfs_155_fixed_eplus.patch')"
+
+          apply_patch_strict() {
+            patch_file="$1"
+            patch_name="$(basename "$patch_file")"
+            echo "[INFO] Applying $patch_name"
+
+            if git apply --check "$patch_file"; then
+              git apply "$patch_file"
+              echo "[OK] applied with git apply: $patch_name"
+            elif git apply --reverse --check "$patch_file"; then
+              echo "[OK] already applied: $patch_name"
+            elif patch -p1 --dry-run < "$patch_file"; then
+              patch -p1 < "$patch_file"
+              echo "[OK] applied with patch -p1: $patch_name"
+            elif patch -p1 --reverse --dry-run < "$patch_file"; then
+              echo "[OK] already applied according to patch -R dry-run: $patch_name"
+            else
+              echo "[ERROR] Failed to apply required patch: $patch_file"
+              echo "[ERROR] Not bypassing. Check hunk rejects/anchor mismatch."
+              exit 1
+            fi
+
+            rej="$(find . -name '*.rej' -print)"
+            if [ -n "$rej" ]; then
+              echo "[ERROR] Reject files after $patch_name:"
+              echo "$rej"
+              exit 1
+            fi
+            find . -name '*.orig' -print -delete || true
+          }
+
+          # Patch 1: task_mmu.c susfs_def.h guard / SUS_KSTAT/SUS_MAP support.
+          apply_patch_strict "$SUSFS_FIXED_EPLUS"
+
+          # Patch 2: fs/proc/fd.c SUS_MOUNT hide + include/linux/mount.h KABI slot.
+          apply_patch_strict "$SUSFS_155_FIXED_EPLUS"
+
+          # Strict post-apply verification.
+          if ! grep -q 'susfs_mnt_id_backup' include/linux/mount.h; then
+            echo "[ERROR] include/linux/mount.h missing susfs_mnt_id_backup after eplus fix patch"
+            echo "[ERROR] SUS_MOUNT KABI field missing; refusing build."
+            grep -n 'ANDROID_KABI_USE\|ANDROID_KABI_RESERVE\|susfs_mnt_id_backup' include/linux/mount.h || true
+            exit 1
+          fi
+
+          if ! grep -q 'ANDROID_KABI_USE.*susfs_mnt_id_backup' include/linux/mount.h; then
+            echo "[ERROR] susfs_mnt_id_backup exists but is not wired through ANDROID_KABI_USE in include/linux/mount.h"
+            echo "[ERROR] GKI 1.0 KABI-safe field expected; refusing build."
+            grep -n 'ANDROID_KABI_USE\|ANDROID_KABI_RESERVE\|susfs_mnt_id_backup' include/linux/mount.h || true
+            exit 1
+          fi
+
+          if ! grep -q 'linux/susfs_def.h' fs/proc/task_mmu.c; then
+            echo "[ERROR] fs/proc/task_mmu.c missing linux/susfs_def.h include after eplus fix patch"
+            exit 1
+          fi
+
+          # Do not apply SM6375/dev_sm6375 patch on lisa/SM7325.
+          if find "$PATCH_DIR" -type f -name 'susfs_155_fixed_dev_sm6375.patch' | grep -q .; then
+            echo "[OK] dev_sm6375 patch intentionally not applied for lisa/SM7325"
+          fi
+
+          {
+            echo "=== Lisa SUSFS device-specific eplus fixes ==="
+            echo "repo=$PATCH_REPO"
+            echo "branch=$PATCH_BRANCH"
+            echo "patch1=$SUSFS_FIXED_EPLUS"
+            echo "patch2=$SUSFS_155_FIXED_EPLUS"
+            echo
+            echo "--- fs/proc/task_mmu.c SUSFS include/features ---"
+            grep -n 'susfs_def.h\|CONFIG_KSU_SUSFS_SUS_KSTAT\|CONFIG_KSU_SUSFS_SUS_MAP' fs/proc/task_mmu.c || true
+            echo
+            echo "--- include/linux/mount.h SUSFS KABI ---"
+            grep -n 'ANDROID_KABI_USE\|ANDROID_KABI_RESERVE\|susfs_mnt_id_backup' include/linux/mount.h || true
+            echo
+            echo "--- fs/proc/fd.c SUS_MOUNT/SUSFS refs ---"
+            grep -n 'SUSFS\|susfs\|mnt_id' fs/proc/fd.c || true
+            echo
+          } >> "$DEBUG_SUMMARY"
+
       - name: Fix defconfig KSU/SUSFS
         shell: bash
         run: |
