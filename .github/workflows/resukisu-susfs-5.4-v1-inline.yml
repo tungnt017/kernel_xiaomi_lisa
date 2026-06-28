@@ -37,7 +37,7 @@ on:
         default: "true"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   strict-full-build:
@@ -1117,6 +1117,55 @@ jobs:
           done
 
           ls -lh /tmp/resukisu-susfs-output
+
+      - name: Upload output zip to GitHub Release
+        if: ${{ github.event.inputs.run_build == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ZIP_DIR="/tmp/resukisu-susfs-output"
+          test -d "$ZIP_DIR" || {
+            echo "[ERROR] ZIP directory not found: $ZIP_DIR"
+            exit 1
+          }
+
+          mapfile -t zips < <(find "$ZIP_DIR" -type f -name "*.zip" -print | sort)
+
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "[ERROR] No ZIP files found in $ZIP_DIR"
+            exit 1
+          fi
+
+          SHORT_SHA="${GITHUB_SHA::8}"
+          RELEASE_DATE="$(date -u +'%Y%m%d-%H%M')"
+          RELEASE_TAG="resukisu-lisa-${RELEASE_DATE}-${SHORT_SHA}"
+          RELEASE_TITLE="ReSukiSU SUSFS Lisa ${RELEASE_DATE} ${SHORT_SHA}"
+
+          {
+            echo "=== GitHub Release Upload ==="
+            echo "tag=$RELEASE_TAG"
+            echo "title=$RELEASE_TITLE"
+            echo "zips:"
+            printf '  - %s\n' "${zips[@]}"
+            echo
+          } >> "$DEBUG_SUMMARY"
+
+          echo "[INFO] Creating release: $RELEASE_TAG"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "[WARN] Release already exists, uploading assets with --clobber"
+            gh release upload "$RELEASE_TAG" "${zips[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${zips[@]}" \
+              --title "$RELEASE_TITLE" \
+              --notes-file "$DEBUG_SUMMARY" \
+              --target "$GITHUB_SHA"
+          fi
+
+          echo "[OK] Uploaded ZIP to GitHub Release: $RELEASE_TAG"
 
       - name: Upload output zip artifacts
         if: ${{ github.event.inputs.run_build == 'true' }}
