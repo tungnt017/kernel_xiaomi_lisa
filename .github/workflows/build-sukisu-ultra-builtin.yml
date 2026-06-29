@@ -80,73 +80,65 @@ jobs:
           echo "[INFO] drivers/kernelsu -> KernelSU/kernel/"
           ls -la drivers/kernelsu 2>/dev/null || ls -la KernelSU/kernel/ | head -5
 
-      # -------------------------------------------------------
-      # Disable SUSFS in Kconfig (builtin branch default y → n)
-      # Runs before hook script so defconfig is clean
-      # -------------------------------------------------------
-      - name: Disable SUSFS in SukiSU-Ultra Kconfig
-        if: ${{ github.event.inputs.disable_susfs == '1' }}
-        run: |
-          set -e
-          set -o pipefail
-          mkdir -p logs
+- name: Disable SUSFS by default
+  if: ${{ github.event.inputs.disable_susfs == '1' }}
+  shell: bash
+  run: |
+    set -e
+    set -o pipefail
+    mkdir -p logs
 
-          {
-            KCONFIG_PATH=""
+    {
+      KCONFIG_PATH=""
 
-            if [ -f "drivers/kernelsu/Kconfig" ]; then
-              KCONFIG_PATH="drivers/kernelsu/Kconfig"
-            elif [ -f "KernelSU/kernel/Kconfig" ]; then
-              KCONFIG_PATH="KernelSU/kernel/Kconfig"
-            else
-              echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
-              find . -name "Kconfig" -path "*/kernelsu/*" | head -5
-              exit 1
-            fi
+      if [ -f "drivers/kernelsu/Kconfig" ]; then
+        KCONFIG_PATH="drivers/kernelsu/Kconfig"
+      elif [ -f "KernelSU/kernel/Kconfig" ]; then
+        KCONFIG_PATH="KernelSU/kernel/Kconfig"
+      else
+        echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
+        find . -name "Kconfig" -path "*/kernelsu/*" | head -5
+        exit 1
+      fi
 
-            echo "[INFO] Kconfig: ${KCONFIG_PATH}"
-            echo "[INFO] Before:"
-            grep -n "default" "${KCONFIG_PATH}" | head -20
+      echo "[INFO] Kconfig: ${KCONFIG_PATH}"
+      echo "[INFO] Before:"
+      grep -n "default" "${KCONFIG_PATH}" | head -20 || true
 
-            # Đổi default y → default n cho CONFIG_KSU_SUSFS (parent)
-            # Chỉ đổi trong menu "KernelSU - SUSFS" block
-            # Khi parent=n, toàn bộ KSU_SUSFS_* subconfigs tự =n do depends on KSU_SUSFS
-            python3 - <<'PYEOF'
-            import re, sys
-            
-            kconfig = "${KCONFIG_PATH}"
-            
-            with open(kconfig) as f:
-                data = f.read()
-            
-            # Tìm config KSU_SUSFS block và đổi "default y" đầu tiên của nó thành "default n"
-            # Pattern: từ "config KSU_SUSFS" đến dòng trống kế tiếp (end of block)
-            pat = re.compile(
-                r'(config KSU_SUSFS\b.*?)(\n\tdefault )y(\b)',
-                re.S
-            )
-            
-            new_data, count = pat.subn(r'\1\2n\3', data, count=1)
-            
-            if count == 0:
-                print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
-            else:
-                with open(kconfig, 'w') as f:
-                    f.write(new_data)
-                print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
-            PYEOF
+      python3 - "$KCONFIG_PATH" <<'PYEOF'
+import re
+import sys
 
-            echo "[INFO] After:"
-            grep -n "default" "${KCONFIG_PATH}" | head -20
+kconfig = sys.argv[1]
 
-            # Verify
-            if grep -A5 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default n"; then
-              echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
-            else
-              echo "[WARN] Could not confirm default n — check Kconfig manually"
-            fi
+with open(kconfig, "r", encoding="utf-8") as f:
+    data = f.read()
 
-          } 2>&1 | tee logs/disable-susfs.log
+pat = re.compile(
+    r'(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)',
+    re.S
+)
+
+new_data, count = pat.subn(r'\1\2n\3', data, count=1)
+
+if count == 0:
+    print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
+else:
+    with open(kconfig, "w", encoding="utf-8") as f:
+        f.write(new_data)
+    print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
+PYEOF
+
+      echo "[INFO] After:"
+      grep -n "default" "${KCONFIG_PATH}" | head -20 || true
+
+      if grep -A8 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
+        echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
+      else
+        echo "[WARN] Could not confirm default n — check Kconfig manually"
+      fi
+
+    } 2>&1 | tee logs/disable-susfs.log
 
       # -------------------------------------------------------
       # Apply manual hooks (SukiSU-Ultra edition)
