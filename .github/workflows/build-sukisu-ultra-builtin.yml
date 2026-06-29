@@ -62,14 +62,12 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             echo "[INFO] Setup SukiSU-Ultra builtin"
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-
             echo "[INFO] SukiSU paths after setup:"
-            find . -maxdepth 4 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print || true
-            find . -maxdepth 5 -type f -path "*kernelsu*Kconfig" -print || true
+            find . -maxdepth 5 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print || true
+            find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
           } 2>&1 | tee logs/setup-sukisu.log
 
       - name: Disable SukiSU-Ultra SUSFS default in Kconfig
@@ -79,7 +77,6 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             echo "[INFO] Disable SUSFS default in SukiSU-Ultra Kconfig"
 
@@ -107,39 +104,27 @@ jobs:
             echo "[INFO] Before patch:"
             grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-before.txt || true
 
-            python3 -c '
-            import re
-            import sys
-            from pathlib import Path
-            
-            kconfig = Path(sys.argv[1])
-            data = kconfig.read_text(encoding="utf-8", errors="ignore")
-            
-            pat = re.compile(
-                r"(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)",
-                re.S,
-            )
-            new_data, count = pat.subn(r"\1\2n\3", data, count=1)
-            
-            if count == 0:
-                if re.search(r"config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+n\b", data, re.S):
-                    print("[OK] CONFIG_KSU_SUSFS already default n")
-                else:
-                    print("[ERROR] CONFIG_KSU_SUSFS default y/default n not found; format may differ")
-                    sys.exit(2)
-            else:
-                kconfig.write_text(new_data, encoding="utf-8")
-                print(f"[OK] Changed CONFIG_KSU_SUSFS default y -> default n in {kconfig}")
-            ' "${KCONFIG_PATH}"
+            BEFORE_HASH="$(sha256sum "${KCONFIG_PATH}" | awk '{print $1}')"
+
+            # Patch only the parent config KSU_SUSFS block:
+            #   config KSU_SUSFS ... default y  ->  default n
+            # No python -c and no heredoc are used here, so there is no PYEOF or IndentationError issue.
+            perl -0pi -e 's/(config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+)y\b/${1}n/s' "${KCONFIG_PATH}"
+
+            AFTER_HASH="$(sha256sum "${KCONFIG_PATH}" | awk '{print $1}')"
 
             echo "[INFO] After patch:"
             grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-after.txt || true
 
             if grep -A35 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
-              echo "[OK] Kconfig patch confirmed: CONFIG_KSU_SUSFS default n"
+              if [ "${BEFORE_HASH}" = "${AFTER_HASH}" ]; then
+                echo "[OK] CONFIG_KSU_SUSFS already default n"
+              else
+                echo "[OK] Changed CONFIG_KSU_SUSFS default y -> default n in ${KCONFIG_PATH}"
+              fi
             else
-              echo "[ERROR] CONFIG_KSU_SUSFS default n not confirmed"
-              exit 1
+              echo "[ERROR] CONFIG_KSU_SUSFS default n not confirmed after patch"
+              exit 2
             fi
           } 2>&1 | tee logs/disable-susfs-kconfig.log
 
@@ -149,13 +134,11 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             if [ ! -f "apply_sukisu_ultra_manual_hooks.py" ]; then
               echo "[ERROR] apply_sukisu_ultra_manual_hooks.py not found in repository root"
               exit 1
             fi
-
             export SUKISU_KALLSYMS_ALL="${{ github.event.inputs.kallsyms_all }}"
             python3 apply_sukisu_ultra_manual_hooks.py "${DEFCONFIG}"
           } 2>&1 | tee logs/apply-manual-hooks.log
@@ -167,7 +150,6 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             DEFCONFIG_PATH=""
             for p in \
@@ -212,7 +194,6 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug "${OUT_DIR}"
-
           {
             echo "[INFO] Generate .config from ${DEFCONFIG}"
             make O="${OUT_DIR}" "${DEFCONFIG}"
@@ -226,10 +207,8 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             CONFIG_FILE="${OUT_DIR}/.config"
-
             if [ ! -f "$CONFIG_FILE" ]; then
               echo "[ERROR] ${CONFIG_FILE} not found. Run defconfig before this step."
               exit 1
@@ -259,7 +238,6 @@ jobs:
               grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE"
               exit 1
             fi
-
             echo "[OK] SUSFS disabled verification passed"
           } 2>&1 | tee logs/verify-susfs-disabled.log
 
@@ -271,7 +249,6 @@ jobs:
           {
             echo "===== DEBUG 1: TREE AND SUKISU STATE ====="
             echo "Date: $(date -u)"
-            echo "Runner: ${RUNNER_OS:-unknown}"
             echo "Commit: ${GITHUB_SHA:-unknown}"
             echo
             echo "===== SukiSU directories ====="
@@ -307,7 +284,7 @@ jobs:
             cat debug/ksu-config-before-build.txt 2>/dev/null || true
             echo
             echo "===== Raw .config SUSFS lines ====="
-            grep -n "SUSFS\|CONFIG_KSU\|CONFIG_KPM\|CONFIG_KALLSYMS" "${OUT_DIR}/.config" 2>/dev/null || true
+            grep -nE "SUSFS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS" "${OUT_DIR}/.config" 2>/dev/null || true
           } > debug/02-kconfig-and-config-state.txt
 
       - name: Build kernel
@@ -316,17 +293,13 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
             JOBS="$(nproc --all)"
           else
             JOBS="${{ github.event.inputs.jobs }}"
           fi
-
-          {
-            echo "[INFO] Starting compilation with jobs=${JOBS}"
-            make O="${OUT_DIR}" -j"${JOBS}" 2>&1 | tee logs/build.log
-          }
+          echo "[INFO] Starting compilation with jobs=${JOBS}" | tee logs/build.log
+          make O="${OUT_DIR}" -j"${JOBS}" 2>&1 | tee -a logs/build.log
 
       - name: Create debug file 3 - errors and build summary
         if: always()
