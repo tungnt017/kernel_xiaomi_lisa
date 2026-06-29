@@ -134,13 +134,36 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
+
           {
-            if [ ! -f "apply_sukisu_ultra_manual_hooks.py" ]; then
-              echo "[ERROR] apply_sukisu_ultra_manual_hooks.py not found in repository root"
-              exit 1
+            echo "[INFO] Looking for apply_sukisu_ultra_manual_hooks.py"
+
+            HOOK_SCRIPT=""
+            for p in \
+              "apply_sukisu_ultra_manual_hooks.py" \
+              ".github/scripts/apply_sukisu_ultra_manual_hooks.py" \
+              "scripts/apply_sukisu_ultra_manual_hooks.py" \
+              "tools/apply_sukisu_ultra_manual_hooks.py"
+            do
+              if [ -f "$p" ]; then
+                HOOK_SCRIPT="$p"
+                break
+              fi
+            done
+
+            if [ -z "$HOOK_SCRIPT" ]; then
+              echo "[WARN] apply_sukisu_ultra_manual_hooks.py not found."
+              echo "[WARN] Skipping manual hooks step."
+              echo "[WARN] If your kernel requires manual hooks, commit the script to repository root or .github/scripts/."
+              find . -maxdepth 4 -type f -name "*sukisu*hook*.py" -o -name "*manual*hook*.py" | sort | tee debug/manual-hook-script-search.txt || true
+              exit 0
             fi
+
+            echo "[INFO] Hook script: ${HOOK_SCRIPT}"
+            cp "$HOOK_SCRIPT" debug/apply_sukisu_ultra_manual_hooks.used.py
+
             export SUKISU_KALLSYMS_ALL="${{ github.event.inputs.kallsyms_all }}"
-            python3 apply_sukisu_ultra_manual_hooks.py "${DEFCONFIG}"
+            python3 "$HOOK_SCRIPT" "${DEFCONFIG}"
           } 2>&1 | tee logs/apply-manual-hooks.log
 
       - name: Force disable SUSFS in defconfig
