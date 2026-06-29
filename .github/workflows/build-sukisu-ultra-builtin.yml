@@ -108,29 +108,29 @@ jobs:
             grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-before.txt || true
 
             python3 -c '
-import re
-import sys
-from pathlib import Path
-
-kconfig = Path(sys.argv[1])
-data = kconfig.read_text(encoding="utf-8", errors="ignore")
-
-pat = re.compile(
-    r"(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)",
-    re.S,
-)
-new_data, count = pat.subn(r"\1\2n\3", data, count=1)
-
-if count == 0:
-    if re.search(r"config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+n\b", data, re.S):
-        print("[OK] CONFIG_KSU_SUSFS already default n")
-    else:
-        print("[ERROR] CONFIG_KSU_SUSFS default y/default n not found; format may differ")
-        sys.exit(2)
-else:
-    kconfig.write_text(new_data, encoding="utf-8")
-    print(f"[OK] Changed CONFIG_KSU_SUSFS default y -> default n in {kconfig}")
-' "${KCONFIG_PATH}"
+            import re
+            import sys
+            from pathlib import Path
+            
+            kconfig = Path(sys.argv[1])
+            data = kconfig.read_text(encoding="utf-8", errors="ignore")
+            
+            pat = re.compile(
+                r"(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)",
+                re.S,
+            )
+            new_data, count = pat.subn(r"\1\2n\3", data, count=1)
+            
+            if count == 0:
+                if re.search(r"config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+n\b", data, re.S):
+                    print("[OK] CONFIG_KSU_SUSFS already default n")
+                else:
+                    print("[ERROR] CONFIG_KSU_SUSFS default y/default n not found; format may differ")
+                    sys.exit(2)
+            else:
+                kconfig.write_text(new_data, encoding="utf-8")
+                print(f"[OK] Changed CONFIG_KSU_SUSFS default y -> default n in {kconfig}")
+            ' "${KCONFIG_PATH}"
 
             echo "[INFO] After patch:"
             grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-after.txt || true
