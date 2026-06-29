@@ -80,54 +80,54 @@ jobs:
           echo "[INFO] drivers/kernelsu -> KernelSU/kernel/"
           ls -la drivers/kernelsu 2>/dev/null || ls -la KernelSU/kernel/ | head -5
 
-- name: Disable SUSFS by default
-  if: ${{ github.event.inputs.disable_susfs == '1' }}
-  shell: bash
-  run: |
-    set -e
-    set -o pipefail
-    mkdir -p logs
-
-    {
-      KCONFIG_PATH=""
-
-      if [ -f "drivers/kernelsu/Kconfig" ]; then
-        KCONFIG_PATH="drivers/kernelsu/Kconfig"
-      elif [ -f "KernelSU/kernel/Kconfig" ]; then
-        KCONFIG_PATH="KernelSU/kernel/Kconfig"
-      else
-        echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
-        find . -name "Kconfig" -path "*/kernelsu/*" | head -5
-        exit 1
-      fi
-
-      echo "[INFO] Kconfig: ${KCONFIG_PATH}"
-      echo "[INFO] Before:"
-      grep -n "default" "${KCONFIG_PATH}" | head -20 || true
-
-      python3 - "$KCONFIG_PATH" <<'PYEOF'
-import re
-import sys
-
-kconfig = sys.argv[1]
-
-with open(kconfig, "r", encoding="utf-8") as f:
-    data = f.read()
-
-pat = re.compile(
-    r'(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)',
-    re.S
-)
-
-new_data, count = pat.subn(r'\1\2n\3', data, count=1)
-
-if count == 0:
-    print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
-else:
-    with open(kconfig, "w", encoding="utf-8") as f:
-        f.write(new_data)
-    print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
-PYEOF
+      - name: Disable SUSFS by default
+        if: ${{ github.event.inputs.disable_susfs == '1' }}
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+      
+          {
+            KCONFIG_PATH=""
+      
+            if [ -f "drivers/kernelsu/Kconfig" ]; then
+              KCONFIG_PATH="drivers/kernelsu/Kconfig"
+            elif [ -f "KernelSU/kernel/Kconfig" ]; then
+              KCONFIG_PATH="KernelSU/kernel/Kconfig"
+            else
+              echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
+              find . -name "Kconfig" -path "*/kernelsu/*" | head -5
+              exit 1
+            fi
+      
+            echo "[INFO] Kconfig: ${KCONFIG_PATH}"
+            echo "[INFO] Before:"
+            grep -n "default" "${KCONFIG_PATH}" | head -20 || true
+      
+            python3 - "$KCONFIG_PATH" <<'PYEOF'
+      import re
+      import sys
+      
+      kconfig = sys.argv[1]
+      
+      with open(kconfig, "r", encoding="utf-8") as f:
+          data = f.read()
+      
+      pat = re.compile(
+          r'(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)',
+          re.S
+      )
+      
+      new_data, count = pat.subn(r'\1\2n\3', data, count=1)
+      
+      if count == 0:
+          print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
+      else:
+          with open(kconfig, "w", encoding="utf-8") as f:
+              f.write(new_data)
+          print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
+      PYEOF
 
       echo "[INFO] After:"
       grep -n "default" "${KCONFIG_PATH}" | head -20 || true
