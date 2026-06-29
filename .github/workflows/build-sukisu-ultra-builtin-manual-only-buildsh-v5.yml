@@ -1,4 +1,4 @@
-name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks Only Official
+name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks Only Official V7
 
 on:
   workflow_dispatch:
@@ -12,9 +12,9 @@ on:
         required: true
         default: "auto"
       sukisu_official_ref:
-        description: "Official SukiSU-Ultra ref used to sync official fix files"
+        description: "Official SukiSU-Ultra ref used to sync full kernel tree"
         required: false
-        default: "main"
+        default: "builtin"
       kallsyms_all:
         description: "Force CONFIG_KALLSYMS_ALL=y (set to 1 to enable)"
         required: false
@@ -43,7 +43,7 @@ env:
 
 jobs:
   build:
-    name: Build SukiSU-Ultra builtin manual-hook-only kernel official
+    name: Build SukiSU-Ultra builtin manual-hook-only official v7
     runs-on: ubuntu-22.04
 
     steps:
@@ -60,7 +60,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex git kmod libssl-dev \
-            libelf-dev libncurses5-dev libncurses-dev lld llvm clang python3 zip unzip \
+            libelf-dev libncurses5-dev libncurses-dev lld llvm clang python3 zip unzip rsync \
             dwarves pahole jq \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
           mkdir -p logs debug artifacts "${OUT_DIR}"
@@ -87,15 +87,14 @@ jobs:
             find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
           } 2>&1 | tee logs/setup-sukisu.log
 
-      - name: Sync official SukiSU-Ultra fix files only
+      - name: Sync full official SukiSU-Ultra kernel tree only
         shell: bash
         run: |
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
-            echo "[INFO] Sync official SukiSU-Ultra source files only"
+            echo "[INFO] Sync full official SukiSU-Ultra kernel tree"
             echo "[INFO] No stubs, no weak symbols, no no-op, no local bypass patches"
 
             OFFICIAL_REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"
@@ -104,86 +103,54 @@ jobs:
             rm -rf .sukisu-official
             git clone --depth=1 --branch "${OFFICIAL_REF}" "${OFFICIAL_REPO}" .sukisu-official
 
-            if [ ! -d "drivers/kernelsu" ]; then
-              echo "[ERROR] drivers/kernelsu not found after setup.sh builtin"
+            if [ ! -d ".sukisu-official/kernel" ]; then
+              echo "[ERROR] Official kernel directory missing"
               exit 1
             fi
 
-            echo "[INFO] Official ref:"
+            echo "[INFO] Official ref/branch: ${OFFICIAL_REF}"
             git -C .sukisu-official rev-parse HEAD | tee debug/sukisu-official-ref.txt
 
-            echo "[INFO] Official runtime files:"
-            find .sukisu-official/kernel/runtime -maxdepth 1 -type f -print | sort | tee debug/official-runtime-files.txt || true
+            echo "[INFO] Official kernel tree files:"
+            find .sukisu-official/kernel -maxdepth 3 -type f | sort | tee debug/official-kernel-files.txt
 
-            mkdir -p debug/sukisu-before-sync debug/sukisu-after-sync
-
-            sync_official_file() {
-              local official_src="$1"
-              local local_dst="$2"
-
-              if [ ! -f ".sukisu-official/kernel/${official_src}" ]; then
-                echo "[ERROR] Official file missing: kernel/${official_src}"
-                return 1
-              fi
-
-              if [ -f "drivers/kernelsu/${local_dst}" ]; then
-                mkdir -p "debug/sukisu-before-sync/$(dirname "${local_dst}")"
-                cp "drivers/kernelsu/${local_dst}" "debug/sukisu-before-sync/${local_dst}"
-              fi
-
-              mkdir -p "drivers/kernelsu/$(dirname "${local_dst}")"
-              cp ".sukisu-official/kernel/${official_src}" "drivers/kernelsu/${local_dst}"
-
-              mkdir -p "debug/sukisu-after-sync/$(dirname "${local_dst}")"
-              cp "drivers/kernelsu/${local_dst}" "debug/sukisu-after-sync/${local_dst}"
-
-              echo "[OK] Synced official kernel/${official_src} -> drivers/kernelsu/${local_dst}"
-            }
-
-            # runtime/ksud.c was renamed upstream to runtime/ksud_integration.c on current main.
-            # Use official upstream content, mapped to legacy path expected by this kernel tree.
-            if [ -f ".sukisu-official/kernel/runtime/ksud.c" ]; then
-              sync_official_file "runtime/ksud.c" "runtime/ksud.c"
-            elif [ -f ".sukisu-official/kernel/runtime/ksud_integration.c" ]; then
-              echo "[INFO] Official kernel/runtime/ksud.c not found; using official runtime/ksud_integration.c for legacy runtime/ksud.c"
-              sync_official_file "runtime/ksud_integration.c" "runtime/ksud.c"
-            else
-              echo "[ERROR] Neither official runtime/ksud.c nor runtime/ksud_integration.c exists"
-              echo "[ERROR] Refusing to continue; no official runtime ksud source is available"
-              exit 1
+            if [ -d "drivers/kernelsu" ]; then
+              rm -rf debug/sukisu-before-sync
+              mkdir -p debug/sukisu-before-sync
+              rsync -a drivers/kernelsu/ debug/sukisu-before-sync/
             fi
 
-            sync_official_file "sulog/event.c" "sulog/event.c"
-            sync_official_file "sulog/event.h" "sulog/event.h"
+            rm -rf drivers/kernelsu
+            mkdir -p drivers/kernelsu
+            rsync -a .sukisu-official/kernel/ drivers/kernelsu/
 
-            # These are optional across upstream layouts. Sync only if official files exist.
-            if [ -f ".sukisu-official/kernel/feature/selinux_hide.c" ]; then
-              sync_official_file "feature/selinux_hide.c" "feature/selinux_hide.c"
-            else
-              echo "[INFO] Official feature/selinux_hide.c not present on this ref; skipping"
-            fi
+            rm -rf debug/sukisu-after-sync
+            mkdir -p debug/sukisu-after-sync
+            rsync -a drivers/kernelsu/ debug/sukisu-after-sync/
 
-            if [ -f ".sukisu-official/kernel/feature/selinux_hide.h" ]; then
-              sync_official_file "feature/selinux_hide.h" "feature/selinux_hide.h"
-            else
-              echo "[INFO] Official feature/selinux_hide.h not present on this ref; skipping"
-            fi
+            echo "[INFO] Verify official coherent files"
+            test -f drivers/kernelsu/ksu.c
+            test -f drivers/kernelsu/Kconfig
+            test -f drivers/kernelsu/Kbuild
+            test -f drivers/kernelsu/feature/sucompat.c
+            test -f drivers/kernelsu/feature/sucompat.h
+            test -f drivers/kernelsu/sulog/event.c
+            test -f drivers/kernelsu/sulog/event.h
 
-            echo "[INFO] Strict official verification"
+            echo "[INFO] Runtime files after full sync:"
+            find drivers/kernelsu/runtime -maxdepth 1 -type f -print | sort | tee debug/sukisu-runtime-files-after-sync.txt || true
 
-            grep -R "ksu_selinux_hide_handle_post_fs_data" -n drivers/kernelsu/feature drivers/kernelsu/runtime \
-              | tee debug/official-selinux-postfs.txt
+            echo "[INFO] sucompat/sulog API context after full sync:"
+            grep -n "ksu_sulog_capture_sucompat" drivers/kernelsu/feature/sucompat.c drivers/kernelsu/sulog/event.h drivers/kernelsu/sulog/event.c \
+              | tee debug/sukisu-sucompat-sulog-context.txt || true
 
-            grep -R "ksu_selinux_hide_handle_second_stage" -n drivers/kernelsu/feature drivers/kernelsu/runtime \
-              | tee debug/official-selinux-second-stage.txt
+            echo "[INFO] selinux hide context after full sync:"
+            grep -R "ksu_selinux_hide_handle_post_fs_data\|ksu_selinux_hide_handle_second_stage" -n drivers/kernelsu \
+              | tee debug/sukisu-selinux-hide-context.txt || true
 
-            grep -n "USER_ARG_NULL\|ksu_sulog_capture" drivers/kernelsu/sulog/event.c \
-              | tee debug/official-sulog-context.txt || true
+            echo "[OK] Full official SukiSU-Ultra kernel tree synced"
+          } 2>&1 | tee logs/sync-official-sukisu-kernel-tree.log
 
-            echo "[OK] Official SukiSU-Ultra source sync completed"
-
-          } 2>&1 | tee logs/sync-official-sukisu-fixes.log
-          
       - name: Force SukiSU manual hook mode and remove KPROBES dependency
         shell: bash
         run: |
@@ -207,6 +174,7 @@ jobs:
             echo "[INFO] Kconfig path: ${KCONFIG_PATH}"
             cp "${KCONFIG_PATH}" debug/kconfig-before-force-manual-hook.txt
 
+            # Manual-hook-only: remove KPROBES dependency from CONFIG_KSU if official builtin Kconfig still has it.
             perl -0pi -e 's/(config KSU\b(?:(?!\nconfig ).)*?\n[ \t]*depends on )[ \t]*KPROBES[ \t]*&&[ \t]*EXT4_FS/${1}EXT4_FS/s' "${KCONFIG_PATH}"
             perl -0pi -e 's/(config KSU\b(?:(?!\nconfig ).)*?\n)[ \t]*depends on[ \t]+KPROBES[ \t]*\n/${1}/s' "${KCONFIG_PATH}"
 
@@ -568,7 +536,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-v6-official-zips-${{ github.run_number }}
+          name: sukisu-ultra-v7-official-zips-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -635,7 +603,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-v6-full-build-log-${{ github.run_number }}
+          name: sukisu-ultra-v7-full-build-log-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -649,7 +617,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-v6-official-debug-${{ github.run_number }}
+          name: sukisu-ultra-v7-official-debug-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -661,7 +629,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-v6-raw-output-${{ github.run_number }}
+          name: sukisu-ultra-v7-raw-output-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
