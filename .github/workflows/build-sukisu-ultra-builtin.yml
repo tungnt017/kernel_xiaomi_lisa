@@ -1,4 +1,4 @@
-name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks
+name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks Only
 
 on:
   workflow_dispatch:
@@ -11,16 +11,16 @@ on:
         description: "Build jobs, auto = nproc"
         required: true
         default: "auto"
-      release_tag:
-        description: "GitHub Release tag name, empty = auto run number"
-        required: false
-        default: ""
       kallsyms_all:
         description: "Force CONFIG_KALLSYMS_ALL=y (set to 1 to enable)"
         required: false
         default: "1"
       disable_susfs:
         description: "Disable SUSFS in SukiSU-Ultra builtin branch (set to 1 to disable)"
+        required: false
+        default: "1"
+      disable_kprobes:
+        description: "Manual-hook-only build: disable CONFIG_KPROBES (set to 1 to disable)"
         required: false
         default: "1"
       sanitize_polly:
@@ -39,7 +39,7 @@ env:
 
 jobs:
   build:
-    name: Build SukiSU-Ultra builtin kernel
+    name: Build SukiSU-Ultra builtin manual-hook-only kernel
     runs-on: ubuntu-22.04
 
     steps:
@@ -82,6 +82,64 @@ jobs:
             echo "[INFO] SukiSU Kconfig files:"
             find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
           } 2>&1 | tee logs/setup-sukisu.log
+
+      - name: Force SukiSU manual hook mode and remove KPROBES dependency
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
+          {
+            echo "[INFO] Force SukiSU manual hook mode"
+
+            KCONFIG_PATH=""
+            for p in \
+              "drivers/kernelsu/Kconfig" \
+              "KernelSU/kernel/Kconfig" \
+              "kernel/Kconfig"
+            do
+              if [ -f "$p" ] && grep -q "^config KSU" "$p"; then
+                KCONFIG_PATH="$p"
+                break
+              fi
+            done
+
+            if [ -z "$KCONFIG_PATH" ]; then
+              echo "[ERROR] Cannot find SukiSU Kconfig"
+              find . -name "Kconfig" | sort | tee debug/kconfig-list.txt
+              exit 1
+            fi
+
+            echo "[INFO] Kconfig path: ${KCONFIG_PATH}"
+            cp "${KCONFIG_PATH}" debug/kconfig-before-force-manual-hook.txt
+
+            # Manual-hook-only: KSU must not depend on KPROBES, otherwise CONFIG_KSU is dropped when CONFIG_KPROBES=n.
+            perl -0pi -e 's/(config KSU\b(?:(?!\nconfig ).)*?\n[ \t]*depends on )[ \t]*KPROBES[ \t]*&&[ \t]*EXT4_FS/${1}EXT4_FS/s' "${KCONFIG_PATH}"
+            perl -0pi -e 's/(config KSU\b(?:(?!\nconfig ).)*?\n)[ \t]*depends on[ \t]+KPROBES[ \t]*\n/${1}/s' "${KCONFIG_PATH}"
+
+            # Add CONFIG_KSU_MANUAL_HOOK if builtin Kconfig does not expose it.
+            if grep -q "^config KSU_MANUAL_HOOK$" "${KCONFIG_PATH}"; then
+              echo "[OK] config KSU_MANUAL_HOOK already exists"
+            else
+              perl -0pi -e '
+                if ($_ !~ /^config KSU_MANUAL_HOOK$/m) {
+                  if (s/(config KSU_DEBUG\b.*?\n(?=config\s))/\1\nconfig KSU_MANUAL_HOOK\n\tbool "Use manual hook"\n\tdepends on KSU\n\tdefault n\n\thelp\n\t  Enable SukiSU-Ultra manual hook mode.\n\n/s) {
+                  } elsif (s/(config KSU\b.*?\n(?=config\s))/\1\nconfig KSU_MANUAL_HOOK\n\tbool "Use manual hook"\n\tdepends on KSU\n\tdefault n\n\thelp\n\t  Enable SukiSU-Ultra manual hook mode.\n\n/s) {
+                  } else {
+                    die "Cannot find insertion point for KSU_MANUAL_HOOK\n";
+                  }
+                }
+              ' "${KCONFIG_PATH}"
+              echo "[OK] Injected config KSU_MANUAL_HOOK"
+            fi
+
+            cp "${KCONFIG_PATH}" debug/kconfig-after-force-manual-hook.txt
+
+            echo "[INFO] KSU block:"
+            grep -A25 -n "^config KSU$" "${KCONFIG_PATH}" | tee debug/kconfig-ksu-block.txt || true
+            echo "[INFO] KSU_MANUAL_HOOK block:"
+            grep -A10 -n "^config KSU_MANUAL_HOOK$" "${KCONFIG_PATH}" | tee debug/kconfig-manual-hook-block.txt || true
+          } 2>&1 | tee logs/force-manual-hook-kconfig.log
 
       - name: Disable SukiSU-Ultra SUSFS default in Kconfig
         if: ${{ github.event.inputs.disable_susfs == '1' }}
@@ -171,8 +229,7 @@ jobs:
             python3 "$HOOK_SCRIPT" "${DEFCONFIG}"
           } 2>&1 | tee logs/apply-manual-hooks.log
 
-      - name: Force disable SUSFS in defconfig
-        if: ${{ github.event.inputs.disable_susfs == '1' }}
+      - name: Force defconfig for manual hook only and disable SUSFS/KPROBES
         shell: bash
         run: |
           set -e
@@ -198,23 +255,65 @@ jobs:
 
             echo "[INFO] Defconfig path: ${DEFCONFIG_PATH}"
             echo "${DEFCONFIG_PATH}" > debug/defconfig-path.txt
-            cp "$DEFCONFIG_PATH" debug/defconfig-before-disable-susfs.txt
+            cp "$DEFCONFIG_PATH" debug/defconfig-before-force-manual-only.txt
 
+            # Remove stale SukiSU/SUSFS/hook/KPROBES states.
+            sed -i '/^CONFIG_KSU=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_MANUAL_HOOK=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_MANUAL_HOOK is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_TRACEPOINT_HOOK=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_TRACEPOINT_HOOK is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_KPROBE_HOOKS=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_KPROBE_HOOKS is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_KPROBES_HOOK=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_KPROBES_HOOK is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_KPROBES_HOOKS=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_KPROBES_HOOKS is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_WITH_KPROBES=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_WITH_KPROBES is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KPROBES=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KPROBES is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KPROBE_EVENTS=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KPROBE_EVENTS is not set/d' "$DEFCONFIG_PATH"
             sed -i '/^CONFIG_KSU_SUSFS=/d' "$DEFCONFIG_PATH"
             sed -i '/^# CONFIG_KSU_SUSFS is not set/d' "$DEFCONFIG_PATH"
             sed -i '/^CONFIG_KSU_SUSFS_/d' "$DEFCONFIG_PATH"
             sed -i '/^# CONFIG_KSU_SUSFS_.* is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KALLSYMS=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KALLSYMS is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KALLSYMS_ALL=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KALLSYMS_ALL is not set/d' "$DEFCONFIG_PATH"
 
             {
               echo ""
-              echo "# SukiSU-Ultra: force disable SUSFS"
-              echo "# CONFIG_KSU_SUSFS is not set"
+              echo "# SukiSU-Ultra: builtin manual hook only"
+              echo "CONFIG_KSU=y"
+              echo "CONFIG_KSU_MANUAL_HOOK=y"
+              echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+              echo "# CONFIG_KSU_KPROBE_HOOKS is not set"
+              echo "# CONFIG_KSU_KPROBES_HOOK is not set"
+              echo "# CONFIG_KSU_KPROBES_HOOKS is not set"
+              echo "# CONFIG_KSU_WITH_KPROBES is not set"
+              if [ "${{ github.event.inputs.disable_kprobes }}" = "1" ]; then
+                echo "# CONFIG_KPROBES is not set"
+                echo "# CONFIG_KPROBE_EVENTS is not set"
+              fi
+              echo "CONFIG_KALLSYMS=y"
+              if [ "${{ github.event.inputs.kallsyms_all }}" = "1" ]; then
+                echo "CONFIG_KALLSYMS_ALL=y"
+              else
+                echo "# CONFIG_KALLSYMS_ALL is not set"
+              fi
+              if [ "${{ github.event.inputs.disable_susfs }}" = "1" ]; then
+                echo "# CONFIG_KSU_SUSFS is not set"
+              fi
             } >> "$DEFCONFIG_PATH"
 
-            cp "$DEFCONFIG_PATH" debug/defconfig-after-disable-susfs.txt
-            echo "[OK] Forced CONFIG_KSU_SUSFS=n in defconfig"
-            tail -60 "$DEFCONFIG_PATH"
-          } 2>&1 | tee logs/disable-susfs-defconfig.log
+            cp "$DEFCONFIG_PATH" debug/defconfig-after-force-manual-only.txt
+            echo "[OK] Forced manual hook only config in defconfig"
+            tail -80 "$DEFCONFIG_PATH"
+          } 2>&1 | tee logs/force-defconfig-manual-only.log
 
       - name: Sanitize unsupported LLVM Polly flags
         if: ${{ github.event.inputs.sanitize_polly == '1' }}
@@ -237,15 +336,13 @@ jobs:
             echo "[INFO] Searching Polly flags in build files"
             grep -RIn --exclude-dir=.git --exclude-dir="${OUT_DIR}" -E "-mllvm|-polly" . | tee debug/polly-flags-before.txt || true
 
-            # Remove common Polly optimization flags from text build files.
-            # This avoids GCC/Clang failures on runners without Polly-enabled LLVM.
             find . \
               -path "./.git" -prune -o \
               -path "./${OUT_DIR}" -prune -o \
               -type f \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" -o -name "*.conf" -o -name "*defconfig" \) \
               -print0 | xargs -0 perl -pi -e '
                 s/\s*-mllvm\s+-polly(?:=[^\s]+)?//g;
-                s/\s*-mllvm\s+-polly-[^\s]+//g;
+                s/\s*-mllvm\s+-polly-[^\s]+(?:=[^\s]+)?//g;
                 s/\s*-polly(?:-[^\s]+)?(?:=[^\s]+)?//g;
               '
 
@@ -280,48 +377,7 @@ jobs:
             cp "${OUT_DIR}/.config" debug/config-after-defconfig.txt
           } 2>&1 | tee logs/generate-config.log
 
-      - name: Verify SUSFS disabled before build
-        if: ${{ github.event.inputs.disable_susfs == '1' }}
-        shell: bash
-        run: |
-          set -e
-          set -o pipefail
-          mkdir -p logs debug
-          {
-            CONFIG_FILE="${OUT_DIR}/.config"
-            if [ ! -f "$CONFIG_FILE" ]; then
-              echo "[ERROR] ${CONFIG_FILE} not found. Run defconfig before this step."
-              exit 1
-            fi
-
-            echo "[INFO] Verify SUSFS status in ${CONFIG_FILE}"
-            grep -nE "CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "$CONFIG_FILE" | tee debug/ksu-config-before-build.txt || true
-
-            if grep -q "^CONFIG_KSU_SUSFS=y" "$CONFIG_FILE"; then
-              echo "[ERROR] CONFIG_KSU_SUSFS is still enabled"
-              grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE" || true
-              exit 1
-            fi
-
-            if grep -q "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"; then
-              echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are still enabled:"
-              grep -n "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"
-              exit 1
-            fi
-
-            if grep -q "^# CONFIG_KSU_SUSFS is not set" "$CONFIG_FILE"; then
-              echo "[OK] CONFIG_KSU_SUSFS is disabled"
-            elif ! grep -q "CONFIG_KSU_SUSFS" "$CONFIG_FILE"; then
-              echo "[OK] CONFIG_KSU_SUSFS absent from .config, treated as disabled"
-            else
-              echo "[ERROR] Unexpected CONFIG_KSU_SUSFS state"
-              grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE"
-              exit 1
-            fi
-            echo "[OK] SUSFS disabled verification passed"
-          } 2>&1 | tee logs/verify-susfs-disabled.log
-
-      - name: Verify SukiSU manual hook before build
+      - name: Verify manual hook only and SUSFS disabled before build
         shell: bash
         run: |
           set -e
@@ -334,9 +390,14 @@ jobs:
               exit 1
             fi
 
-            echo "[INFO] Verify SukiSU hook mode in ${CONFIG_FILE}"
-            grep -nE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "$CONFIG_FILE" \
-              | tee debug/ksu-hook-config-before-build.txt || true
+            echo "[INFO] Verify final SukiSU hook/SUSFS/KPROBES config in ${CONFIG_FILE}"
+            grep -nE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "$CONFIG_FILE" \
+              | tee debug/final-ksu-config-before-build.txt || true
+
+            if ! grep -q "^CONFIG_KSU=y" "$CONFIG_FILE"; then
+              echo "[ERROR] CONFIG_KSU=y not found"
+              exit 1
+            fi
 
             if grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "$CONFIG_FILE"; then
               echo "[OK] CONFIG_KSU_MANUAL_HOOK=y confirmed"
@@ -349,6 +410,48 @@ jobs:
             if grep -q "^CONFIG_KSU_TRACEPOINT_HOOK=y" "$CONFIG_FILE"; then
               echo "[ERROR] CONFIG_KSU_TRACEPOINT_HOOK=y found, expected manual hook only"
               exit 1
+            fi
+
+            if [ "${{ github.event.inputs.disable_kprobes }}" = "1" ]; then
+              if grep -q "^CONFIG_KPROBES=y" "$CONFIG_FILE"; then
+                echo "[ERROR] CONFIG_KPROBES=y found, expected disabled for manual-hook-only build"
+                grep -n "CONFIG_KPROBES" "$CONFIG_FILE" || true
+                exit 1
+              fi
+
+              if grep -q "^# CONFIG_KPROBES is not set" "$CONFIG_FILE"; then
+                echo "[OK] CONFIG_KPROBES is disabled"
+              elif ! grep -q "CONFIG_KPROBES" "$CONFIG_FILE"; then
+                echo "[OK] CONFIG_KPROBES absent, treated as disabled"
+              else
+                echo "[ERROR] Unexpected CONFIG_KPROBES state"
+                grep -n "CONFIG_KPROBES" "$CONFIG_FILE"
+                exit 1
+              fi
+            fi
+
+            if [ "${{ github.event.inputs.disable_susfs }}" = "1" ]; then
+              if grep -q "^CONFIG_KSU_SUSFS=y" "$CONFIG_FILE"; then
+                echo "[ERROR] CONFIG_KSU_SUSFS is still enabled"
+                grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE" || true
+                exit 1
+              fi
+
+              if grep -q "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"; then
+                echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are still enabled:"
+                grep -n "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"
+                exit 1
+              fi
+
+              if grep -q "^# CONFIG_KSU_SUSFS is not set" "$CONFIG_FILE"; then
+                echo "[OK] CONFIG_KSU_SUSFS is disabled"
+              elif ! grep -q "CONFIG_KSU_SUSFS" "$CONFIG_FILE"; then
+                echo "[OK] CONFIG_KSU_SUSFS absent from .config, treated as disabled"
+              else
+                echo "[ERROR] Unexpected CONFIG_KSU_SUSFS state"
+                grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE"
+                exit 1
+              fi
             fi
 
             echo "[INFO] Verify manual hook source patches"
@@ -370,8 +473,8 @@ jobs:
               exit 1
             fi
 
-            echo "[OK] Manual hook config and source verification passed"
-          } 2>&1 | tee logs/verify-manual-hook.log
+            echo "[OK] Manual-hook-only verification passed"
+          } 2>&1 | tee logs/verify-manual-hook-only.log
 
       - name: Create debug file 1 - source tree and SukiSU state
         if: always()
@@ -389,8 +492,8 @@ jobs:
             echo "===== SukiSU Kconfig files ====="
             find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
             echo
-            echo "===== KSU_SUSFS in source ====="
-            grep -R "KSU_SUSFS" -n drivers/kernelsu KernelSU kernel 2>/dev/null || true
+            echo "===== KSU/SUSFS/KPROBES in source ====="
+            grep -R "KSU_SUSFS\|KSU_MANUAL_HOOK\|KPROBES" -n drivers/kernelsu KernelSU kernel 2>/dev/null || true
           } > debug/01-tree-and-sukisu-state.txt
 
       - name: Create debug file 2 - Kconfig and .config state
@@ -406,20 +509,20 @@ jobs:
             echo "===== Defconfig path ====="
             cat debug/defconfig-path.txt 2>/dev/null || true
             echo
+            echo "===== KSU Kconfig after force manual hook ====="
+            cat debug/kconfig-after-force-manual-hook.txt 2>/dev/null || true
+            echo
             echo "===== SUSFS Kconfig before ====="
             cat debug/susfs-kconfig-before.txt 2>/dev/null || true
             echo
             echo "===== SUSFS Kconfig after ====="
             cat debug/susfs-kconfig-after.txt 2>/dev/null || true
             echo
-            echo "===== KSU config before build ====="
-            cat debug/ksu-config-before-build.txt 2>/dev/null || true
+            echo "===== Final KSU config before build ====="
+            cat debug/final-ksu-config-before-build.txt 2>/dev/null || true
             echo
-            echo "===== KSU manual hook config before build ====="
-            cat debug/ksu-hook-config-before-build.txt 2>/dev/null || true
-            echo
-            echo "===== Raw .config KSU/SUSFS lines ====="
-            grep -nE "SUSFS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_KPROBES" "${OUT_DIR}/.config" 2>/dev/null || true
+            echo "===== Raw .config KSU/SUSFS/KPROBES lines ====="
+            grep -nE "SUSFS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS" "${OUT_DIR}/.config" 2>/dev/null || true
           } > debug/02-kconfig-and-config-state.txt
 
       - name: Build kernel
@@ -454,8 +557,8 @@ jobs:
           echo "[INFO] clang version:" | tee -a logs/build.log
           clang --version | tee -a logs/build.log
 
-          echo "[INFO] Final SukiSU hook/SUSFS config before build:" | tee -a logs/build.log
-          grep -nE "CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "${OUT_DIR}/.config" \
+          echo "[INFO] Final SukiSU hook/SUSFS/KPROBES config before build:" | tee -a logs/build.log
+          grep -nE "CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "${OUT_DIR}/.config" \
             | tee -a logs/build.log || true
 
           if grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "${OUT_DIR}/.config"; then
@@ -465,16 +568,27 @@ jobs:
             exit 1
           fi
 
-          if grep -q "^CONFIG_KSU_SUSFS=y" "${OUT_DIR}/.config"; then
-            echo "[ERROR] CONFIG_KSU_SUSFS is enabled before build" | tee -a logs/build.log
-            exit 1
+          if [ "${{ github.event.inputs.disable_kprobes }}" = "1" ]; then
+            if grep -q "^CONFIG_KPROBES=y" "${OUT_DIR}/.config"; then
+              echo "[ERROR] CONFIG_KPROBES=y found, expected disabled" | tee -a logs/build.log
+              exit 1
+            else
+              echo "[OK] CONFIG_KPROBES is disabled; manual hook only" | tee -a logs/build.log
+            fi
           fi
-          if grep -q "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config"; then
-            echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are enabled before build" | tee -a logs/build.log
-            grep -n "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config" | tee -a logs/build.log
-            exit 1
+
+          if [ "${{ github.event.inputs.disable_susfs }}" = "1" ]; then
+            if grep -q "^CONFIG_KSU_SUSFS=y" "${OUT_DIR}/.config"; then
+              echo "[ERROR] CONFIG_KSU_SUSFS is enabled before build" | tee -a logs/build.log
+              exit 1
+            fi
+            if grep -q "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config"; then
+              echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are enabled before build" | tee -a logs/build.log
+              grep -n "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config" | tee -a logs/build.log
+              exit 1
+            fi
+            echo "[OK] SUSFS is disabled before build" | tee -a logs/build.log
           fi
-          echo "[OK] SUSFS is disabled before build" | tee -a logs/build.log
 
           echo "[INFO] Manual hook source markers:" | tee -a logs/build.log
           grep -n "ksu_handle_execveat" fs/exec.c | tee -a logs/build.log || true
@@ -507,7 +621,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-debug-${{ github.run_number }}
+          name: sukisu-ultra-manual-only-debug-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -532,6 +646,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-kernel-${{ github.run_number }}
+          name: sukisu-ultra-manual-only-kernel-${{ github.run_number }}
           if-no-files-found: warn
           path: artifacts/**
