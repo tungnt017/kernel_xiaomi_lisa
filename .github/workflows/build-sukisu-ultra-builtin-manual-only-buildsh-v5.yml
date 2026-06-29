@@ -1,4 +1,4 @@
-name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks Only
+name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks Only Official
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "Build jobs, auto = nproc"
         required: true
         default: "auto"
+      sukisu_official_ref:
+        description: "Official SukiSU-Ultra ref used to sync official fix files"
+        required: false
+        default: "main"
       kallsyms_all:
         description: "Force CONFIG_KALLSYMS_ALL=y (set to 1 to enable)"
         required: false
@@ -39,7 +43,7 @@ env:
 
 jobs:
   build:
-    name: Build SukiSU-Ultra builtin manual-hook-only kernel
+    name: Build SukiSU-Ultra builtin manual-hook-only kernel official
     runs-on: ubuntu-22.04
 
     steps:
@@ -59,7 +63,7 @@ jobs:
             libelf-dev libncurses5-dev libncurses-dev lld llvm clang python3 zip unzip \
             dwarves pahole jq \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
-          mkdir -p logs debug "${OUT_DIR}" artifacts
+          mkdir -p logs debug artifacts "${OUT_DIR}"
           {
             echo "[INFO] Toolchain versions"
             clang --version || true
@@ -79,7 +83,67 @@ jobs:
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
             echo "[INFO] SukiSU paths after setup:"
             find . -maxdepth 5 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print || true
+            echo "[INFO] SukiSU Kconfig files:"
+            find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
           } 2>&1 | tee logs/setup-sukisu.log
+
+      - name: Sync official SukiSU-Ultra fix files only
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
+          {
+            echo "[INFO] Sync official SukiSU-Ultra source files only"
+            echo "[INFO] No stubs, no weak symbols, no no-op, no local bypass patches"
+
+            OFFICIAL_REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"
+            OFFICIAL_REF="${{ github.event.inputs.sukisu_official_ref }}"
+
+            rm -rf .sukisu-official
+            git clone --depth=1 --branch "${OFFICIAL_REF}" "${OFFICIAL_REPO}" .sukisu-official
+
+            if [ ! -d "drivers/kernelsu" ]; then
+              echo "[ERROR] drivers/kernelsu not found after setup.sh builtin"
+              exit 1
+            fi
+
+            echo "[INFO] Official ref:"
+            git -C .sukisu-official rev-parse HEAD | tee debug/sukisu-official-ref.txt
+
+            mkdir -p debug/sukisu-before-sync debug/sukisu-after-sync
+            for f in \
+              "runtime/ksud.c" \
+              "sulog/event.c" \
+              "sulog/event.h" \
+              "feature/selinux_hide.c" \
+              "feature/selinux_hide.h"
+            do
+              if [ -f "drivers/kernelsu/$f" ]; then
+                mkdir -p "debug/sukisu-before-sync/$(dirname "$f")"
+                cp "drivers/kernelsu/$f" "debug/sukisu-before-sync/$f"
+              fi
+
+              if [ ! -f ".sukisu-official/kernel/$f" ]; then
+                echo "[ERROR] Official file missing: kernel/$f"
+                echo "[ERROR] Refusing to continue because official fix file is unavailable"
+                exit 1
+              fi
+
+              mkdir -p "drivers/kernelsu/$(dirname "$f")"
+              cp ".sukisu-official/kernel/$f" "drivers/kernelsu/$f"
+              mkdir -p "debug/sukisu-after-sync/$(dirname "$f")"
+              cp "drivers/kernelsu/$f" "debug/sukisu-after-sync/$f"
+              echo "[OK] Synced official kernel/$f -> drivers/kernelsu/$f"
+            done
+
+            echo "[INFO] Strict official verification"
+            grep -R "ksu_selinux_hide_handle_post_fs_data" -n drivers/kernelsu/feature drivers/kernelsu/runtime | tee debug/official-selinux-postfs.txt
+            grep -R "ksu_selinux_hide_handle_second_stage" -n drivers/kernelsu/feature drivers/kernelsu/runtime | tee debug/official-selinux-second-stage.txt
+            grep -n "USER_ARG_NULL\|ksu_sulog_capture" drivers/kernelsu/sulog/event.c | tee debug/official-sulog-context.txt || true
+
+            echo "[OK] Official SukiSU-Ultra source sync completed"
+          } 2>&1 | tee logs/sync-official-sukisu-fixes.log
 
       - name: Force SukiSU manual hook mode and remove KPROBES dependency
         shell: bash
@@ -121,6 +185,7 @@ jobs:
               ' "${KCONFIG_PATH}"
               echo "[OK] Injected config KSU_MANUAL_HOOK"
             fi
+
             cp "${KCONFIG_PATH}" debug/kconfig-after-force-manual-hook.txt
             grep -A25 -n "^config KSU$" "${KCONFIG_PATH}" | tee debug/kconfig-ksu-block.txt || true
             grep -A10 -n "^config KSU_MANUAL_HOOK$" "${KCONFIG_PATH}" | tee debug/kconfig-manual-hook-block.txt || true
@@ -349,9 +414,10 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug artifacts
+          : > logs/build.log
 
           if [ ! -f "build.sh" ]; then
-            echo "[ERROR] build.sh not found in kernel tree root: $(pwd)" | tee logs/build.log
+            echo "[ERROR] build.sh not found in kernel tree root: $(pwd)" | tee -a logs/build.log
             find . -maxdepth 3 -type f -name "build.sh" | sort | tee debug/build-sh-search.txt || true
             exit 1
           fi
@@ -420,27 +486,42 @@ jobs:
 
             echo "[INFO] Running ./build.sh"
             ./build.sh
-          } 2>&1 | tee logs/build.log
+          } 2>&1 | tee -a logs/build.log
+
+      - name: Collect full build log into debug
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p logs debug artifacts
+          {
+            echo "[INFO] Preserve full build log for artifact debugging"
+            if [ -f logs/build.log ]; then
+              cp -v logs/build.log debug/full-build.log
+              gzip -9 -c logs/build.log > debug/full-build.log.gz
+              split -b 45M -d -a 3 logs/build.log debug/full-build.log.part- || true
+              wc -l logs/build.log | tee debug/full-build-log-line-count.txt
+              ls -lah debug/full-build.log* || true
+            else
+              echo "[WARN] logs/build.log not found"
+            fi
+          } 2>&1 | tee logs/collect-full-build-log.log
 
       - name: Collect zip outputs
         if: always()
         shell: bash
         run: |
-          mkdir -p artifacts debug
+          mkdir -p artifacts debug logs
           {
             echo "[INFO] Searching zip outputs"
             find . -type f -name "*.zip" \
               -not -path "./.git/*" \
               -not -path "./artifacts/*" \
               -print | sort | tee debug/zip-list.txt
-
             while IFS= read -r z; do
               [ -f "$z" ] || continue
               base="$(basename "$z")"
               cp -v "$z" "artifacts/${base}"
             done < debug/zip-list.txt
-
-            echo "[INFO] Artifacts directory:"
             ls -lah artifacts || true
           } 2>&1 | tee logs/collect-zips.log
 
@@ -448,7 +529,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-manual-only-zips-${{ github.run_number }}
+          name: sukisu-ultra-v6-official-zips-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -501,8 +582,8 @@ jobs:
             echo "===== Error-like lines from logs ====="
             grep -RniE "error:|undefined reference|implicit declaration|incompatible type|No rule to make target|fatal:|FAILED|Error [0-9]+|unrecognized command-line option" logs 2>/dev/null || true
             echo
-            echo "===== Last 300 lines of build.log ====="
-            tail -300 logs/build.log 2>/dev/null || true
+            echo "===== Last 500 lines of build.log ====="
+            tail -500 logs/build.log 2>/dev/null || true
             echo
             echo "===== Zip outputs ====="
             cat debug/zip-list.txt 2>/dev/null || true
@@ -511,26 +592,37 @@ jobs:
             find "${OUT_DIR}" arch/arm64/boot artifacts -maxdepth 5 -type f \( -name "Image" -o -name "Image.gz" -o -name "*.dtb" -o -name "*.dtbo" -o -name "*.ko" -o -name "*.zip" \) 2>/dev/null | sort | head -300 || true
           } > debug/03-errors-and-build-summary.txt
 
+      - name: Upload full build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-ultra-v6-full-build-log-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            logs/build.log
+            debug/full-build.log
+            debug/full-build.log.gz
+            debug/full-build.log.part-*
+            debug/full-build-log-line-count.txt
+
       - name: Upload debug logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-manual-only-debug-${{ github.run_number }}
+          name: sukisu-ultra-v6-official-debug-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
             logs/**
-            debug/01-tree-and-sukisu-state.txt
-            debug/02-kconfig-and-config-state.txt
-            debug/03-errors-and-build-summary.txt
-            debug/*.txt
+            debug/**
             out/.config
 
       - name: Upload raw kernel outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sukisu-ultra-manual-only-raw-output-${{ github.run_number }}
+          name: sukisu-ultra-v6-raw-output-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
           path: |
