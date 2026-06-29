@@ -112,29 +112,29 @@ jobs:
             # Chỉ đổi trong menu "KernelSU - SUSFS" block
             # Khi parent=n, toàn bộ KSU_SUSFS_* subconfigs tự =n do depends on KSU_SUSFS
             python3 - <<'PYEOF'
-import re, sys
-
-kconfig = "${KCONFIG_PATH}"
-
-with open(kconfig) as f:
-    data = f.read()
-
-# Tìm config KSU_SUSFS block và đổi "default y" đầu tiên của nó thành "default n"
-# Pattern: từ "config KSU_SUSFS" đến dòng trống kế tiếp (end of block)
-pat = re.compile(
-    r'(config KSU_SUSFS\b.*?)(\n\tdefault )y(\b)',
-    re.S
-)
-
-new_data, count = pat.subn(r'\1\2n\3', data, count=1)
-
-if count == 0:
-    print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
-else:
-    with open(kconfig, 'w') as f:
-        f.write(new_data)
-    print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
-PYEOF
+            import re, sys
+            
+            kconfig = "${KCONFIG_PATH}"
+            
+            with open(kconfig) as f:
+                data = f.read()
+            
+            # Tìm config KSU_SUSFS block và đổi "default y" đầu tiên của nó thành "default n"
+            # Pattern: từ "config KSU_SUSFS" đến dòng trống kế tiếp (end of block)
+            pat = re.compile(
+                r'(config KSU_SUSFS\b.*?)(\n\tdefault )y(\b)',
+                re.S
+            )
+            
+            new_data, count = pat.subn(r'\1\2n\3', data, count=1)
+            
+            if count == 0:
+                print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
+            else:
+                with open(kconfig, 'w') as f:
+                    f.write(new_data)
+                print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
+            PYEOF
 
             echo "[INFO] After:"
             grep -n "default" "${KCONFIG_PATH}" | head -20
@@ -344,10 +344,10 @@ PYEOF
 
           cat >> "${DEFCONFIG_PATH}" <<EOF
 
-# SukiSU-Ultra symbol export requirement
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=${KALLSYMS_ALL_VAL}
-EOF
+          # SukiSU-Ultra symbol export requirement
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=${KALLSYMS_ALL_VAL}
+          EOF
 
           echo "Updated ${DEFCONFIG_PATH}:"
           grep -n "CONFIG_KALLSYMS\|CONFIG_KSU" "${DEFCONFIG_PATH}" || true
