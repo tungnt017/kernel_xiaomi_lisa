@@ -18,9 +18,13 @@ on:
       kallsyms_all:
         description: "Force CONFIG_KALLSYMS_ALL=y (set to 1 to enable)"
         required: false
-        default: "0"
+        default: "1"
       disable_susfs:
         description: "Disable SUSFS in SukiSU-Ultra builtin branch (set to 1 to disable)"
+        required: false
+        default: "1"
+      sanitize_polly:
+        description: "Strip unsupported LLVM Polly flags if current clang does not support them"
         required: false
         default: "1"
 
@@ -52,9 +56,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex git kmod libssl-dev \
-            libelf-dev libncurses5-dev libncurses-dev lld llvm python3 zip \
-            dwarves pahole jq
+            libelf-dev libncurses5-dev libncurses-dev lld llvm clang python3 zip \
+            dwarves pahole jq \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
           mkdir -p logs debug "${OUT_DIR}"
+          {
+            echo "[INFO] Toolchain versions"
+            clang --version || true
+            ld.lld --version || true
+            aarch64-linux-gnu-gcc --version | head -1 || true
+            arm-linux-gnueabi-gcc --version | head -1 || true
+          } 2>&1 | tee logs/toolchain.log
 
       - name: Setup SukiSU-Ultra builtin
         shell: bash
@@ -67,6 +79,7 @@ jobs:
             curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
             echo "[INFO] SukiSU paths after setup:"
             find . -maxdepth 5 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print || true
+            echo "[INFO] SukiSU Kconfig files:"
             find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
           } 2>&1 | tee logs/setup-sukisu.log
 
@@ -105,12 +118,7 @@ jobs:
             grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-before.txt || true
 
             BEFORE_HASH="$(sha256sum "${KCONFIG_PATH}" | awk '{print $1}')"
-
-            # Patch only the parent config KSU_SUSFS block:
-            #   config KSU_SUSFS ... default y  ->  default n
-            # No python -c and no heredoc are used here, so there is no PYEOF or IndentationError issue.
             perl -0pi -e 's/(config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+)y\b/${1}n/s' "${KCONFIG_PATH}"
-
             AFTER_HASH="$(sha256sum "${KCONFIG_PATH}" | awk '{print $1}')"
 
             echo "[INFO] After patch:"
@@ -134,7 +142,6 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
-
           {
             echo "[INFO] Looking for apply_sukisu_ultra_manual_hooks.py"
 
@@ -152,11 +159,9 @@ jobs:
             done
 
             if [ -z "$HOOK_SCRIPT" ]; then
-              echo "[WARN] apply_sukisu_ultra_manual_hooks.py not found."
-              echo "[WARN] Skipping manual hooks step."
-              echo "[WARN] If your kernel requires manual hooks, commit the script to repository root or .github/scripts/."
-              find . -maxdepth 4 -type f -name "*sukisu*hook*.py" -o -name "*manual*hook*.py" | sort | tee debug/manual-hook-script-search.txt || true
-              exit 0
+              echo "[ERROR] apply_sukisu_ultra_manual_hooks.py not found. Manual hook workflow requires this script."
+              find . -maxdepth 5 -type f \( -name "*sukisu*hook*.py" -o -name "*manual*hook*.py" \) | sort | tee debug/manual-hook-script-search.txt || true
+              exit 1
             fi
 
             echo "[INFO] Hook script: ${HOOK_SCRIPT}"
@@ -208,8 +213,45 @@ jobs:
 
             cp "$DEFCONFIG_PATH" debug/defconfig-after-disable-susfs.txt
             echo "[OK] Forced CONFIG_KSU_SUSFS=n in defconfig"
-            tail -40 "$DEFCONFIG_PATH"
+            tail -60 "$DEFCONFIG_PATH"
           } 2>&1 | tee logs/disable-susfs-defconfig.log
+
+      - name: Sanitize unsupported LLVM Polly flags
+        if: ${{ github.event.inputs.sanitize_polly == '1' }}
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
+          {
+            echo "[INFO] Checking whether current clang supports LLVM Polly flags"
+            echo 'int main(void){return 0;}' > /tmp/polly-test.c
+            if clang -Werror -mllvm -polly -x c -c /tmp/polly-test.c -o /tmp/polly-test.o >/tmp/polly-test.log 2>&1; then
+              echo "[OK] clang accepts -mllvm -polly; no flag sanitization needed"
+              cat /tmp/polly-test.log || true
+              exit 0
+            fi
+
+            echo "[WARN] clang does not accept -mllvm -polly on this runner"
+            cat /tmp/polly-test.log || true
+            echo "[INFO] Searching Polly flags in build files"
+            grep -RIn --exclude-dir=.git --exclude-dir="${OUT_DIR}" -E "-mllvm|-polly" . | tee debug/polly-flags-before.txt || true
+
+            # Remove common Polly optimization flags from text build files.
+            # This avoids GCC/Clang failures on runners without Polly-enabled LLVM.
+            find . \
+              -path "./.git" -prune -o \
+              -path "./${OUT_DIR}" -prune -o \
+              -type f \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" -o -name "*.conf" -o -name "*defconfig" \) \
+              -print0 | xargs -0 perl -pi -e '
+                s/\s*-mllvm\s+-polly(?:=[^\s]+)?//g;
+                s/\s*-mllvm\s+-polly-[^\s]+//g;
+                s/\s*-polly(?:-[^\s]+)?(?:=[^\s]+)?//g;
+              '
+
+            echo "[INFO] Polly flags after sanitization:"
+            grep -RIn --exclude-dir=.git --exclude-dir="${OUT_DIR}" -E "-mllvm|-polly" . | tee debug/polly-flags-after.txt || true
+          } 2>&1 | tee logs/sanitize-polly.log
 
       - name: Generate kernel config
         shell: bash
@@ -219,7 +261,22 @@ jobs:
           mkdir -p logs debug "${OUT_DIR}"
           {
             echo "[INFO] Generate .config from ${DEFCONFIG}"
-            make O="${OUT_DIR}" "${DEFCONFIG}"
+            MAKE_ARGS=(
+              O="${OUT_DIR}"
+              ARCH=arm64
+              LLVM=1
+              LLVM_IAS=1
+              CC=clang
+              LD=ld.lld
+              AR=llvm-ar
+              NM=llvm-nm
+              OBJCOPY=llvm-objcopy
+              OBJDUMP=llvm-objdump
+              STRIP=llvm-strip
+              CROSS_COMPILE=aarch64-linux-gnu-
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            )
+            make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
             cp "${OUT_DIR}/.config" debug/config-after-defconfig.txt
           } 2>&1 | tee logs/generate-config.log
 
@@ -264,6 +321,58 @@ jobs:
             echo "[OK] SUSFS disabled verification passed"
           } 2>&1 | tee logs/verify-susfs-disabled.log
 
+      - name: Verify SukiSU manual hook before build
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
+          {
+            CONFIG_FILE="${OUT_DIR}/.config"
+            if [ ! -f "$CONFIG_FILE" ]; then
+              echo "[ERROR] ${CONFIG_FILE} not found"
+              exit 1
+            fi
+
+            echo "[INFO] Verify SukiSU hook mode in ${CONFIG_FILE}"
+            grep -nE "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "$CONFIG_FILE" \
+              | tee debug/ksu-hook-config-before-build.txt || true
+
+            if grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "$CONFIG_FILE"; then
+              echo "[OK] CONFIG_KSU_MANUAL_HOOK=y confirmed"
+            else
+              echo "[ERROR] CONFIG_KSU_MANUAL_HOOK=y not found"
+              grep -nE "CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KSU" "$CONFIG_FILE" || true
+              exit 1
+            fi
+
+            if grep -q "^CONFIG_KSU_TRACEPOINT_HOOK=y" "$CONFIG_FILE"; then
+              echo "[ERROR] CONFIG_KSU_TRACEPOINT_HOOK=y found, expected manual hook only"
+              exit 1
+            fi
+
+            echo "[INFO] Verify manual hook source patches"
+            grep -n "ksu_handle_execveat" fs/exec.c | tee debug/source-hook-exec.txt || true
+            grep -n "ksu_handle_faccessat" fs/open.c | tee debug/source-hook-open.txt || true
+            grep -n "ksu_handle_stat" fs/stat.c | tee debug/source-hook-stat.txt || true
+            grep -n "ksu_handle_sys_reboot" kernel/reboot.c | tee debug/source-hook-reboot.txt || true
+
+            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+              echo "[ERROR] fs/exec.c manual hook was not found"
+              exit 1
+            fi
+            if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+              echo "[ERROR] fs/open.c manual hook was not found"
+              exit 1
+            fi
+            if ! grep -q "ksu_handle_stat" fs/stat.c; then
+              echo "[ERROR] fs/stat.c manual hook was not found"
+              exit 1
+            fi
+
+            echo "[OK] Manual hook config and source verification passed"
+          } 2>&1 | tee logs/verify-manual-hook.log
+
       - name: Create debug file 1 - source tree and SukiSU state
         if: always()
         shell: bash
@@ -306,8 +415,11 @@ jobs:
             echo "===== KSU config before build ====="
             cat debug/ksu-config-before-build.txt 2>/dev/null || true
             echo
-            echo "===== Raw .config SUSFS lines ====="
-            grep -nE "SUSFS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS" "${OUT_DIR}/.config" 2>/dev/null || true
+            echo "===== KSU manual hook config before build ====="
+            cat debug/ksu-hook-config-before-build.txt 2>/dev/null || true
+            echo
+            echo "===== Raw .config KSU/SUSFS lines ====="
+            grep -nE "SUSFS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_KPROBES" "${OUT_DIR}/.config" 2>/dev/null || true
           } > debug/02-kconfig-and-config-state.txt
 
       - name: Build kernel
@@ -321,8 +433,56 @@ jobs:
           else
             JOBS="${{ github.event.inputs.jobs }}"
           fi
+
+          MAKE_ARGS=(
+            O="${OUT_DIR}"
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+
           echo "[INFO] Starting compilation with jobs=${JOBS}" | tee logs/build.log
-          make O="${OUT_DIR}" -j"${JOBS}" 2>&1 | tee -a logs/build.log
+          echo "[INFO] clang version:" | tee -a logs/build.log
+          clang --version | tee -a logs/build.log
+
+          echo "[INFO] Final SukiSU hook/SUSFS config before build:" | tee -a logs/build.log
+          grep -nE "CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "${OUT_DIR}/.config" \
+            | tee -a logs/build.log || true
+
+          if grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "${OUT_DIR}/.config"; then
+            echo "[OK] Build is using SukiSU manual hook: CONFIG_KSU_MANUAL_HOOK=y" | tee -a logs/build.log
+          else
+            echo "[ERROR] Build is NOT using SukiSU manual hook" | tee -a logs/build.log
+            exit 1
+          fi
+
+          if grep -q "^CONFIG_KSU_SUSFS=y" "${OUT_DIR}/.config"; then
+            echo "[ERROR] CONFIG_KSU_SUSFS is enabled before build" | tee -a logs/build.log
+            exit 1
+          fi
+          if grep -q "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config"; then
+            echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are enabled before build" | tee -a logs/build.log
+            grep -n "^CONFIG_KSU_SUSFS_" "${OUT_DIR}/.config" | tee -a logs/build.log
+            exit 1
+          fi
+          echo "[OK] SUSFS is disabled before build" | tee -a logs/build.log
+
+          echo "[INFO] Manual hook source markers:" | tee -a logs/build.log
+          grep -n "ksu_handle_execveat" fs/exec.c | tee -a logs/build.log || true
+          grep -n "ksu_handle_faccessat" fs/open.c | tee -a logs/build.log || true
+          grep -n "ksu_handle_stat" fs/stat.c | tee -a logs/build.log || true
+          grep -n "ksu_handle_sys_reboot" kernel/reboot.c | tee -a logs/build.log || true
+
+          make "${MAKE_ARGS[@]}" -j"${JOBS}" 2>&1 | tee -a logs/build.log
 
       - name: Create debug file 3 - errors and build summary
         if: always()
@@ -334,7 +494,7 @@ jobs:
             echo "Date: $(date -u)"
             echo
             echo "===== Error-like lines from logs ====="
-            grep -RniE "error:|undefined reference|implicit declaration|incompatible type|No rule to make target|fatal:|FAILED|Error [0-9]+" logs 2>/dev/null || true
+            grep -RniE "error:|undefined reference|implicit declaration|incompatible type|No rule to make target|fatal:|FAILED|Error [0-9]+|unrecognized command-line option" logs 2>/dev/null || true
             echo
             echo "===== Last 300 lines of build.log ====="
             tail -300 logs/build.log 2>/dev/null || true
