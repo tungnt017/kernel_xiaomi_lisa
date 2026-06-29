@@ -1,0 +1,509 @@
+name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lisa_defconfig"
+      jobs:
+        description: "Build jobs"
+        required: true
+        default: "auto"
+      release_tag:
+        description: "GitHub Release tag name, empty = auto run number"
+        required: false
+        default: ""
+      kallsyms_all:
+        description: "Force CONFIG_KALLSYMS_ALL=y (set to 1 to enable)"
+        required: false
+        default: "0"
+      disable_susfs:
+        description: "Disable SUSFS in builtin branch (set to 1 to disable)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SukiSU-Ultra builtin kernel
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      OUT_DIR: out
+      DEFCONFIG: ${{ github.event.inputs.defconfig }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          sudo apt update
+          sudo apt install -y \
+            git curl wget zip unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libyaml-dev \
+            python3 python-is-python3 \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            cpio rsync file gzip
+
+      - name: Prepare logs directory
+        run: |
+          mkdir -p logs
+
+      # -------------------------------------------------------
+      # Clone SukiSU-Ultra builtin branch
+      # Replaces: curl ReSukiSU/ReSukiSU setup.sh
+      # Uses:     SukiSU-Ultra/SukiSU-Ultra builtin branch
+      # -------------------------------------------------------
+      - name: Add SukiSU-Ultra source (builtin branch)
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s builtin 2>&1 | tee logs/sukisu-setup.log
+
+          echo "[INFO] SukiSU-Ultra builtin branch integrated"
+          echo "[INFO] drivers/kernelsu -> KernelSU/kernel/"
+          ls -la drivers/kernelsu 2>/dev/null || ls -la KernelSU/kernel/ | head -5
+
+      # -------------------------------------------------------
+      # Disable SUSFS in Kconfig (builtin branch default y → n)
+      # Runs before hook script so defconfig is clean
+      # -------------------------------------------------------
+      - name: Disable SUSFS in SukiSU-Ultra Kconfig
+        if: ${{ github.event.inputs.disable_susfs == '1' }}
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            KCONFIG_PATH=""
+
+            if [ -f "drivers/kernelsu/Kconfig" ]; then
+              KCONFIG_PATH="drivers/kernelsu/Kconfig"
+            elif [ -f "KernelSU/kernel/Kconfig" ]; then
+              KCONFIG_PATH="KernelSU/kernel/Kconfig"
+            else
+              echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
+              find . -name "Kconfig" -path "*/kernelsu/*" | head -5
+              exit 1
+            fi
+
+            echo "[INFO] Kconfig: ${KCONFIG_PATH}"
+            echo "[INFO] Before:"
+            grep -n "default" "${KCONFIG_PATH}" | head -20
+
+            # Đổi default y → default n cho CONFIG_KSU_SUSFS (parent)
+            # Chỉ đổi trong menu "KernelSU - SUSFS" block
+            # Khi parent=n, toàn bộ KSU_SUSFS_* subconfigs tự =n do depends on KSU_SUSFS
+            python3 - <<'PYEOF'
+import re, sys
+
+kconfig = "${KCONFIG_PATH}"
+
+with open(kconfig) as f:
+    data = f.read()
+
+# Tìm config KSU_SUSFS block và đổi "default y" đầu tiên của nó thành "default n"
+# Pattern: từ "config KSU_SUSFS" đến dòng trống kế tiếp (end of block)
+pat = re.compile(
+    r'(config KSU_SUSFS\b.*?)(\n\tdefault )y(\b)',
+    re.S
+)
+
+new_data, count = pat.subn(r'\1\2n\3', data, count=1)
+
+if count == 0:
+    print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
+else:
+    with open(kconfig, 'w') as f:
+        f.write(new_data)
+    print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
+PYEOF
+
+            echo "[INFO] After:"
+            grep -n "default" "${KCONFIG_PATH}" | head -20
+
+            # Verify
+            if grep -A5 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default n"; then
+              echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
+            else
+              echo "[WARN] Could not confirm default n — check Kconfig manually"
+            fi
+
+          } 2>&1 | tee logs/disable-susfs.log
+
+      # -------------------------------------------------------
+      # Apply manual hooks (SukiSU-Ultra edition)
+      # Uses apply_sukisu_ultra_manual_hooks.py (no newfstat_ret / fstat64_ret)
+      # -------------------------------------------------------
+      - name: Apply SukiSU-Ultra manual hooks
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          SUKISU_KALLSYMS_ALL="${{ github.event.inputs.kallsyms_all }}" \
+            python3 .github/scripts/apply_sukisu_ultra_manual_hooks.py "${DEFCONFIG}" \
+            2>&1 | tee logs/apply-hooks.log
+
+      # -------------------------------------------------------
+      # Diff check — SukiSU-Ultra edition
+      # Removed: ksu_handle_newfstat_ret, ksu_handle_fstat64_ret
+      # Added:   statx check (kernel ≥ 4.11)
+      # -------------------------------------------------------
+      - name: Verify SukiSU-Ultra manual hook diff
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            echo "===== git diff -- manual hook files ====="
+            git diff -- \
+              fs/exec.c \
+              fs/stat.c \
+              fs/open.c \
+              kernel/reboot.c \
+              security/selinux/selinuxfs.c || true
+
+            echo
+            echo "===== Verify required SukiSU-Ultra hook markers ====="
+
+            FAIL=0
+
+            check_marker() {
+              local file="$1"
+              local marker="$2"
+              local label="$3"
+
+              if [ ! -f "$file" ]; then
+                echo "[MISS] ${label}: file not found: ${file}"
+                FAIL=1
+                return 0
+              fi
+
+              if grep -Fq "$marker" "$file"; then
+                echo "[OK]   ${label}"
+              else
+                echo "[MISS] ${label}: '${marker}' not found in ${file}"
+                FAIL=1
+              fi
+            }
+
+            check_regex() {
+              local file="$1"
+              local pattern="$2"
+              local label="$3"
+
+              if [ ! -f "$file" ]; then
+                echo "[MISS] ${label}: file not found: ${file}"
+                FAIL=1
+                return 0
+              fi
+
+              if grep -Eq "$pattern" "$file"; then
+                echo "[OK]   ${label}"
+              else
+                echo "[MISS] ${label}: pattern '${pattern}' not found in ${file}"
+                FAIL=1
+              fi
+            }
+
+            # ---- Required hooks (always present in SukiSU-Ultra builtin) ----
+
+            check_marker fs/exec.c \
+              "ksu_handle_execveat" \
+              "execve/execveat hook (fs/exec.c)"
+
+            check_marker fs/stat.c \
+              "ksu_handle_stat" \
+              "stat path hook (fs/stat.c)"
+
+            check_marker fs/open.c \
+              "ksu_handle_faccessat" \
+              "faccessat hook (fs/open.c)"
+
+            check_marker kernel/reboot.c \
+              "ksu_handle_sys_reboot" \
+              "reboot hook (kernel/reboot.c)"
+
+            # ---- SELinux exports (conditional on file existence) ----
+
+            if [ -f security/selinux/selinuxfs.c ]; then
+              check_regex security/selinux/selinuxfs.c \
+                "EXPORT_SYMBOL(_GPL)?[[:space:]]*\([[:space:]]*write_op[[:space:]]*\)" \
+                "SELinux write_op export"
+
+              check_regex security/selinux/selinuxfs.c \
+                "EXPORT_SYMBOL(_GPL)?[[:space:]]*\([[:space:]]*sel_handle_status_ops[[:space:]]*\)" \
+                "SELinux status ops export"
+            else
+              echo "[WARN] security/selinux/selinuxfs.c not found, skip SELinux export checks"
+            fi
+
+            # ---- Conditional stat hooks ----
+
+            # fstatat64 32-bit compat (present in lisa 5.4)
+            if grep -Fq "SYSCALL_DEFINE4(fstatat64" fs/stat.c; then
+              check_marker fs/stat.c \
+                "ksu_handle_stat(&dfd, &filename, &flag);" \
+                "fstatat64 stat hook (fs/stat.c)"
+            else
+              echo "[SKIP] fstatat64 syscall not present in this kernel tree"
+            fi
+
+            # statx (kernel ≥ 4.11, present in lisa 5.4)
+            if grep -Fq "SYSCALL_DEFINE5(statx" fs/stat.c; then
+              check_marker fs/stat.c \
+                "ksu_handle_stat(&dfd, &filename, &flags);" \
+                "statx stat hook (fs/stat.c)"
+            else
+              echo "[SKIP] statx syscall not present in this kernel tree"
+            fi
+
+            # NOTE: ksu_handle_newfstat_ret and ksu_handle_fstat64_ret are
+            # intentionally NOT checked — these are ReSukiSU-specific hooks
+            # not present in SukiSU-Ultra builtin.
+
+            # ---- SUSFS config check (when disable_susfs=1) ----
+
+            if [ "${{ github.event.inputs.disable_susfs }}" = "1" ]; then
+              echo
+              echo "===== Verify SUSFS disabled in Kconfig ====="
+
+              KCONFIG_PATH=""
+              if [ -f "drivers/kernelsu/Kconfig" ]; then
+                KCONFIG_PATH="drivers/kernelsu/Kconfig"
+              elif [ -f "KernelSU/kernel/Kconfig" ]; then
+                KCONFIG_PATH="KernelSU/kernel/Kconfig"
+              fi
+
+              if [ -n "${KCONFIG_PATH}" ]; then
+                if grep -A5 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default n"; then
+                  echo "[OK]   CONFIG_KSU_SUSFS default n in ${KCONFIG_PATH}"
+                else
+                  echo "[MISS] CONFIG_KSU_SUSFS is NOT default n in ${KCONFIG_PATH}"
+                  FAIL=1
+                fi
+              else
+                echo "[WARN] Kconfig not found, skip SUSFS check"
+              fi
+            fi
+
+            echo
+            if [ "$FAIL" -ne 0 ]; then
+              echo "[ERROR] SukiSU-Ultra manual hook diff/marker check FAILED. Missing required hook(s)."
+              exit 1
+            fi
+
+            echo "[DONE] SukiSU-Ultra manual hook diff/marker check passed"
+          } 2>&1 | tee logs/hook-diff-check.log
+
+      - name: Force SukiSU-Ultra required config
+        run: |
+          set -e
+
+          DEFCONFIG_PATH=""
+
+          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+          else
+            echo "ERROR: defconfig not found: ${DEFCONFIG}"
+            exit 1
+          fi
+
+          # Remove any stale KALLSYMS lines (apply_sukisu script already wrote them,
+          # but this step ensures clean state after any re-run)
+          sed -i '/CONFIG_KALLSYMS=/d' "${DEFCONFIG_PATH}"
+          sed -i '/CONFIG_KALLSYMS_ALL=/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS is not set/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS_ALL is not set/d' "${DEFCONFIG_PATH}"
+
+          KALLSYMS_ALL_VAL="n"
+          if [ "${{ github.event.inputs.kallsyms_all }}" = "1" ]; then
+            KALLSYMS_ALL_VAL="y"
+          fi
+
+          cat >> "${DEFCONFIG_PATH}" <<EOF
+
+# SukiSU-Ultra symbol export requirement
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=${KALLSYMS_ALL_VAL}
+EOF
+
+          echo "Updated ${DEFCONFIG_PATH}:"
+          grep -n "CONFIG_KALLSYMS\|CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+
+      - name: Show SukiSU-Ultra config
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            DEFCONFIG_PATH=""
+
+            if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+            elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+            else
+              echo "ERROR: defconfig not found: ${DEFCONFIG}"
+              find arch/arm64/configs -name "*defconfig" | sort
+              exit 1
+            fi
+
+            echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
+            echo ""
+            echo "=== KSU configs ==="
+            grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+            echo ""
+            echo "=== KALLSYMS configs ==="
+            grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
+            echo ""
+            echo "=== SUSFS configs ==="
+            grep -n "CONFIG_KSU_SUSFS\|SUSFS" "${DEFCONFIG_PATH}" || true
+
+          } 2>&1 | tee logs/config.log
+
+      - name: Build kernel using build.sh
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          chmod +x build.sh
+
+          if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
+            export JOBS="$(nproc --all)"
+          else
+            export JOBS="${{ github.event.inputs.jobs }}"
+          fi
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export OUT_DIR="${OUT_DIR}"
+          export DEFCONFIG="${DEFCONFIG}"
+
+          {
+            echo "ARCH=${ARCH}"
+            echo "SUBARCH=${SUBARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "JOBS=${JOBS}"
+            echo "GITHUB_SHA=${GITHUB_SHA}"
+            echo "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}"
+          } | tee logs/build-env.log
+
+          bash build.sh 2>&1 | tee logs/build.log
+
+      - name: Collect flashable zip
+        if: always()
+        run: |
+          set -e
+          set -o pipefail
+
+          mkdir -p artifacts/zips
+          mkdir -p logs
+
+          {
+            echo "Searching for flashable zip from build.sh..."
+
+            mapfile -t ZIP_FILES < <(
+              find . -type f -name "*.zip" \
+                ! -path "./.git/*" \
+                ! -path "./artifacts/*" \
+                ! -path "./KernelSU/*" \
+                | sort
+            )
+
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "WARNING: No zip found."
+              echo "Available zip files:"
+              find . -type f -name "*.zip" || true
+            else
+              echo "Found zip(s):"
+              printf '%s\n' "${ZIP_FILES[@]}"
+
+              for zipfile in "${ZIP_FILES[@]}"; do
+                cp -v "${zipfile}" artifacts/zips/
+              done
+            fi
+
+            echo "Artifacts ready:"
+            find artifacts -type f -print || true
+          } 2>&1 | tee logs/collect.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-sukisu-ultra-build-logs-${{ github.run_number }}
+          path: logs/**
+          if-no-files-found: warn
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-kernel-sukisu-ultra-builtin-${{ github.run_number }}
+          path: artifacts/**
+          if-no-files-found: warn
+
+      - name: Upload zip to GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -e
+          set -o pipefail
+
+          if [ -z "${INPUT_RELEASE_TAG}" ]; then
+            RELEASE_TAG="sukisu-ultra-lisa-${{ github.run_number }}"
+          else
+            RELEASE_TAG="${INPUT_RELEASE_TAG}"
+          fi
+
+          RELEASE_NAME="Lisa Kernel SukiSU-Ultra Builtin - ${RELEASE_TAG}"
+
+          echo "Release tag: ${RELEASE_TAG}"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release exists"
+          else
+            echo "Creating release..."
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes "SukiSU-Ultra builtin manual hook AnyKernel3 build for Xiaomi lisa (SM7325, kernel 5.4)."
+          fi
+
+          ZIPS="$(find artifacts/zips -type f -name "*.zip" | sort)"
+
+          if [ -z "${ZIPS}" ]; then
+            echo "ERROR: no zip found to upload"
+            exit 1
+          fi
+
+          echo "Uploading:"
+          echo "${ZIPS}"
+
+          gh release upload "${RELEASE_TAG}" ${ZIPS} --clobber
