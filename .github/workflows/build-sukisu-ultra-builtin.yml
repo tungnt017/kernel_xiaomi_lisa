@@ -8,7 +8,7 @@ on:
         required: true
         default: "lisa_defconfig"
       jobs:
-        description: "Build jobs"
+        description: "Build jobs, auto = nproc"
         required: true
         default: "auto"
       release_tag:
@@ -20,23 +20,23 @@ on:
         required: false
         default: "0"
       disable_susfs:
-        description: "Disable SUSFS in builtin branch (set to 1 to disable)"
+        description: "Disable SUSFS in SukiSU-Ultra builtin branch (set to 1 to disable)"
         required: false
         default: "1"
 
 permissions:
   contents: write
 
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  OUT_DIR: out
+  DEFCONFIG: ${{ github.event.inputs.defconfig }}
+
 jobs:
   build:
     name: Build SukiSU-Ultra builtin kernel
     runs-on: ubuntu-22.04
-
-    env:
-      ARCH: arm64
-      SUBARCH: arm64
-      OUT_DIR: out
-      DEFCONFIG: ${{ github.event.inputs.defconfig }}
 
     steps:
       - name: Checkout kernel source
@@ -44,459 +44,338 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install build dependencies
-        run: |
-          set -e
-
-          sudo apt update
-          sudo apt install -y \
-            git curl wget zip unzip \
-            build-essential bc bison flex \
-            libssl-dev libelf-dev libyaml-dev \
-            python3 python-is-python3 \
-            clang lld llvm \
-            gcc-aarch64-linux-gnu \
-            cpio rsync file gzip
-
-      - name: Prepare logs directory
-        run: |
-          mkdir -p logs
-
-      # -------------------------------------------------------
-      # Clone SukiSU-Ultra builtin branch
-      # Replaces: curl ReSukiSU/ReSukiSU setup.sh
-      # Uses:     SukiSU-Ultra/SukiSU-Ultra builtin branch
-      # -------------------------------------------------------
-      - name: Add SukiSU-Ultra source (builtin branch)
+      - name: Prepare build environment
+        shell: bash
         run: |
           set -e
           set -o pipefail
-          mkdir -p logs
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git kmod libssl-dev \
+            libelf-dev libncurses5-dev libncurses-dev lld llvm python3 zip \
+            dwarves pahole jq
+          mkdir -p logs debug "${OUT_DIR}"
 
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s builtin 2>&1 | tee logs/sukisu-setup.log
+      - name: Setup SukiSU-Ultra builtin
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
 
-          echo "[INFO] SukiSU-Ultra builtin branch integrated"
-          echo "[INFO] drivers/kernelsu -> KernelSU/kernel/"
-          ls -la drivers/kernelsu 2>/dev/null || ls -la KernelSU/kernel/ | head -5
+          {
+            echo "[INFO] Setup SukiSU-Ultra builtin"
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
 
-      - name: Disable SUSFS by default
+            echo "[INFO] SukiSU paths after setup:"
+            find . -maxdepth 4 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print || true
+            find . -maxdepth 5 -type f -path "*kernelsu*Kconfig" -print || true
+          } 2>&1 | tee logs/setup-sukisu.log
+
+      - name: Disable SukiSU-Ultra SUSFS default in Kconfig
         if: ${{ github.event.inputs.disable_susfs == '1' }}
         shell: bash
         run: |
           set -e
           set -o pipefail
-          mkdir -p logs
-      
-          {
-          KCONFIG_PATH=""
-    
-          if [ -f "drivers/kernelsu/Kconfig" ]; then
-            KCONFIG_PATH="drivers/kernelsu/Kconfig"
-          elif [ -f "KernelSU/kernel/Kconfig" ]; then
-            KCONFIG_PATH="KernelSU/kernel/Kconfig"
-          else
-            echo "[ERROR] Cannot find SukiSU-Ultra Kconfig"
-            find . -name "Kconfig" -path "*/kernelsu/*" | head -5 || true
-            exit 1
-          fi
-    
-          echo "[INFO] Kconfig: ${KCONFIG_PATH}"
-          echo "[INFO] Before:"
-          grep -n "default" "${KCONFIG_PATH}" | head -20 || true
-    
-          python3 -c '
-          import re
-          import sys
-          
-          kconfig = sys.argv[1]
-          
-          with open(kconfig, "r", encoding="utf-8") as f:
-              data = f.read()
-          
-          pat = re.compile(
-              r"(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)",
-              re.S
-          )
-          
-          new_data, count = pat.subn(r"\1\2n\3", data, count=1)
-          
-          if count == 0:
-              print("[WARN] config KSU_SUSFS default y not found — may already be n or format differs")
-          else:
-              with open(kconfig, "w", encoding="utf-8") as f:
-                  f.write(new_data)
-              print(f"[OK] Changed CONFIG_KSU_SUSFS default y -> default n in {kconfig}")
-          ' "${KCONFIG_PATH}"
-
-              echo "[INFO] After:"
-              grep -n "default" "${KCONFIG_PATH}" | head -20 || true
-        
-              if grep -A8 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
-                echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
-              else
-                echo "[WARN] Could not confirm default n — check Kconfig manually"
-                grep -A12 "^config KSU_SUSFS$" "${KCONFIG_PATH}" || true
-              fi
-        
-            } 2>&1 | tee logs/disable-susfs.log
-
-      # -------------------------------------------------------
-      # Apply manual hooks (SukiSU-Ultra edition)
-      # Uses apply_sukisu_ultra_manual_hooks.py (no newfstat_ret / fstat64_ret)
-      # -------------------------------------------------------
-      - name: Apply SukiSU-Ultra manual hooks
-        run: |
-          set -e
-          set -o pipefail
-          mkdir -p logs
-
-          SUKISU_KALLSYMS_ALL="${{ github.event.inputs.kallsyms_all }}" \
-            python3 .github/scripts/apply_sukisu_ultra_manual_hooks.py "${DEFCONFIG}" \
-            2>&1 | tee logs/apply-hooks.log
-
-      # -------------------------------------------------------
-      # Diff check — SukiSU-Ultra edition
-      # Removed: ksu_handle_newfstat_ret, ksu_handle_fstat64_ret
-      # Added:   statx check (kernel ≥ 4.11)
-      # -------------------------------------------------------
-      - name: Verify SukiSU-Ultra manual hook diff
-        run: |
-          set -e
-          set -o pipefail
-          mkdir -p logs
+          mkdir -p logs debug
 
           {
-            echo "===== git diff -- manual hook files ====="
-            git diff -- \
-              fs/exec.c \
-              fs/stat.c \
-              fs/open.c \
-              kernel/reboot.c \
-              security/selinux/selinuxfs.c || true
+            echo "[INFO] Disable SUSFS default in SukiSU-Ultra Kconfig"
 
-            echo
-            echo "===== Verify required SukiSU-Ultra hook markers ====="
-
-            FAIL=0
-
-            check_marker() {
-              local file="$1"
-              local marker="$2"
-              local label="$3"
-
-              if [ ! -f "$file" ]; then
-                echo "[MISS] ${label}: file not found: ${file}"
-                FAIL=1
-                return 0
+            KCONFIG_PATH=""
+            for p in \
+              "drivers/kernelsu/Kconfig" \
+              "KernelSU/kernel/Kconfig" \
+              "kernel/Kconfig"
+            do
+              if [ -f "$p" ] && grep -q "config KSU_SUSFS" "$p"; then
+                KCONFIG_PATH="$p"
+                break
               fi
+            done
 
-              if grep -Fq "$marker" "$file"; then
-                echo "[OK]   ${label}"
-              else
-                echo "[MISS] ${label}: '${marker}' not found in ${file}"
-                FAIL=1
-              fi
-            }
-
-            check_regex() {
-              local file="$1"
-              local pattern="$2"
-              local label="$3"
-
-              if [ ! -f "$file" ]; then
-                echo "[MISS] ${label}: file not found: ${file}"
-                FAIL=1
-                return 0
-              fi
-
-              if grep -Eq "$pattern" "$file"; then
-                echo "[OK]   ${label}"
-              else
-                echo "[MISS] ${label}: pattern '${pattern}' not found in ${file}"
-                FAIL=1
-              fi
-            }
-
-            # ---- Required hooks (always present in SukiSU-Ultra builtin) ----
-
-            check_marker fs/exec.c \
-              "ksu_handle_execveat" \
-              "execve/execveat hook (fs/exec.c)"
-
-            check_marker fs/stat.c \
-              "ksu_handle_stat" \
-              "stat path hook (fs/stat.c)"
-
-            check_marker fs/open.c \
-              "ksu_handle_faccessat" \
-              "faccessat hook (fs/open.c)"
-
-            check_marker kernel/reboot.c \
-              "ksu_handle_sys_reboot" \
-              "reboot hook (kernel/reboot.c)"
-
-            # ---- SELinux exports (conditional on file existence) ----
-
-            if [ -f security/selinux/selinuxfs.c ]; then
-              check_regex security/selinux/selinuxfs.c \
-                "EXPORT_SYMBOL(_GPL)?[[:space:]]*\([[:space:]]*write_op[[:space:]]*\)" \
-                "SELinux write_op export"
-
-              check_regex security/selinux/selinuxfs.c \
-                "EXPORT_SYMBOL(_GPL)?[[:space:]]*\([[:space:]]*sel_handle_status_ops[[:space:]]*\)" \
-                "SELinux status ops export"
-            else
-              echo "[WARN] security/selinux/selinuxfs.c not found, skip SELinux export checks"
-            fi
-
-            # ---- Conditional stat hooks ----
-
-            # fstatat64 32-bit compat (present in lisa 5.4)
-            if grep -Fq "SYSCALL_DEFINE4(fstatat64" fs/stat.c; then
-              check_marker fs/stat.c \
-                "ksu_handle_stat(&dfd, &filename, &flag);" \
-                "fstatat64 stat hook (fs/stat.c)"
-            else
-              echo "[SKIP] fstatat64 syscall not present in this kernel tree"
-            fi
-
-            # statx (kernel ≥ 4.11, present in lisa 5.4)
-            if grep -Fq "SYSCALL_DEFINE5(statx" fs/stat.c; then
-              check_marker fs/stat.c \
-                "ksu_handle_stat(&dfd, &filename, &flags);" \
-                "statx stat hook (fs/stat.c)"
-            else
-              echo "[SKIP] statx syscall not present in this kernel tree"
-            fi
-
-            # NOTE: ksu_handle_newfstat_ret and ksu_handle_fstat64_ret are
-            # intentionally NOT checked — these are ReSukiSU-specific hooks
-            # not present in SukiSU-Ultra builtin.
-
-            # ---- SUSFS config check (when disable_susfs=1) ----
-
-            if [ "${{ github.event.inputs.disable_susfs }}" = "1" ]; then
-              echo
-              echo "===== Verify SUSFS disabled in Kconfig ====="
-
-              KCONFIG_PATH=""
-              if [ -f "drivers/kernelsu/Kconfig" ]; then
-                KCONFIG_PATH="drivers/kernelsu/Kconfig"
-              elif [ -f "KernelSU/kernel/Kconfig" ]; then
-                KCONFIG_PATH="KernelSU/kernel/Kconfig"
-              fi
-
-              if [ -n "${KCONFIG_PATH}" ]; then
-                if grep -A5 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default n"; then
-                  echo "[OK]   CONFIG_KSU_SUSFS default n in ${KCONFIG_PATH}"
-                else
-                  echo "[MISS] CONFIG_KSU_SUSFS is NOT default n in ${KCONFIG_PATH}"
-                  FAIL=1
-                fi
-              else
-                echo "[WARN] Kconfig not found, skip SUSFS check"
-              fi
-            fi
-
-            echo
-            if [ "$FAIL" -ne 0 ]; then
-              echo "[ERROR] SukiSU-Ultra manual hook diff/marker check FAILED. Missing required hook(s)."
+            if [ -z "$KCONFIG_PATH" ]; then
+              echo "[ERROR] Cannot find Kconfig containing config KSU_SUSFS"
+              find . -name "Kconfig" | sort | tee debug/kconfig-list.txt
               exit 1
             fi
 
-            echo "[DONE] SukiSU-Ultra manual hook diff/marker check passed"
-          } 2>&1 | tee logs/hook-diff-check.log
+            echo "[INFO] Kconfig path: ${KCONFIG_PATH}"
+            echo "${KCONFIG_PATH}" > debug/susfs-kconfig-path.txt
 
-      - name: Force SukiSU-Ultra required config
-        run: |
-          set -e
+            echo "[INFO] Before patch:"
+            grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-before.txt || true
 
-          DEFCONFIG_PATH=""
+            python3 -c '
+import re
+import sys
+from pathlib import Path
 
-          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
-            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
-          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
-            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
-          else
-            echo "ERROR: defconfig not found: ${DEFCONFIG}"
-            exit 1
-          fi
+kconfig = Path(sys.argv[1])
+data = kconfig.read_text(encoding="utf-8", errors="ignore")
 
-          # Remove any stale KALLSYMS lines (apply_sukisu script already wrote them,
-          # but this step ensures clean state after any re-run)
-          sed -i '/CONFIG_KALLSYMS=/d' "${DEFCONFIG_PATH}"
-          sed -i '/CONFIG_KALLSYMS_ALL=/d' "${DEFCONFIG_PATH}"
-          sed -i '/# CONFIG_KALLSYMS is not set/d' "${DEFCONFIG_PATH}"
-          sed -i '/# CONFIG_KALLSYMS_ALL is not set/d' "${DEFCONFIG_PATH}"
+pat = re.compile(
+    r"(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)",
+    re.S,
+)
+new_data, count = pat.subn(r"\1\2n\3", data, count=1)
 
-          KALLSYMS_ALL_VAL="n"
-          if [ "${{ github.event.inputs.kallsyms_all }}" = "1" ]; then
-            KALLSYMS_ALL_VAL="y"
-          fi
+if count == 0:
+    if re.search(r"config KSU_SUSFS\b.*?\n[ \t]*default[ \t]+n\b", data, re.S):
+        print("[OK] CONFIG_KSU_SUSFS already default n")
+    else:
+        print("[ERROR] CONFIG_KSU_SUSFS default y/default n not found; format may differ")
+        sys.exit(2)
+else:
+    kconfig.write_text(new_data, encoding="utf-8")
+    print(f"[OK] Changed CONFIG_KSU_SUSFS default y -> default n in {kconfig}")
+' "${KCONFIG_PATH}"
 
-          cat >> "${DEFCONFIG_PATH}" <<EOF
+            echo "[INFO] After patch:"
+            grep -A35 -n "^config KSU_SUSFS$" "${KCONFIG_PATH}" | tee debug/susfs-kconfig-after.txt || true
 
-          # SukiSU-Ultra symbol export requirement
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=${KALLSYMS_ALL_VAL}
-          EOF
+            if grep -A35 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
+              echo "[OK] Kconfig patch confirmed: CONFIG_KSU_SUSFS default n"
+            else
+              echo "[ERROR] CONFIG_KSU_SUSFS default n not confirmed"
+              exit 1
+            fi
+          } 2>&1 | tee logs/disable-susfs-kconfig.log
 
-          echo "Updated ${DEFCONFIG_PATH}:"
-          grep -n "CONFIG_KALLSYMS\|CONFIG_KSU" "${DEFCONFIG_PATH}" || true
-
-      - name: Show SukiSU-Ultra config
+      - name: Apply SukiSU-Ultra manual hooks
+        shell: bash
         run: |
           set -e
           set -o pipefail
-          mkdir -p logs
+          mkdir -p logs debug
+
+          {
+            if [ ! -f "apply_sukisu_ultra_manual_hooks.py" ]; then
+              echo "[ERROR] apply_sukisu_ultra_manual_hooks.py not found in repository root"
+              exit 1
+            fi
+
+            export SUKISU_KALLSYMS_ALL="${{ github.event.inputs.kallsyms_all }}"
+            python3 apply_sukisu_ultra_manual_hooks.py "${DEFCONFIG}"
+          } 2>&1 | tee logs/apply-manual-hooks.log
+
+      - name: Force disable SUSFS in defconfig
+        if: ${{ github.event.inputs.disable_susfs == '1' }}
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
 
           {
             DEFCONFIG_PATH=""
+            for p in \
+              "arch/arm64/configs/${DEFCONFIG}" \
+              "arch/arm64/configs/vendor/${DEFCONFIG}"
+            do
+              if [ -f "$p" ]; then
+                DEFCONFIG_PATH="$p"
+                break
+              fi
+            done
 
-            if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
-              DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
-            elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
-              DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
-            else
-              echo "ERROR: defconfig not found: ${DEFCONFIG}"
-              find arch/arm64/configs -name "*defconfig" | sort
+            if [ -z "$DEFCONFIG_PATH" ]; then
+              echo "[ERROR] Defconfig not found: ${DEFCONFIG}"
+              find arch/arm64/configs -name "*defconfig" | sort | tee debug/defconfig-list.txt || true
               exit 1
             fi
 
-            echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
-            echo ""
-            echo "=== KSU configs ==="
-            grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
-            echo ""
-            echo "=== KALLSYMS configs ==="
-            grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
-            echo ""
-            echo "=== SUSFS configs ==="
-            grep -n "CONFIG_KSU_SUSFS\|SUSFS" "${DEFCONFIG_PATH}" || true
+            echo "[INFO] Defconfig path: ${DEFCONFIG_PATH}"
+            echo "${DEFCONFIG_PATH}" > debug/defconfig-path.txt
+            cp "$DEFCONFIG_PATH" debug/defconfig-before-disable-susfs.txt
 
-          } 2>&1 | tee logs/config.log
+            sed -i '/^CONFIG_KSU_SUSFS=/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_SUSFS is not set/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_KSU_SUSFS_/d' "$DEFCONFIG_PATH"
+            sed -i '/^# CONFIG_KSU_SUSFS_.* is not set/d' "$DEFCONFIG_PATH"
 
-      - name: Build kernel using build.sh
+            {
+              echo ""
+              echo "# SukiSU-Ultra: force disable SUSFS"
+              echo "# CONFIG_KSU_SUSFS is not set"
+            } >> "$DEFCONFIG_PATH"
+
+            cp "$DEFCONFIG_PATH" debug/defconfig-after-disable-susfs.txt
+            echo "[OK] Forced CONFIG_KSU_SUSFS=n in defconfig"
+            tail -40 "$DEFCONFIG_PATH"
+          } 2>&1 | tee logs/disable-susfs-defconfig.log
+
+      - name: Generate kernel config
+        shell: bash
         run: |
           set -e
           set -o pipefail
-          mkdir -p logs
-
-          chmod +x build.sh
-
-          if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
-            export JOBS="$(nproc --all)"
-          else
-            export JOBS="${{ github.event.inputs.jobs }}"
-          fi
-
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export OUT_DIR="${OUT_DIR}"
-          export DEFCONFIG="${DEFCONFIG}"
+          mkdir -p logs debug "${OUT_DIR}"
 
           {
-            echo "ARCH=${ARCH}"
-            echo "SUBARCH=${SUBARCH}"
-            echo "OUT_DIR=${OUT_DIR}"
-            echo "DEFCONFIG=${DEFCONFIG}"
-            echo "JOBS=${JOBS}"
-            echo "GITHUB_SHA=${GITHUB_SHA}"
-            echo "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}"
-          } | tee logs/build-env.log
+            echo "[INFO] Generate .config from ${DEFCONFIG}"
+            make O="${OUT_DIR}" "${DEFCONFIG}"
+            cp "${OUT_DIR}/.config" debug/config-after-defconfig.txt
+          } 2>&1 | tee logs/generate-config.log
 
-          bash build.sh 2>&1 | tee logs/build.log
-
-      - name: Collect flashable zip
-        if: always()
+      - name: Verify SUSFS disabled before build
+        if: ${{ github.event.inputs.disable_susfs == '1' }}
+        shell: bash
         run: |
           set -e
           set -o pipefail
-
-          mkdir -p artifacts/zips
-          mkdir -p logs
+          mkdir -p logs debug
 
           {
-            echo "Searching for flashable zip from build.sh..."
+            CONFIG_FILE="${OUT_DIR}/.config"
 
-            mapfile -t ZIP_FILES < <(
-              find . -type f -name "*.zip" \
-                ! -path "./.git/*" \
-                ! -path "./artifacts/*" \
-                ! -path "./KernelSU/*" \
-                | sort
-            )
-
-            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-              echo "WARNING: No zip found."
-              echo "Available zip files:"
-              find . -type f -name "*.zip" || true
-            else
-              echo "Found zip(s):"
-              printf '%s\n' "${ZIP_FILES[@]}"
-
-              for zipfile in "${ZIP_FILES[@]}"; do
-                cp -v "${zipfile}" artifacts/zips/
-              done
+            if [ ! -f "$CONFIG_FILE" ]; then
+              echo "[ERROR] ${CONFIG_FILE} not found. Run defconfig before this step."
+              exit 1
             fi
 
-            echo "Artifacts ready:"
-            find artifacts -type f -print || true
-          } 2>&1 | tee logs/collect.log
+            echo "[INFO] Verify SUSFS status in ${CONFIG_FILE}"
+            grep -nE "CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|SUSFS" "$CONFIG_FILE" | tee debug/ksu-config-before-build.txt || true
 
-      - name: Upload build logs
+            if grep -q "^CONFIG_KSU_SUSFS=y" "$CONFIG_FILE"; then
+              echo "[ERROR] CONFIG_KSU_SUSFS is still enabled"
+              grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE" || true
+              exit 1
+            fi
+
+            if grep -q "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"; then
+              echo "[ERROR] Some CONFIG_KSU_SUSFS_* options are still enabled:"
+              grep -n "^CONFIG_KSU_SUSFS_" "$CONFIG_FILE"
+              exit 1
+            fi
+
+            if grep -q "^# CONFIG_KSU_SUSFS is not set" "$CONFIG_FILE"; then
+              echo "[OK] CONFIG_KSU_SUSFS is disabled"
+            elif ! grep -q "CONFIG_KSU_SUSFS" "$CONFIG_FILE"; then
+              echo "[OK] CONFIG_KSU_SUSFS absent from .config, treated as disabled"
+            else
+              echo "[ERROR] Unexpected CONFIG_KSU_SUSFS state"
+              grep -n "CONFIG_KSU_SUSFS" "$CONFIG_FILE"
+              exit 1
+            fi
+
+            echo "[OK] SUSFS disabled verification passed"
+          } 2>&1 | tee logs/verify-susfs-disabled.log
+
+      - name: Create debug file 1 - source tree and SukiSU state
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lisa-sukisu-ultra-build-logs-${{ github.run_number }}
-          path: logs/**
-          if-no-files-found: warn
+        shell: bash
+        run: |
+          mkdir -p debug
+          {
+            echo "===== DEBUG 1: TREE AND SUKISU STATE ====="
+            echo "Date: $(date -u)"
+            echo "Runner: ${RUNNER_OS:-unknown}"
+            echo "Commit: ${GITHUB_SHA:-unknown}"
+            echo
+            echo "===== SukiSU directories ====="
+            find . -maxdepth 5 -type d \( -iname "kernelsu" -o -iname "KernelSU" \) -print 2>/dev/null || true
+            echo
+            echo "===== SukiSU Kconfig files ====="
+            find . -maxdepth 6 -type f -name "Kconfig" | grep -Ei "ksu|kernelsu|KernelSU" || true
+            echo
+            echo "===== KSU_SUSFS in source ====="
+            grep -R "KSU_SUSFS" -n drivers/kernelsu KernelSU kernel 2>/dev/null || true
+          } > debug/01-tree-and-sukisu-state.txt
 
-      - name: Upload kernel artifacts
+      - name: Create debug file 2 - Kconfig and .config state
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lisa-kernel-sukisu-ultra-builtin-${{ github.run_number }}
-          path: artifacts/**
-          if-no-files-found: warn
+        shell: bash
+        run: |
+          mkdir -p debug
+          {
+            echo "===== DEBUG 2: KCONFIG AND CONFIG STATE ====="
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "OUT_DIR=${OUT_DIR}"
+            echo
+            echo "===== Defconfig path ====="
+            cat debug/defconfig-path.txt 2>/dev/null || true
+            echo
+            echo "===== SUSFS Kconfig before ====="
+            cat debug/susfs-kconfig-before.txt 2>/dev/null || true
+            echo
+            echo "===== SUSFS Kconfig after ====="
+            cat debug/susfs-kconfig-after.txt 2>/dev/null || true
+            echo
+            echo "===== KSU config before build ====="
+            cat debug/ksu-config-before-build.txt 2>/dev/null || true
+            echo
+            echo "===== Raw .config SUSFS lines ====="
+            grep -n "SUSFS\|CONFIG_KSU\|CONFIG_KPM\|CONFIG_KALLSYMS" "${OUT_DIR}/.config" 2>/dev/null || true
+          } > debug/02-kconfig-and-config-state.txt
 
-      - name: Upload zip to GitHub Release
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+      - name: Build kernel
+        shell: bash
         run: |
           set -e
           set -o pipefail
+          mkdir -p logs debug
 
-          if [ -z "${INPUT_RELEASE_TAG}" ]; then
-            RELEASE_TAG="sukisu-ultra-lisa-${{ github.run_number }}"
+          if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
+            JOBS="$(nproc --all)"
           else
-            RELEASE_TAG="${INPUT_RELEASE_TAG}"
+            JOBS="${{ github.event.inputs.jobs }}"
           fi
 
-          RELEASE_NAME="Lisa Kernel SukiSU-Ultra Builtin - ${RELEASE_TAG}"
+          {
+            echo "[INFO] Starting compilation with jobs=${JOBS}"
+            make O="${OUT_DIR}" -j"${JOBS}" 2>&1 | tee logs/build.log
+          }
 
-          echo "Release tag: ${RELEASE_TAG}"
+      - name: Create debug file 3 - errors and build summary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p debug logs
+          {
+            echo "===== DEBUG 3: ERRORS AND BUILD SUMMARY ====="
+            echo "Date: $(date -u)"
+            echo
+            echo "===== Error-like lines from logs ====="
+            grep -RniE "error:|undefined reference|implicit declaration|incompatible type|No rule to make target|fatal:|FAILED|Error [0-9]+" logs 2>/dev/null || true
+            echo
+            echo "===== Last 300 lines of build.log ====="
+            tail -300 logs/build.log 2>/dev/null || true
+            echo
+            echo "===== Output artifacts found ====="
+            find "${OUT_DIR}" arch/arm64/boot -maxdepth 5 -type f \( -name "Image" -o -name "Image.gz" -o -name "*.dtb" -o -name "*.dtbo" -o -name "*.ko" \) 2>/dev/null | sort | head -300 || true
+          } > debug/03-errors-and-build-summary.txt
 
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "Release exists"
-          else
-            echo "Creating release..."
-            gh release create "${RELEASE_TAG}" \
-              --title "${RELEASE_NAME}" \
-              --notes "SukiSU-Ultra builtin manual hook AnyKernel3 build for Xiaomi lisa (SM7325, kernel 5.4)."
-          fi
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-ultra-debug-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            logs/**
+            debug/01-tree-and-sukisu-state.txt
+            debug/02-kconfig-and-config-state.txt
+            debug/03-errors-and-build-summary.txt
+            debug/*.txt
+            out/.config
 
-          ZIPS="$(find artifacts/zips -type f -name "*.zip" | sort)"
+      - name: Package kernel outputs
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p artifacts
+          find "${OUT_DIR}" arch/arm64/boot -maxdepth 5 -type f \( -name "Image" -o -name "Image.gz" -o -name "*.dtb" -o -name "*.dtbo" \) -exec cp -v {} artifacts/ \; 2>/dev/null || true
+          ls -lah artifacts || true
 
-          if [ -z "${ZIPS}" ]; then
-            echo "ERROR: no zip found to upload"
-            exit 1
-          fi
-
-          echo "Uploading:"
-          echo "${ZIPS}"
-
-          gh release upload "${RELEASE_TAG}" ${ZIPS} --clobber
+      - name: Upload kernel outputs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-ultra-kernel-${{ github.run_number }}
+          if-no-files-found: warn
+          path: artifacts/**
