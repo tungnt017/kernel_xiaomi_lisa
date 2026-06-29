@@ -106,39 +106,39 @@ jobs:
             grep -n "default" "${KCONFIG_PATH}" | head -20 || true
       
             python3 - "$KCONFIG_PATH" <<'PYEOF'
-      import re
-      import sys
+            import re
+            import sys
+            
+            kconfig = sys.argv[1]
+            
+            with open(kconfig, "r", encoding="utf-8") as f:
+                data = f.read()
+            
+            pat = re.compile(
+                r'(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)',
+                re.S
+            )
+            
+            new_data, count = pat.subn(r'\1\2n\3', data, count=1)
+            
+            if count == 0:
+                print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
+            else:
+                with open(kconfig, "w", encoding="utf-8") as f:
+                    f.write(new_data)
+                print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
+            PYEOF
       
-      kconfig = sys.argv[1]
+            echo "[INFO] After:"
+            grep -n "default" "${KCONFIG_PATH}" | head -20 || true
       
-      with open(kconfig, "r", encoding="utf-8") as f:
-          data = f.read()
+            if grep -A8 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
+              echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
+            else
+              echo "[WARN] Could not confirm default n — check Kconfig manually"
+            fi
       
-      pat = re.compile(
-          r'(config KSU_SUSFS\b.*?)(\n[ \t]*default[ \t]+)y(\b)',
-          re.S
-      )
-      
-      new_data, count = pat.subn(r'\1\2n\3', data, count=1)
-      
-      if count == 0:
-          print("[WARN] config KSU_SUSFS default y not found in Kconfig — may already be n or format differs")
-      else:
-          with open(kconfig, "w", encoding="utf-8") as f:
-              f.write(new_data)
-          print(f"[OK] Changed CONFIG_KSU_SUSFS default y → default n in {kconfig}")
-      PYEOF
-
-      echo "[INFO] After:"
-      grep -n "default" "${KCONFIG_PATH}" | head -20 || true
-
-      if grep -A8 "^config KSU_SUSFS$" "${KCONFIG_PATH}" | grep -q "default[[:space:]]\+n"; then
-        echo "[OK] CONFIG_KSU_SUSFS default n confirmed"
-      else
-        echo "[WARN] Could not confirm default n — check Kconfig manually"
-      fi
-
-    } 2>&1 | tee logs/disable-susfs.log
+          } 2>&1 | tee logs/disable-susfs.log
 
       # -------------------------------------------------------
       # Apply manual hooks (SukiSU-Ultra edition)
