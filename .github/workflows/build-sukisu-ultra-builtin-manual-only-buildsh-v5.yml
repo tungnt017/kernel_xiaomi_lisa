@@ -93,6 +93,7 @@ jobs:
           set -e
           set -o pipefail
           mkdir -p logs debug
+
           {
             echo "[INFO] Sync official SukiSU-Ultra source files only"
             echo "[INFO] No stubs, no weak symbols, no no-op, no local bypass patches"
@@ -111,40 +112,78 @@ jobs:
             echo "[INFO] Official ref:"
             git -C .sukisu-official rev-parse HEAD | tee debug/sukisu-official-ref.txt
 
+            echo "[INFO] Official runtime files:"
+            find .sukisu-official/kernel/runtime -maxdepth 1 -type f -print | sort | tee debug/official-runtime-files.txt || true
+
             mkdir -p debug/sukisu-before-sync debug/sukisu-after-sync
-            for f in \
-              "runtime/ksud.c" \
-              "sulog/event.c" \
-              "sulog/event.h" \
-              "feature/selinux_hide.c" \
-              "feature/selinux_hide.h"
-            do
-              if [ -f "drivers/kernelsu/$f" ]; then
-                mkdir -p "debug/sukisu-before-sync/$(dirname "$f")"
-                cp "drivers/kernelsu/$f" "debug/sukisu-before-sync/$f"
+
+            sync_official_file() {
+              local official_src="$1"
+              local local_dst="$2"
+
+              if [ ! -f ".sukisu-official/kernel/${official_src}" ]; then
+                echo "[ERROR] Official file missing: kernel/${official_src}"
+                return 1
               fi
 
-              if [ ! -f ".sukisu-official/kernel/$f" ]; then
-                echo "[ERROR] Official file missing: kernel/$f"
-                echo "[ERROR] Refusing to continue because official fix file is unavailable"
-                exit 1
+              if [ -f "drivers/kernelsu/${local_dst}" ]; then
+                mkdir -p "debug/sukisu-before-sync/$(dirname "${local_dst}")"
+                cp "drivers/kernelsu/${local_dst}" "debug/sukisu-before-sync/${local_dst}"
               fi
 
-              mkdir -p "drivers/kernelsu/$(dirname "$f")"
-              cp ".sukisu-official/kernel/$f" "drivers/kernelsu/$f"
-              mkdir -p "debug/sukisu-after-sync/$(dirname "$f")"
-              cp "drivers/kernelsu/$f" "debug/sukisu-after-sync/$f"
-              echo "[OK] Synced official kernel/$f -> drivers/kernelsu/$f"
-            done
+              mkdir -p "drivers/kernelsu/$(dirname "${local_dst}")"
+              cp ".sukisu-official/kernel/${official_src}" "drivers/kernelsu/${local_dst}"
+
+              mkdir -p "debug/sukisu-after-sync/$(dirname "${local_dst}")"
+              cp "drivers/kernelsu/${local_dst}" "debug/sukisu-after-sync/${local_dst}"
+
+              echo "[OK] Synced official kernel/${official_src} -> drivers/kernelsu/${local_dst}"
+            }
+
+            # runtime/ksud.c was renamed upstream to runtime/ksud_integration.c on current main.
+            # Use official upstream content, mapped to legacy path expected by this kernel tree.
+            if [ -f ".sukisu-official/kernel/runtime/ksud.c" ]; then
+              sync_official_file "runtime/ksud.c" "runtime/ksud.c"
+            elif [ -f ".sukisu-official/kernel/runtime/ksud_integration.c" ]; then
+              echo "[INFO] Official kernel/runtime/ksud.c not found; using official runtime/ksud_integration.c for legacy runtime/ksud.c"
+              sync_official_file "runtime/ksud_integration.c" "runtime/ksud.c"
+            else
+              echo "[ERROR] Neither official runtime/ksud.c nor runtime/ksud_integration.c exists"
+              echo "[ERROR] Refusing to continue; no official runtime ksud source is available"
+              exit 1
+            fi
+
+            sync_official_file "sulog/event.c" "sulog/event.c"
+            sync_official_file "sulog/event.h" "sulog/event.h"
+
+            # These are optional across upstream layouts. Sync only if official files exist.
+            if [ -f ".sukisu-official/kernel/feature/selinux_hide.c" ]; then
+              sync_official_file "feature/selinux_hide.c" "feature/selinux_hide.c"
+            else
+              echo "[INFO] Official feature/selinux_hide.c not present on this ref; skipping"
+            fi
+
+            if [ -f ".sukisu-official/kernel/feature/selinux_hide.h" ]; then
+              sync_official_file "feature/selinux_hide.h" "feature/selinux_hide.h"
+            else
+              echo "[INFO] Official feature/selinux_hide.h not present on this ref; skipping"
+            fi
 
             echo "[INFO] Strict official verification"
-            grep -R "ksu_selinux_hide_handle_post_fs_data" -n drivers/kernelsu/feature drivers/kernelsu/runtime | tee debug/official-selinux-postfs.txt
-            grep -R "ksu_selinux_hide_handle_second_stage" -n drivers/kernelsu/feature drivers/kernelsu/runtime | tee debug/official-selinux-second-stage.txt
-            grep -n "USER_ARG_NULL\|ksu_sulog_capture" drivers/kernelsu/sulog/event.c | tee debug/official-sulog-context.txt || true
+
+            grep -R "ksu_selinux_hide_handle_post_fs_data" -n drivers/kernelsu/feature drivers/kernelsu/runtime \
+              | tee debug/official-selinux-postfs.txt
+
+            grep -R "ksu_selinux_hide_handle_second_stage" -n drivers/kernelsu/feature drivers/kernelsu/runtime \
+              | tee debug/official-selinux-second-stage.txt
+
+            grep -n "USER_ARG_NULL\|ksu_sulog_capture" drivers/kernelsu/sulog/event.c \
+              | tee debug/official-sulog-context.txt || true
 
             echo "[OK] Official SukiSU-Ultra source sync completed"
-          } 2>&1 | tee logs/sync-official-sukisu-fixes.log
 
+          } 2>&1 | tee logs/sync-official-sukisu-fixes.log
+          
       - name: Force SukiSU manual hook mode and remove KPROBES dependency
         shell: bash
         run: |
