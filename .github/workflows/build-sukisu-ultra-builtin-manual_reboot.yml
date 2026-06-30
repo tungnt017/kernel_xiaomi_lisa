@@ -294,6 +294,104 @@ jobs:
             python3 "$HOOK_SCRIPT" "${DEFCONFIG}"
           } 2>&1 | tee logs/apply-manual-hooks.log
 
+      - name: Make manual hooks source-aware for reboot hook
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs debug
+
+          {
+            echo "[INFO] Source-aware manual hook cleanup"
+            echo "[INFO] Policy: no stub, no weak symbol, no no-op, no fake implementation"
+            echo "[INFO] If selected SukiSU source does not provide ksu_handle_sys_reboot, remove only the unsupported reboot hook site from kernel/reboot.c"
+
+            REBOOT_C="kernel/reboot.c"
+            if [ ! -f "${REBOOT_C}" ]; then
+              echo "[WARN] ${REBOOT_C} not found; skipping reboot hook source-aware cleanup"
+              exit 0
+            fi
+
+            cp "${REBOOT_C}" debug/reboot-before-source-aware-hook-cleanup.c
+
+            if grep -R "ksu_handle_sys_reboot" -n drivers/kernelsu KernelSU 2>/dev/null | tee debug/source-ksu-handle-sys-reboot.txt; then
+              echo "[OK] Selected SukiSU source provides ksu_handle_sys_reboot; keeping reboot hook"
+              grep -n "ksu_handle_sys_reboot" "${REBOOT_C}" | tee debug/reboot-hook-kept.txt || true
+            else
+              echo "[WARN] Selected SukiSU source does not provide ksu_handle_sys_reboot"
+              echo "[INFO] Removing unsupported reboot hook call/declaration from ${REBOOT_C}"
+
+              python3 <<'PY'
+              from pathlib import Path
+              
+              path = Path("kernel/reboot.c")
+              text = path.read_text(errors="ignore")
+              lines = text.splitlines(keepends=True)
+              
+              # Remove any line that references the unsupported reboot hook symbol.
+              lines = [ln for ln in lines if "ksu_handle_sys_reboot" not in ln]
+              
+              # Remove empty CONFIG_KSU_MANUAL_HOOK blocks left behind by removing the symbol line.
+              def is_blank(s):
+                  return s.strip() == ""
+              
+              def cleanup_empty_ifdef_blocks(lines):
+                  changed = True
+                  while changed:
+                      changed = False
+                      out = []
+                      i = 0
+                      while i < len(lines):
+                          if lines[i].strip() == "#ifdef CONFIG_KSU_MANUAL_HOOK":
+                              j = i + 1
+                              # Keep blank lines inside candidate block ignorable.
+                              while j < len(lines) and is_blank(lines[j]):
+                                  j += 1
+                              if j < len(lines) and lines[j].strip() == "#endif":
+                                  # Drop #ifdef, blank lines, #endif. Preserve one blank line to avoid accidental token join.
+                                  out.append("\n")
+                                  i = j + 1
+                                  changed = True
+                                  continue
+                          out.append(lines[i])
+                          i += 1
+                      lines = out
+                  return lines
+              
+              lines = cleanup_empty_ifdef_blocks(lines)
+              
+              # Prevent excessive blank lines caused by cleanup.
+              compact = []
+              blank_count = 0
+              for ln in lines:
+                  if is_blank(ln):
+                      blank_count += 1
+                      if blank_count <= 2:
+                          compact.append(ln)
+                  else:
+                      blank_count = 0
+                      compact.append(ln)
+              
+              path.write_text("".join(compact))
+              PY
+
+              cp "${REBOOT_C}" debug/reboot-after-source-aware-hook-cleanup.c
+
+              if grep -q "ksu_handle_sys_reboot" "${REBOOT_C}"; then
+                echo "[ERROR] ksu_handle_sys_reboot still present in ${REBOOT_C} although selected source does not provide it"
+                grep -n "ksu_handle_sys_reboot" "${REBOOT_C}" || true
+                exit 1
+              fi
+
+              echo "[OK] Unsupported reboot hook removed from kernel/reboot.c for this selected source"
+            fi
+
+            echo "[INFO] Final reboot hook context:"
+            grep -n "ksu_handle_sys_reboot\|CONFIG_KSU_MANUAL_HOOK" "${REBOOT_C}" | tee debug/reboot-final-hook-context.txt || true
+
+          } 2>&1 | tee logs/source-aware-reboot-hook-cleanup.log
+
+
       - name: Force defconfig for manual hook only and disable SUSFS/KPROBES
         shell: bash
         run: |
