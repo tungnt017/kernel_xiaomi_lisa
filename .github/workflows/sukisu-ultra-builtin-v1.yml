@@ -60,7 +60,7 @@ jobs:
           set -o pipefail
           mkdir -p logs
 
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash 2>&1 | tee logs/resukisu-setup.log
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin 2>&1 | tee logs/resukisu-setup.log
 
       - name: Apply ReSukiSU manual hooks
         run: |
