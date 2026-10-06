@@ -1,0 +1,323 @@
+name: Build Lisa Kernel With SukiSU-Ultra Builtin Manual Hooks (SUSFS disabled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lisa_defconfig"
+      jobs:
+        description: "Build jobs"
+        required: true
+        default: "auto"
+      release_tag:
+        description: "GitHub Release tag name, empty = auto run number"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build SukiSU-Ultra kernel
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      OUT_DIR: out
+      DEFCONFIG: ${{ github.event.inputs.defconfig }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          sudo apt update
+          sudo apt install -y \
+            git curl wget zip unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libyaml-dev \
+            python3 python-is-python3 \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu \
+            cpio rsync file gzip
+
+      - name: Prepare logs directory
+        run: |
+          mkdir -p logs
+
+      - name: Add SukiSU-Ultra source (builtin branch)
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+
+            # setup.sh silently stays on the default branch if the ref does not exist,
+            # so verify that we really are on "builtin".
+            BRANCH="$(git -C KernelSU branch --show-current || true)"
+            echo "KernelSU branch: ${BRANCH}"
+            echo "KernelSU commit: $(git -C KernelSU rev-parse --short HEAD)"
+            if [ "${BRANCH}" != "builtin" ]; then
+              echo "ERROR: expected branch 'builtin', got '${BRANCH}'"
+              exit 1
+            fi
+          } 2>&1 | tee logs/sukisu-setup.log
+
+      - name: Disable SUSFS in SukiSU-Ultra source
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            KCONFIG="KernelSU/kernel/Kconfig"
+
+            if [ ! -f "${KCONFIG}" ]; then
+              echo "ERROR: ${KCONFIG} not found"
+              exit 1
+            fi
+
+            echo "Before:"
+            sed -n '/^config KSU_SUSFS$/,/^$/p' "${KCONFIG}"
+
+            # KSU_SUSFS defaults to y in the builtin branch. Flip it to n.
+            # All KSU_SUSFS_* sub options depend on KSU_SUSFS, so they go off too.
+            sed -i '/^config KSU_SUSFS$/,/default y/ s/default y/default n/' "${KCONFIG}"
+
+            echo "After:"
+            sed -n '/^config KSU_SUSFS$/,/^$/p' "${KCONFIG}"
+
+            if ! sed -n '/^config KSU_SUSFS$/,/^$/p' "${KCONFIG}" | grep -q 'default n'; then
+              echo "ERROR: failed to set KSU_SUSFS default to n"
+              exit 1
+            fi
+          } 2>&1 | tee logs/disable-susfs.log
+
+      - name: Apply ReSukiSU manual hooks
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          python3 .github/scripts/apply_resukisu_manual_hooks_1_fixed.py "${DEFCONFIG}" 2>&1 | tee logs/apply-hooks.log
+
+      - name: Force SukiSU-Ultra required config
+        run: |
+          set -e
+
+          DEFCONFIG_PATH=""
+
+          if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+            DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+          else
+            echo "ERROR: defconfig not found: ${DEFCONFIG}"
+            exit 1
+          fi
+
+          sed -i '/CONFIG_KALLSYMS=/d' "${DEFCONFIG_PATH}"
+          sed -i '/CONFIG_KALLSYMS_ALL=/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS is not set/d' "${DEFCONFIG_PATH}"
+          sed -i '/# CONFIG_KALLSYMS_ALL is not set/d' "${DEFCONFIG_PATH}"
+
+          # Remove any previous KSU / SUSFS switch so the values below are the only ones
+          sed -i '/^CONFIG_KSU=/d' "${DEFCONFIG_PATH}"
+          sed -i '/^# CONFIG_KSU is not set/d' "${DEFCONFIG_PATH}"
+          sed -i '/^CONFIG_KSU_SUSFS/d' "${DEFCONFIG_PATH}"
+          sed -i '/^# CONFIG_KSU_SUSFS/d' "${DEFCONFIG_PATH}"
+
+          cat >> "${DEFCONFIG_PATH}" <<'EOF'
+
+          # SukiSU-Ultra builtin: SUSFS disabled
+          CONFIG_KSU=y
+          # CONFIG_KSU_SUSFS is not set
+
+          # Symbol export requirement
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          EOF
+
+          echo "Updated ${DEFCONFIG_PATH}:"
+          grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
+          grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+
+      - name: Show SukiSU-Ultra config
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            DEFCONFIG_PATH=""
+
+            if [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+            elif [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+              DEFCONFIG_PATH="arch/arm64/configs/vendor/${DEFCONFIG}"
+            else
+              echo "ERROR: defconfig not found: ${DEFCONFIG}"
+              find arch/arm64/configs -name "*defconfig" | sort
+              exit 1
+            fi
+
+            echo "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
+            grep -n "CONFIG_KSU" "${DEFCONFIG_PATH}" || true
+            grep -n "CONFIG_KALLSYMS" "${DEFCONFIG_PATH}" || true
+          } 2>&1 | tee logs/config.log
+
+      - name: Build kernel using build.sh
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          chmod +x build.sh
+
+          if [ "${{ github.event.inputs.jobs }}" = "auto" ]; then
+            export JOBS="$(nproc --all)"
+          else
+            export JOBS="${{ github.event.inputs.jobs }}"
+          fi
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export OUT_DIR="${OUT_DIR}"
+          export DEFCONFIG="${DEFCONFIG}"
+
+          {
+            echo "ARCH=${ARCH}"
+            echo "SUBARCH=${SUBARCH}"
+            echo "OUT_DIR=${OUT_DIR}"
+            echo "DEFCONFIG=${DEFCONFIG}"
+            echo "JOBS=${JOBS}"
+            echo "GITHUB_SHA=${GITHUB_SHA}"
+            echo "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}"
+          } | tee logs/build-env.log
+
+          bash build.sh 2>&1 | tee logs/build.log
+
+      - name: Verify SUSFS is off in final .config
+        if: always()
+        run: |
+          mkdir -p logs
+
+          {
+            if [ -f "${OUT_DIR}/.config" ]; then
+              echo "Checking ${OUT_DIR}/.config"
+              grep -n "CONFIG_KSU" "${OUT_DIR}/.config" || true
+              if grep -q "^CONFIG_KSU_SUSFS=y" "${OUT_DIR}/.config"; then
+                echo "WARNING: CONFIG_KSU_SUSFS=y in final .config"
+              else
+                echo "OK: SUSFS is not enabled"
+              fi
+            else
+              echo "No ${OUT_DIR}/.config found, skipping check"
+            fi
+          } 2>&1 | tee logs/verify-susfs.log
+
+      - name: Collect flashable zip
+        if: always()
+        run: |
+          set -e
+          set -o pipefail
+
+          mkdir -p artifacts/zips
+          mkdir -p logs
+
+          {
+            echo "Searching for flashable zip from build.sh..."
+
+            mapfile -t ZIP_FILES < <(
+              find . -type f -name "*.zip" \
+                ! -path "./.git/*" \
+                ! -path "./artifacts/*" \
+                ! -path "./KernelSU/*" \
+                ! -path "./KernelSU-Next/*" \
+                ! -path "./ReSukiSU/*" \
+                | sort
+            )
+
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "WARNING: No zip found."
+              echo "Available zip files:"
+              find . -type f -name "*.zip" || true
+            else
+              echo "Found zip(s):"
+              printf '%s\n' "${ZIP_FILES[@]}"
+
+              for zipfile in "${ZIP_FILES[@]}"; do
+                cp -v "${zipfile}" artifacts/zips/
+              done
+            fi
+
+            echo "Artifacts ready:"
+            find artifacts -type f -print || true
+          } 2>&1 | tee logs/collect.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-sukisu-build-logs-${{ github.run_number }}
+          path: logs/**
+          if-no-files-found: warn
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lisa-kernel-sukisu-builtin-${{ github.run_number }}
+          path: artifacts/**
+          if-no-files-found: warn
+
+      - name: Upload zip to GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -e
+          set -o pipefail
+
+          if [ -z "${INPUT_RELEASE_TAG}" ]; then
+            RELEASE_TAG="sukisu-lisa-${{ github.run_number }}"
+          else
+            RELEASE_TAG="${INPUT_RELEASE_TAG}"
+          fi
+
+          RELEASE_NAME="Lisa Kernel SukiSU-Ultra Builtin - ${RELEASE_TAG}"
+
+          echo "Release tag: ${RELEASE_TAG}"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release exists"
+          else
+            echo "Creating release..."
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_NAME}" \
+              --notes "SukiSU-Ultra builtin (SUSFS disabled) manual hook AnyKernel3 build for Xiaomi lisa."
+          fi
+
+          ZIPS="$(find artifacts/zips -type f -name "*.zip" | sort)"
+
+          if [ -z "${ZIPS}" ]; then
+            echo "ERROR: no zip found to upload"
+            exit 1
+          fi
+
+          echo "Uploading:"
+          echo "${ZIPS}"
+
+          gh release upload "${RELEASE_TAG}" ${ZIPS} --clobber
