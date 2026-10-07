@@ -104,6 +104,32 @@ jobs:
             fi
           } 2>&1 | tee logs/disable-susfs.log
 
+      - name: Fix SukiSU-Ultra builtin missing arch.h include
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p logs
+
+          {
+            HDR="KernelSU/kernel/kernel_includes.h"
+
+            # builtin (since 486ad6f) includes "arch.h" but never ships that file,
+            # so ksu.o fails with: fatal error: 'arch.h' file not found.
+            # Nothing in builtin uses the symbols arch.h defines, so drop the include.
+            if grep -q '#include "arch.h"' "${HDR}" && [ -z "$(find KernelSU/kernel -name arch.h)" ]; then
+              if grep -rEq '__PT_|REBOOT_SYMBOL|SYS_(READ|EXECVE|FSTAT)_SYMBOL|__PT_REGS_CAST' KernelSU/kernel --include=*.c --include=*.h; then
+                echo "ERROR: arch.h symbols are used in this builtin commit, cannot just drop the include"
+                exit 1
+              fi
+              echo "arch.h is included but not shipped, removing the include"
+              sed -i '/#include "arch.h"/d' "${HDR}"
+            else
+              echo "No arch.h fix needed"
+            fi
+
+            grep -n 'arch.h' "${HDR}" || echo "OK: no arch.h reference left in ${HDR}"
+          } 2>&1 | tee logs/fix-archh.log
+
       - name: Apply ReSukiSU manual hooks
         run: |
           set -e
